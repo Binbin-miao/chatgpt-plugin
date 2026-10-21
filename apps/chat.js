@@ -43,7 +43,6 @@ import { INNER_OS_BEGIN, INNER_OS_END } from '../utils/innerOs.js'
 import ChatCooldown from '../utils/chatCooldown.js'
 import { groupReply } from '../utils/groupReply.js'
 import { avatarReply } from '../utils/avatarReply.js'
-import { isModerationRefusalError, pickRefusalReply, refusalDetail } from '../utils/refusal.js'
 
 let version = Config.version
 let proxy = getProxy()
@@ -830,24 +829,6 @@ export class chatgpt extends plugin {
     return true;
   }
 
-  /**
-   * 审核拒绝的统一出口：只回温和词库文案，不打堆栈、不渲染报错图。
-   *
-   * 拒绝发生在模型返回阶段（用户输入已提交），是预期内的内容策略结果而非程序故障，
-   * 因此不走 abstractChat 的普通报错分支。
-   *
-   * @param {object} e 消息事件
-   * @param {object} config 当前会话的 provider 配置
-   * @param {string} logMessage 写进日志的整条拒绝原因
-   */
-  async replyModerationRefusal(e, config, logMessage) {
-    logger.warn(`[ChatGPT] ${logMessage}`)
-    await this.reply(pickRefusalReply(config), true, { recallMsg: !config.is_recallMsg ? 0 : (e.isGroup ? 30 : 0) })
-    if (e.checkAndExecuteContent?.length) {
-      await this.reply(e.checkAndExecuteContent)
-    }
-  }
-
   async abstractChat(e, prompt, use, forcePictureMode = false, { automatic = false } = {}) {
     const providerSource = structuredClone(Config.getConfig())
     let profile
@@ -1060,12 +1041,6 @@ export class chatgpt extends plugin {
       }
       if ((use === 'api' || use === 'responses') && !chatMessage) {
         // 字数超限直接返回
-        return false
-      }
-      if (chatMessage?.refused) {
-        // 审核拒绝不是故障：回温和词库文案，且不把被拒答的轮次写进会话历史
-        const detail = refusalDetail(chatMessage.text)
-        await this.replyModerationRefusal(e, config, `模型拒绝回答${detail ? `：${hidePrivacyInfo(detail).slice(0, 200)}` : ''}`)
         return false
       }
       if (use === 'responses') {
@@ -1696,10 +1671,6 @@ export class chatgpt extends plugin {
       }
       if (withAvatar) await avatarReply.send(e, response, chatMessage.actualProviderId || profile.id)
     } catch (err) {
-      if (isModerationRefusalError(err)) {
-        await this.replyModerationRefusal(e, config, hidePrivacyInfo(err?.message || '模型拒绝回答'))
-        return
-      }
       logger.error(err)
       if (err === 'Error: {"detail":"Conversation not found"}') {
         await this.destroyConversations(err)
