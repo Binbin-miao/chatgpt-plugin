@@ -21,6 +21,26 @@
  * 5. 每个 `test:*` 必须被 `check` 调用，或在 CHECK_EXCLUDED 里写明豁免理由——否则 CI 永远不跑它。
  * 6. 仓库根不得出现 `package-lock.json` 或 `.venv`：前者是 npm 在 pnpm 工作区里跑出来的，
  *    后者是本仓已无 Python 代码的证据（临时验证的 venv 该建在系统临时目录）。
+ * 7. 用户可见文案（锅巴 `bottomHelpMessage`、`e.reply(...)`）里的**时长断言**必须带「实测」。
+ *    本仓已吃过一次：审核文案写「一两分钟」，实测 8 分 30 秒，四倍偏差活到上线才被日志抓住。
+ * 8. （已撤，编号留空不重用）原「测试里不许手搓框架事件身份字段」的门禁随 `07771ba` 整笔回退删除。
+ *    恢复时沿用 8 号；共享夹具 `test/helpers/trssEvent.mjs` 仍在，只是暂时没有门禁强制使用。
+ * 9. `docs/adr/` 与 `.scratch/` 的 markdown 里「约 N 条/个/处/种」必须同行带「实测」。
+ *    数字写进 ADR / spec 之后就没人管了：本仓吃过一次——ADR 写「21 个消息类、约 160 条 rule」，
+ *    实测 19 与 151，四份文档连带返工。规则 7 只管用户文案里的时长，管不到这里。
+ * 10. 根指南 `AGENTS.md` 不得超过 14000 字节：它整篇进每次会话的上下文，一旦顶到注入上限，
+ *    尾部规则会被**静默截断**——不报错、不提示，只是不再生效（2026-10-28 实测在 15.4KB 附近
+ *    被截，丢了「指南维护」四行）。超限就把细则移到 `docs/agent-guides/`，根文件留指针。
+ *
+ * 已评估但**未实现**的候选（写在注释里是为了让后来者知道没有这道门禁，别误以为有）：
+ * - 锅巴 schema 的每个 `field` 都要能在 `utils/config.js` 的默认配置里找到。
+ *   价值明确（删配置项忘了删面板字段，用户会看到点了没反应的开关），但没法用正则判定：
+ *   `defaultConfig` 里 `groupReply` / `avatarReply` 是函数调用，静态取不到叶子键。
+ *   要做就得引 AST 或运行时求值，成本高于收益，暂缓。
+ * - 同一 `field` 在 `guoba.support.js` 里只能出现一次（合并两条分支时常留下两个同名开关，
+ *   面板上就是两份互相矛盾的说明）。这条**不需要**读默认配置，只解析本文件就能正则判定；
+ *   没实现是维护者在 2026-10-28 明确否决（判断为用处不大），不是做不到。要恢复先确认这个
+ *   判断还成立——那次否决之后，仓库里确实又出现过一次同名开关并存。
  */
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
@@ -37,6 +57,10 @@ const NO_CONSOLE_LOG_DIRS = ['client/', 'model/']
 const JSDOC_SAME_LINE_RE = /\*\/[ \t]+(?:const|let|var|function|async[ \t]+function|export|class)\b/
 const CAMEL_LOG_PREFIX_RE = /\blogger\.(?:info|warn|error|mark|debug|blue|cyan|red)\(\s*['"`]\[([a-z][A-Za-z0-9]*)\]/
 const CONSOLE_LOG_RE = /\bconsole\.log\(/
+/** 用户可见文案的判定：锅巴字段说明与回复语句 */
+const USER_COPY_RE = /bottomHelpMessage:|e\.reply\(/
+/** 时长断言：约 N 分钟 / N 分 M 秒 / 一两分钟 / 几分钟 —— 都是「没测就写」的典型措辞 */
+const DURATION_CLAIM_RE = /约\s*\d+(?:\.\d+)?\s*分(?:钟)?|\d+\s*分\s*\d+\s*秒|一两分钟|几分钟/
 
 const violations = []
 
@@ -53,6 +77,14 @@ function scanFile(file) {
     const camelLog = CAMEL_LOG_PREFIX_RE.exec(line)
     if (camelLog && /[A-Z]/.test(camelLog[1])) {
       violations.push(`${relative}:${index + 1} 日志前缀 "${camelLog[1]}" 是 camelCase；改全小写或 "[ChatGPT][子模块]"`)
+    }
+    // 规则 7：用户文案里的时长断言必须带「实测」，否则就是凭感觉写的数
+    const trimmedLine = line.trim()
+    if (USER_COPY_RE.test(line) && !trimmedLine.startsWith('//') && !trimmedLine.startsWith('*')) {
+      const claim = DURATION_CLAIM_RE.exec(line)
+      if (claim && !line.includes('实测')) {
+        violations.push(`${relative}:${index + 1} 时长断言「${claim[0]}」没有实测依据；写实测值并注明规模，或改成「视规模而定」`)
+      }
     }
     if (!forbidConsoleLog) return
     const trimmed = line.trim()
@@ -91,6 +123,36 @@ for (const file of SCAN_FILES) {
     // 同上
   }
 }
+
+// 规则 9：ADR / spec 里的近似数量断言必须有实测依据（规则 7 只管用户文案里的时长）
+const APPROX_COUNT_RE = /约\s*\d+\s*(?:个|条|处|种)/
+const APPROX_DOC_DIRS = ['docs/adr', '.scratch']
+
+function scanApproxClaims(dir) {
+  let entries
+  try {
+    entries = readdirSync(path.join(ROOT, dir), { withFileTypes: true })
+  } catch {
+    return // 目录不存在就跳过：分支裁剪后可能出现
+  }
+  for (const entry of entries) {
+    const relative = path.join(dir, entry.name)
+    if (entry.isDirectory()) {
+      if (SKIP_DIRS.has(entry.name)) continue
+      scanApproxClaims(relative)
+      continue
+    }
+    if (!entry.isFile() || path.extname(entry.name) !== '.md') continue
+    const lines = readFileSync(path.join(ROOT, relative), 'utf8').split('\n')
+    lines.forEach((line, index) => {
+      if (line.includes('lint-ignore') || line.includes('实测')) return
+      if (!APPROX_COUNT_RE.test(line)) return
+      violations.push(`${relative.split(path.sep).join('/')}:${index + 1} 近似数量断言没有实测依据；写实测值并注明规模，或改成「视规模而定」`)
+    })
+  }
+}
+
+for (const dir of APPROX_DOC_DIRS) scanApproxClaims(dir)
 
 const scripts = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8')).scripts
 const scriptsText = Object.values(scripts).join('\n')
@@ -148,9 +210,21 @@ for (const [name, reason] of STRAY_ARTIFACTS) {
   if (existsSync(path.join(ROOT, name))) violations.push(`不应存在 ${name}——${reason}`)
 }
 
+// 规则 10：根指南留出注入余量。超限不会报错，只会让尾部规则悄悄消失——本仓踩过。
+// 阈值按字节量（同一文件的稳定代理）；上限本身是字符/上下文预算，别把它当成精确刻度。
+const AGENTS_MAX_BYTES = 14000
+try {
+  const size = statSync(path.join(ROOT, 'AGENTS.md')).size
+  if (size > AGENTS_MAX_BYTES) {
+    violations.push(`AGENTS.md 已有 ${size} 字节，超过 ${AGENTS_MAX_BYTES} 的注入余量：再长会顶到上限，尾部规则被静默截断。把细则移到 docs/agent-guides/，根文件留指针`)
+  }
+} catch {
+  // 文件缺失不在这里报：仓库结构由别的门禁管
+}
+
 if (violations.length) {
   console.error(`[ChatGPT] 风格检查未通过，共 ${violations.length} 处：`)
   for (const item of violations) console.error('  - ' + item)
   process.exit(1)
 }
-console.log('[ChatGPT] 风格检查通过：JSDoc 换行、日志前缀、console.log 边界、测试挂载、脚本路径、套件接线、工具链产物')
+console.log('[ChatGPT] 风格检查通过：JSDoc 换行、日志前缀、console.log 边界、测试挂载、脚本路径、套件接线、工具链产物、时长断言须实测、近似数量须实测、根指南体量')

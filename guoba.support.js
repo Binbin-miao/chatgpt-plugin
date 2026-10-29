@@ -1652,6 +1652,12 @@ export function supportGuoba() {
           component: 'Switch'
         },
         {
+          field: 'enableCapabilityMap',
+          label: '启用插件能力地图',
+          bottomHelpMessage: '让AI可以获取 Yunzai 所有 Plugins 的指令的说明和调用方法，并且可以智能调用这些指令；可用指令： #chatgpt刷新功能表 #chatgpt更新指令地图：',
+          component: 'Switch'
+        },
+        {
           label: '智能模式 定时任务',
           component: 'Divider'
         },

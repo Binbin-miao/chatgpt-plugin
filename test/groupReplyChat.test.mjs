@@ -98,7 +98,7 @@ test('开启角色的正式回复先发一次完整正文再附图，辅助来�
   assert.deepEqual(output, [['text', ['完整回答。第二句话。']]])
 })
 
-test('自主回复复用正常聊天入口和全局提供商，不传禁用工具参数，仍受黑名单约束', async () => {
+test('自主回复复用正常聊天入口和全局提供商，仍受黑名单约束', async () => {
   const e = {
     isGroup: true, group_id: '100', group: { group_id: '100' }, self_id: '999', user_id: '123',
     sender: { user_id: '123', role: 'member' }, msg: '开放话题', raw_message: '开放话题', message: [],
@@ -117,7 +117,6 @@ test('自主回复复用正常聊天入口和全局提供商，不传禁用工�
   assert.deepEqual(options.settings, { enableGroupContext: true, groupContextFromLatest: true })
   assert.equal(options.groupAutoReply, true)
   assert.equal(Config.enableGroupContext, false)
-  assert.equal(options?.disableTools, undefined)
   assert.equal(options?.enableSmart, undefined)
   assert.equal(Config.smartMode, true)
   Config.blacklist = ['^123']

@@ -355,6 +355,14 @@ const defaultConfig = {
   // 智能模式 V2 记忆系统配置（群聊采集须由 Bot 主人在锅巴或当前群显式授权）
   enableMemory: false, // 是否启用记忆系统（唯一总开关，同时开放 Memory_Tool 与 userProfile）
   enableAtGraph: true, // 是否开放 #at图谱 指令；仍需启用记忆系统并授权当前群
+
+  // 插件能力地图（扫描本机其他插件的指令，供 AI 检索与代执行）
+  // 默认关闭：开启后每次刷新都要把本机全部指令交给模型审核（条数随装的插件变），
+  // 属于真金白银的支出，不能因为"装了插件就自动生效"而替用户花钱。
+  // 同一个开关兼任「代执行」：AI 会以用户身份把指令发进别人的插件管道，风险面比只读查询
+  // 高得多，所以必须由主人显式打开。
+  enableCapabilityMap: false, // 总开关：开启后同时具备「查得到」与「代执行」
+  commandMapIndexUrl: 'https://raw.githubusercontent.com/Binbin-miao/command-maps/main/index.json',
   maxMemoriesPerUser: 100, // 每用户每作用域（跨群 user / 每群 user_group）各自独立，默认 100；Guoba 最低 50
   maxMemoriesPerGroup: 50, // 每群公共 group 记忆的独立整理容量目标，默认 50；Guoba 最低 20（>95% 夜间压缩可按 Token 预算分片）
   memoryContextLimit: 8, // 每次对话注入的最大记忆条数
