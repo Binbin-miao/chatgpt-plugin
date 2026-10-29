@@ -109,11 +109,21 @@ test('查询词为空时要求补充，不返回整张表', async () => {
   assert.match(text, /请给出要查询的指令名或功能关键词/)
 })
 
-test('功能开关关闭时不查询', async () => {
-  config.enableCapabilityMap = false
+test('地图开关关闭时不查询', async () => {
+  config.enableMapSync = false
   try {
     const text = await run('#签到')
     assert.match(text, /已关闭/)
+  } finally {
+    config.enableMapSync = true
+  }
+})
+
+test('代执行开关关着也照样能查（查与代执行是两件事）', async () => {
+  config.enableCapabilityMap = false
+  try {
+    const text = await run('#签到')
+    assert.doesNotMatch(text, /已关闭/)
   } finally {
     config.enableCapabilityMap = true
   }

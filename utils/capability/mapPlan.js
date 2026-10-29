@@ -57,7 +57,7 @@ export async function readMapIndex ({ indexUrl, fetchImpl } = {}) {
  *   missing: string[]
  * }}
  */
-export function planMapSync ({ index, plugins = [], localVersions = new Map() } = {}) {
+export function planMapSync ({ index, plugins = [], localVersions = new Map(), localMetas = null } = {}) {
   const entries = index?.plugins && typeof index.plugins === 'object' ? index.plugins : {}
   const pending = []
   const upToDate = []
@@ -74,14 +74,27 @@ export function planMapSync ({ index, plugins = [], localVersions = new Map() } 
     }
 
     const cloudVersion = typeof entry.version === 'string' ? entry.version.trim() : ''
-    const localVersion = String(localVersions.get(key) || '')
+    const cloudSha = typeof entry.sha256 === 'string' ? entry.sha256.trim() : ''
+
+    // localMetas 优先（带 sha256）；老调用方只给 localVersions 时退回纯版本比对
+    const meta = localMetas?.get(key)
+    const localVersion = meta
+      ? String(meta.version || '')
+      : String(localVersions.get(key) || '')
+    const localSha = meta ? String(meta.sha256 || '') : ''
 
     // 本地没有这份地图：版本相同也得拉，否则等于没有
-    if (!localVersion) {
+    if (!localVersion && !localSha) {
       pending.push({ key, reason: 'no-local-map', cloudVersion, localVersion, entry })
       continue
     }
-    if (localVersion === cloudVersion) {
+
+    // 云端没写 version 时 version 两边都可能是空串，比 sha256 才判得准；
+    // 否则每轮都判成「版本变了」，等于全量重拉
+    const same = cloudVersion
+      ? localVersion === cloudVersion
+      : Boolean(cloudSha) && localSha === cloudSha
+    if (same) {
       upToDate.push(key)
       continue
     }

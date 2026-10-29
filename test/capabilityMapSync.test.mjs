@@ -148,3 +148,22 @@ describe('按清单下载地图', () => {
     assert.match(result.errors[0], /sha256/)
   })
 })
+
+describe('地图正文与索引对不上', () => {
+  test('正文的 plugin.key 与请求的 key 不一致时拒绝落盘', async () => {
+    const other = JSON.stringify({
+      schema: 2,
+      plugin: { key: 'b-plugin' },
+      instructions: []
+    })
+    const result = await downloadMaps({
+      base: BASE,
+      pending: [{ key: 'a-plugin', entry: { file: 'maps/a-plugin.json', sha256: sha256(other), revision: 1 } }],
+      fetchImpl: fakeFetch({ 'maps/a-plugin.json': other })
+    })
+
+    assert.equal(result.failed, 1)
+    assert.match(result.errors[0], /plugin\.key/)
+    assert.equal(readLocalMap('a-plugin'), null)
+  })
+})

@@ -35,9 +35,11 @@ const RULES = [
 ]
 
 /**
+ * @param {{ allowRun?: boolean }} [options] allowRun 为 false 时（代执行开关关着），
+ *   在第 5/6/9 条前加一句说明，免得模型去调用一个没注册的工具
  * @returns {string} 没有可用地图时返回空串
  */
-export function mapPromptAddon () {
+export function mapPromptAddon ({ allowRun = true } = {}) {
   const lines = []
   for (const key of listLocalMapKeys()) {
     const map = readLocalMap(key)
@@ -60,6 +62,7 @@ export function mapPromptAddon () {
     '【本机插件能力目录】',
     '下面是本机已安装的第三方插件清单（插件名 + 一句话功能 + 指令条数）。',
     '规则（必须遵守）：',
+    ...(allowRun ? [] : ['（本机未开启代执行：你只能告诉用户正确写法，不能替用户执行；下面第 5、6、9 条不适用。）']),
     ...RULES,
     '',
     lines.join('\n')

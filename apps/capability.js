@@ -5,7 +5,8 @@ import { readCapabilityState } from '../utils/capability/store.js'
 import { previewList } from '../utils/capability/form.js'
 import { formatManualReport, syncPluginMaps } from '../utils/capability/mapRunner.js'
 
-const DISABLED_HINT = '能力地图功能已关闭，请先在锅巴「插件能力地图（AI 代执行）」里打开「启用插件能力地图」。'
+const DISABLED_HINT = '这项功能已关闭：请先在锅巴打开「启用代执行（AI 替你发指令）」。'
+const MAP_DISABLED_HINT = '指令地图已关闭：请先在锅巴打开「启用指令地图（只读查询）」。'
 
 /**
  * 两张地图的维护入口：能力表只能手动重建，指令地图补丁也只能手动拉取。
@@ -79,16 +80,16 @@ export class mapMaintenance extends plugin {
       }
       await e.reply(lines.join('\n'), true)
     } catch (err) {
-      globalThis.logger?.warn?.(`[Chatgpt][capability] 手动重建失败：${err.message}`)
+      globalThis.logger?.warn?.(`[ChatGPT][capability] 手动重建失败：${err.message}`)
       await e.reply(`Error: 重建失败 —— ${err.message}`, true)
     }
     return true
   }
 
   async sync (e) {
-    // 与每日自动同步、手动重建共用总开关：关掉后三个入口都不许动地图数据
-    if (Config.enableCapabilityMap === false) {
-      await e.reply(DISABLED_HINT, true)
+    // 拉地图只花带宽不花钱，跟地图开关走；重建能力表才受「代执行」开关约束
+    if (Config.enableMapSync === false) {
+      await e.reply(MAP_DISABLED_HINT, true)
       return true
     }
 
@@ -105,7 +106,7 @@ export class mapMaintenance extends plugin {
       const result = await syncPluginMaps({ indexUrl })
       await e.reply(formatManualReport(result, ((Date.now() - startedAt) / 1000).toFixed(1)), true)
     } catch (err) {
-      globalThis.logger?.warn?.(`[Chatgpt][map] 手动更新失败：${err?.message || err}`)
+      globalThis.logger?.warn?.(`[ChatGPT][map] 手动更新失败：${err?.message || err}`)
       await e.reply(`Error: 插件地图更新失败 —— ${err?.message || err}`, true)
     }
     return true
