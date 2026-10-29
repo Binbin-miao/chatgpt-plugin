@@ -10,6 +10,9 @@ import { fileURLToPath } from 'node:url'
 
 export const CAPABILITY_FORMAT_VERSION = 1
 
+/** 地图结构版本：本机只认 2，读到别的版本一律按缺失处理 */
+export const CAPABILITY_MAP_SCHEMA = 2
+
 /**
  * 目录里展开的**插件类**个数上限（两级目录的第一级）。
  *
@@ -30,6 +33,11 @@ export const FRAMEWORK_LOADER_SPEC = '../../../../lib/plugins/loader.js'
 
 /** 框架配置（只为取主人号，用于告警） */
 export const FRAMEWORK_CONFIG_SPEC = '../../../../lib/config/config.js'
+
+/** 地图留存的目录：按插件分子目录，一份 map.json + 一份 meta.json */
+export function capabilityMapsDir () {
+  return path.join(process.cwd(), 'data', 'chatgpt', 'maps')
+}
 
 /** 产物目录：放在框架的 data/ 下，天生不在插件仓库的版本控制里 */
 export function capabilityDataDir () {

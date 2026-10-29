@@ -1,6 +1,6 @@
 import { AbstractTool } from './AbstractTool.js'
 import { Config } from '../config.js'
-import { loadCommandIndex } from '../commandMap/indexLoader.js'
+import { loadMapIndex } from '../capability/mapIndex.js'
 import { executeCommand, findCommandEntry, isCallableCall } from '../commandMap/execute.js'
 import { recall } from '../commandMap/recall.js'
 import { putPending, takePending, peekPending, samePending, isAffirmative } from '../commandMap/confirm.js'
@@ -105,10 +105,10 @@ export class RunPluginCommandTool extends AbstractTool {
     const query = typeof opts?.query === 'string' ? opts.query.trim() : ''
     if (!wanted && !query) return 'Error: 缺少参数：请填 query（用户原话）或 command（指令写法）。'
 
-    const { entries } = loadCommandIndex()
+    const { entries } = loadMapIndex()
     if (!entries.length) {
-      // 工具只读不重建：重建要扫本机插件并调模型审核（花钱），只能由主人发 #chatgpt刷新功能表
-      return 'Error: 本机能力表还没生成，请主人先发 #chatgpt刷新功能表。'
+      // 工具只读不下载：拉取要访问云端并校验哈希，只能由主人发指令或等每日任务
+      return 'Error: 还没有拉取插件地图，请发 #chatgpt更新指令地图 后再试。'
     }
 
     let command = wanted

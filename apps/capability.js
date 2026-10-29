@@ -3,7 +3,7 @@ import { Config } from '../utils/config.js'
 import { rebuildCapabilityState } from '../utils/capability/rebuild.js'
 import { readCapabilityState } from '../utils/capability/store.js'
 import { previewList } from '../utils/capability/form.js'
-import { syncPatches } from '../utils/commandMap/sync.js'
+import { formatManualReport, syncPluginMaps } from '../utils/capability/mapRunner.js'
 
 const DISABLED_HINT = '能力地图功能已关闭，请先在锅巴「插件能力地图（AI 代执行）」里打开「启用插件能力地图」。'
 
@@ -98,27 +98,15 @@ export class mapMaintenance extends plugin {
       return true
     }
 
-    const state = readCapabilityState()
-    const pluginKeys = [...new Set((state?.meta?.entries || []).map(entry => entry.pluginKey).filter(Boolean))]
-    if (!pluginKeys.length) {
-      await e.reply('还没有能力表可对齐：先发送 #chatgpt刷新功能表 生成后再更新地图。', true)
-      return true
-    }
-
-    await e.reply(`开始更新指令地图：本机 ${pluginKeys.length} 个插件，按索引匹配云端补丁。`, true)
+    await e.reply('开始更新插件地图：读云端索引 → 比对本机插件 → 只下载有变化的。', true)
 
     const startedAt = Date.now()
     try {
-      const result = await syncPatches({ indexUrl, pluginKeys })
-      const lines = [
-        `更新完成（版本 ${result.revision}，耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s）`,
-        `已更新 ${result.updated} 份 ｜ 云端没有 ${result.skipped} 份 ｜ 失败 ${result.failed} 份`
-      ]
-      if (result.errors.length) lines.push(`失败原因：${result.errors.slice(0, 3).join('；')}`)
-      await e.reply(lines.join('\n'), true)
+      const result = await syncPluginMaps({ indexUrl })
+      await e.reply(formatManualReport(result, ((Date.now() - startedAt) / 1000).toFixed(1)), true)
     } catch (err) {
-      globalThis.logger?.warn?.(`[Chatgpt][commandMap] 地图同步失败：${err.message}`)
-      await e.reply(`Error: 地图更新失败 —— ${err.message}`, true)
+      globalThis.logger?.warn?.(`[Chatgpt][map] 手动更新失败：${err?.message || err}`)
+      await e.reply(`Error: 插件地图更新失败 —— ${err?.message || err}`, true)
     }
     return true
   }
