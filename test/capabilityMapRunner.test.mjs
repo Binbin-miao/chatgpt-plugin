@@ -15,8 +15,7 @@ import { readLocalMeta } from '../utils/capability/mapStore.js'
  * 要守住：没有变化时不下地图、没地图的插件算缺失、失败满三次才告警。
  */
 
-const INDEX_URL = 'https://raw.githubusercontent.com/Binbin-miao/command-maps/main/index.json'
-const BASE = 'https://raw.githubusercontent.com/Binbin-miao/command-maps/main/'
+const INDEX_URL = 'https://raw.githubusercontent.com/Binbin-miao/command-maps/main/dist/index.json'
 
 const sha256 = text => crypto.createHash('sha256').update(text, 'utf8').digest('hex')
 

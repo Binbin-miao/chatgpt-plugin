@@ -1652,9 +1652,15 @@ export function supportGuoba() {
           component: 'Switch'
         },
         {
+          field: 'enableMapSync',
+          label: '启用指令地图（只读查询）',
+          bottomHelpMessage: '让AI能查到 Yunzai 各插件的指令说明。只下载地图文件，不调用模型，不产生费用；默认开启。可用指令：#chatgpt更新指令地图',
+          component: 'Switch'
+        },
+        {
           field: 'enableCapabilityMap',
-          label: '启用插件能力地图',
-          bottomHelpMessage: '让AI可以获取 Yunzai 所有 Plugins 的指令的说明和调用方法，并且可以智能调用这些指令；可用指令： #chatgpt刷新功能表 #chatgpt更新指令地图：',
+          label: '启用代执行（AI 替你发指令）',
+          bottomHelpMessage: '允许AI以你的身份把指令发进其它插件，并启用本机能力表重建。重建会把全部指令交给模型审核（花钱），代执行有风险，默认关闭；可用指令：#chatgpt刷新功能表',
           component: 'Switch'
         },
         {

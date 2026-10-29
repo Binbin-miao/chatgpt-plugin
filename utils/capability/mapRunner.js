@@ -12,7 +12,7 @@ import { patchSyncState, readSyncState } from './syncState.js'
  * 只发一次索引请求，不下载任何地图。
  */
 
-const LOG_PREFIX = '[Chatgpt][map]'
+const LOG_PREFIX = '[ChatGPT][map]'
 
 /**
  * @param {{
@@ -30,13 +30,15 @@ export async function syncPluginMaps ({ indexUrl, fetchImpl, plugins, onProgress
   const list = Array.isArray(plugins) ? plugins : await listInstalledPlugins()
   const { base, index, revision } = await readMapIndex({ indexUrl, fetchImpl })
 
-  const localVersions = new Map()
+  // 传整个 meta：云端没写 version 时要靠 sha256 判断「本地这份是不是同一份」，
+  // 只看 version 会因为两边都空而每轮全量重拉
+  const localMetas = new Map()
   for (const plugin of list) {
     const meta = readLocalMeta(plugin.key)
-    if (meta?.version) localVersions.set(plugin.key, String(meta.version))
+    if (meta) localMetas.set(plugin.key, { version: meta.version, sha256: meta.sha256 })
   }
 
-  const plan = planMapSync({ index, plugins: list, localVersions })
+  const plan = planMapSync({ index, plugins: list, localMetas })
   const downloaded = plan.pending.length
     ? await downloadMaps({ base, pending: plan.pending, fetchImpl, onProgress })
     : { updated: 0, failed: 0, errors: [] }
@@ -104,7 +106,7 @@ function shouldAlert (streak) {
  * 更新都给一条完整回执，缺失插件也一定列出来。
  *
  * @param {object} result syncPluginMaps 的返回值
- * @param {number} seconds 耗时
+ * @param {string} seconds 耗时（已 toFixed 的字符串）
  * @returns {string}
  */
 export function formatManualReport (result, seconds) {

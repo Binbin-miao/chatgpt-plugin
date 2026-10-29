@@ -68,9 +68,13 @@ async function downloadOne ({ key, item, root, rootOrigin, fetchImpl }) {
   if (!map.plugin || typeof map.plugin !== 'object' || !Array.isArray(map.instructions)) {
     throw new Error('地图结构不合法：缺少 plugin 或 instructions')
   }
+  // 索引说这是 A 的地图，正文却写着 B：落盘就会把 B 的内容装进 A 的目录
+  if (String(map.plugin.key || '').trim() !== key) {
+    throw new Error(`地图正文的 plugin.key 是「${map.plugin.key || ''}」，与索引的「${key}」不符，拒绝落盘`)
+  }
 
   saveLocalMap(key, map, {
-    version: typeof item.entry.version === 'string' ? item.entry.version : '',
+    version: typeof item.entry.version === 'string' ? item.entry.version.trim() : '',
     revision: item.entry.revision,
     sha256: expected,
     fetchedAt: new Date().toISOString()

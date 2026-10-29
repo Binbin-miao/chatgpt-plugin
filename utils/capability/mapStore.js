@@ -12,7 +12,7 @@ import { CAPABILITY_MAP_SCHEMA, capabilityMapsDir } from './paths.js'
  * 目录名要净化：pluginKey 来自远端索引，`..` 或分隔符不能把写入带出留存目录。
  */
 
-const LOG_PREFIX = '[Chatgpt][capability]'
+const LOG_PREFIX = '[ChatGPT][map]'
 
 /** 路径段净化：`example/add` 这类带分隔符的 key 会被压成一个目录名 */
 function safeSegment (value) {
@@ -76,7 +76,9 @@ export function readLocalMap (key) {
   let raw
   try {
     raw = JSON.parse(fs.readFileSync(path.join(mapDir(key), 'map.json'), 'utf8'))
-  } catch {
+  } catch (err) {
+    // 没装过这份地图是常态，不吭声；读得到却坏了才值得留一条
+    if (err?.code !== 'ENOENT') globalThis.logger?.warn?.(`[ChatGPT][map] 地图读不出来（${key}）：${err?.message || err}`)
     return null
   }
   return validateMap(raw, key)
@@ -87,7 +89,8 @@ export function readLocalMeta (key) {
   try {
     const meta = JSON.parse(fs.readFileSync(path.join(mapDir(key), 'meta.json'), 'utf8'))
     return meta && typeof meta === 'object' ? meta : null
-  } catch {
+  } catch (err) {
+    if (err?.code !== 'ENOENT') globalThis.logger?.warn?.(`[ChatGPT][map] 元信息读不出来（${key}）：${err?.message || err}`)
     return null
   }
 }
@@ -101,7 +104,8 @@ export function listLocalMapKeys () {
   let entries = []
   try {
     entries = fs.readdirSync(capabilityMapsDir(), { withFileTypes: true })
-  } catch {
+  } catch (err) {
+    if (err?.code !== 'ENOENT') globalThis.logger?.warn?.(`[ChatGPT][map] 地图目录读不出来：${err?.message || err}`)
     return []
   }
 
@@ -117,7 +121,8 @@ export function listLocalMapKeys () {
 function readLocalMetaByDir (segment) {
   try {
     return JSON.parse(fs.readFileSync(path.join(capabilityMapsDir(), segment, 'meta.json'), 'utf8'))
-  } catch {
+  } catch (err) {
+    if (err?.code !== 'ENOENT') globalThis.logger?.warn?.(`[ChatGPT][map] 索引目录里的元信息坏了（${segment}）：${err?.message || err}`)
     return null
   }
 }

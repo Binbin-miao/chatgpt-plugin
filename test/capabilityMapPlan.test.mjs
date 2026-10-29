@@ -10,7 +10,7 @@ import { planMapSync, readMapIndex } from '../utils/capability/mapPlan.js'
  * 「本地没地图必须拉」「索引缺项算缺失」这四件事。
  */
 
-const URL = 'https://raw.githubusercontent.com/Binbin-miao/command-maps/main/index.json'
+const URL = 'https://raw.githubusercontent.com/Binbin-miao/command-maps/main/dist/index.json'
 
 function fakeFetch (body) {
   const calls = []
@@ -116,4 +116,28 @@ describe('版本比对', () => {
     assert.deepEqual(plan.upToDate, ['a-plugin'])
     assert.deepEqual(plan.pending, [])
   })
+})
+
+test('云端没写 version 时按 sha256 判断，不每轮重拉', () => {
+  const index = {
+    schema: 2,
+    revision: 1,
+    plugins: { 'a-plugin': { file: 'maps/a-plugin.json', sha256: 'same-sha', command_count: 1 } }
+  }
+
+  const same = planMapSync({
+    index,
+    plugins: [{ key: 'a-plugin' }],
+    localMetas: new Map([['a-plugin', { version: '', sha256: 'same-sha' }]])
+  })
+  assert.deepEqual(same.upToDate, ['a-plugin'])
+  assert.deepEqual(same.pending, [])
+
+  const changed = planMapSync({
+    index,
+    plugins: [{ key: 'a-plugin' }],
+    localMetas: new Map([['a-plugin', { version: '', sha256: 'other-sha' }]])
+  })
+  assert.equal(changed.pending.length, 1)
+  assert.equal(changed.pending[0].reason, 'version-changed')
 })

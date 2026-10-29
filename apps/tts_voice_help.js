@@ -1239,7 +1239,7 @@ ${userSetting.useTTS === true ? '当前语音模式为' + Config.ttsMode : ''}`
         // 插件地图每日检查。挂在这个任务里是为了不再注册第二个定时任务（少一个失败点，
         // 也少一处要维护的 cron）。开关由「插件能力地图」总开关决定；失败满三次才告警。
         // 整段独立 try：它挂了不能影响上面的 TTS 重置。
-        if (Config.enableCapabilityMap) {
+        if (Config.enableMapSync !== false) {
             try {
                 await dailyPluginMapSync({ indexUrl: Config.commandMapIndexUrl })
             } catch (err) {

@@ -11,7 +11,7 @@ import { capabilityMapsDir } from './paths.js'
  */
 
 const STATE_FILE = '.state.json'
-const LOG_PREFIX = '[Chatgpt][map]'
+const LOG_PREFIX = '[ChatGPT][map]'
 
 /** @returns {{ failStreak: number, missing: string[] }} */
 export function readSyncState () {
@@ -21,7 +21,9 @@ export function readSyncState () {
       failStreak: Number(state?.failStreak) || 0,
       missing: Array.isArray(state?.missing) ? state.missing.filter(item => typeof item === 'string') : []
     }
-  } catch {
+  } catch (err) {
+    // 首次运行没有这个文件，属正常；坏掉了才记一条
+    if (err?.code !== 'ENOENT') globalThis.logger?.warn?.(`[ChatGPT][map] 同步状态读不出来：${err?.message || err}`)
     return { failStreak: 0, missing: [] }
   }
 }

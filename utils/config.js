@@ -359,12 +359,13 @@ const defaultConfig = {
   enableMemory: false, // 是否启用记忆系统（唯一总开关，同时开放 Memory_Tool 与 userProfile）
   enableAtGraph: true, // 是否开放 #at图谱 指令；仍需启用记忆系统并授权当前群
 
-  // 插件能力地图（扫描本机其他插件的指令，供 AI 检索与代执行）
-  // 默认关闭：开启后每次刷新都要把本机全部指令交给模型审核（条数随装的插件变），
-  // 属于真金白银的支出，不能因为"装了插件就自动生效"而替用户花钱。
-  // 同一个开关兼任「代执行」：AI 会以用户身份把指令发进别人的插件管道，风险面比只读查询
-  // 高得多，所以必须由主人显式打开。
-  enableCapabilityMap: false, // 总开关：开启后同时具备「查得到」与「代执行」
+  // 插件地图：让 AI 查到本机各插件的指令，并能替你执行。两件事代价不同，拆成两个开关：
+  //   enableMapSync      只下载地图文件，不调模型、不花钱 —— 默认开，装着就能查。
+  //   enableCapabilityMap 重建能力表（把全部指令交给模型审核，真金白银的支出）
+  //                      + 代执行（以用户身份把指令发进别人的插件管道，风险面比只读查询大得多）。
+  //                      这两件事必须由主人显式打开，不能因为"装了插件就自动生效"而替他花钱/担风险。
+  enableMapSync: true,
+  enableCapabilityMap: false,
   // schema 2 的索引。仓库根目录那份 index.json 是 schema 1，下载端只认 2，指错会直接抛错
   commandMapIndexUrl: 'https://raw.githubusercontent.com/Binbin-miao/command-maps/main/dist/index.json',
   maxMemoriesPerUser: 100, // 每用户每作用域（跨群 user / 每群 user_group）各自独立，默认 100；Guoba 最低 50
@@ -496,9 +497,11 @@ if (hadConfigFile && config.toolGroupAdminArrMigration !== TOOL_GROUP_ADMIN_ARR_
 config = lodash.mergeWith({}, defaultConfig, config, useWholeArray)
 
 /**
- * 地图索引从 schema 1 换到 schema 2 时，老用户机器上可能已经存着旧默认地址（早先版本会把整个
- * 默认配置写进 config.json）。这里只把「值仍然等于旧默认」的人挪到新地址——自己改过地址的不动，
- * 也不写回文件，每次启动重算一遍即可，幂等。
+ * 地图索引从 schema 1 换到 schema 2。
+ *
+ * 本仓的配置是差量保存的，没动过这一项的用户 config.json 里本来就没有这个键，默认值直接生效。
+ * 但早期版本或手动编辑可能把它留在旧地址上，所以再兜一层：只把「值仍等于旧默认」的挪到新地址，
+ * 自己配过的不动。只改内存不写盘，每次启动重算，幂等。
  */
 if (config.commandMapIndexUrl === LEGACY_MAP_INDEX_URL) {
   config.commandMapIndexUrl = defaultConfig.commandMapIndexUrl
