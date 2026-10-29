@@ -24,8 +24,8 @@ let executeResult = { ok: true }
 let lastTarget = null
 
 mock.module('../utils/config.js', { namedExports: { Config: config } })
-mock.module('../utils/commandMap/indexLoader.js', {
-  namedExports: { loadCommandIndex: () => ({ entries: ENTRIES, stats: {} }) }
+mock.module('../utils/capability/mapIndex.js', {
+  namedExports: { loadMapIndex: () => ({ entries: ENTRIES, stats: {} }) }
 })
 mock.module('../utils/commandMap/execute.js', {
   namedExports: {

@@ -24,6 +24,9 @@ const TOOL_GROUP_ADMIN_ARR_MIGRATION = 1
 /** 本次迁移要确保存在的项，顺序即追加顺序 */
 const TOOL_GROUP_ADMIN_ARR_ADDITIONS = ['GroupNotice', 'GroupTodo']
 
+/** 早先版本的默认索引地址（schema 1）。只用于识别「还没自定义过」的用户 */
+const LEGACY_MAP_INDEX_URL = 'https://raw.githubusercontent.com/Binbin-miao/command-maps/main/index.json'
+
 const defaultConfig = {
   blockWords: ['屏蔽词1', '屏蔽词b'],
   promptBlockWords: ['屏蔽词1', '屏蔽词b'],
@@ -362,7 +365,8 @@ const defaultConfig = {
   // 同一个开关兼任「代执行」：AI 会以用户身份把指令发进别人的插件管道，风险面比只读查询
   // 高得多，所以必须由主人显式打开。
   enableCapabilityMap: false, // 总开关：开启后同时具备「查得到」与「代执行」
-  commandMapIndexUrl: 'https://raw.githubusercontent.com/Binbin-miao/command-maps/main/index.json',
+  // schema 2 的索引。仓库根目录那份 index.json 是 schema 1，下载端只认 2，指错会直接抛错
+  commandMapIndexUrl: 'https://raw.githubusercontent.com/Binbin-miao/command-maps/main/dist/index.json',
   maxMemoriesPerUser: 100, // 每用户每作用域（跨群 user / 每群 user_group）各自独立，默认 100；Guoba 最低 50
   maxMemoriesPerGroup: 50, // 每群公共 group 记忆的独立整理容量目标，默认 50；Guoba 最低 20（>95% 夜间压缩可按 Token 预算分片）
   memoryContextLimit: 8, // 每次对话注入的最大记忆条数
@@ -490,6 +494,15 @@ if (hadConfigFile && config.toolGroupAdminArrMigration !== TOOL_GROUP_ADMIN_ARR_
 }
 
 config = lodash.mergeWith({}, defaultConfig, config, useWholeArray)
+
+/**
+ * 地图索引从 schema 1 换到 schema 2 时，老用户机器上可能已经存着旧默认地址（早先版本会把整个
+ * 默认配置写进 config.json）。这里只把「值仍然等于旧默认」的人挪到新地址——自己改过地址的不动，
+ * 也不写回文件，每次启动重算一遍即可，幂等。
+ */
+if (config.commandMapIndexUrl === LEGACY_MAP_INDEX_URL) {
+  config.commandMapIndexUrl = defaultConfig.commandMapIndexUrl
+}
 config.groupReply = normalizeGroupReplyConfig(config.groupReply)
 config.avatarReply = normalizeAvatarReplyConfig(config.avatarReply)
 normalizeProviders(config, providerDefaults)

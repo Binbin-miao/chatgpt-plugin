@@ -239,3 +239,41 @@ function extractRules (text) {
   }
   return rules
 }
+
+/**
+ * 本机已安装的第三方插件清单。
+ *
+ * 只回答「装了谁、什么版本、装在哪」——该向云端要哪几份地图、谁还没地图，都以它为准。
+ * 与 loadPluginSnapshot 的分工：这里不要规则、不要描述，也不做源码降级；
+ * 插件不发版是常态，读不到版本就给空串，不能因此漏掉这个插件。
+ *
+ * @param {{ loader?: object, pluginsRoot?: string }} [options]
+ * @returns {Promise<Array<{ key: string, version: string, dir: string }>>}
+ */
+export async function listInstalledPlugins ({ loader, pluginsRoot = PLUGINS_ROOT } = {}) {
+  const registry = loader || await loadFrameworkLoader()
+  if (!registry || !Array.isArray(registry.priority)) return []
+
+  const plugins = []
+  const seen = new Set()
+  for (const item of registry.priority) {
+    if (!item) continue
+    const dir = resolvePluginDir(item, pluginsRoot)
+    if (!dir || !isThirdParty(dir, pluginsRoot)) continue
+    const key = String(item.key || path.basename(dir))
+    if (seen.has(key)) continue
+    seen.add(key)
+    plugins.push({ key, version: readPluginVersion(dir), dir })
+  }
+  return plugins
+}
+
+/** 插件目录下 package.json 的版本号；读不到返回空串 */
+function readPluginVersion (dir) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'))
+    return typeof pkg?.version === 'string' ? pkg.version.trim() : ''
+  } catch {
+    return ''
+  }
+}

@@ -1,6 +1,6 @@
 import { AbstractTool } from './AbstractTool.js'
 import { Config } from '../config.js'
-import { loadCommandIndex } from '../commandMap/indexLoader.js'
+import { loadMapIndex } from '../capability/mapIndex.js'
 import { recall } from '../commandMap/recall.js'
 import { findPluginGroup, formatCandidates, formatPluginGroup } from '../commandMap/format.js'
 
@@ -10,8 +10,8 @@ import { findPluginGroup, formatCandidates, formatPluginGroup } from '../command
  * 参数只有关键词——**没有任何路径字段**，这是「能力隔离」的接口面约束：
  * 模型无法表达"读哪里"，所以它连尝试都做不到。
  *
- * 数据来自「能力表 + 地图补丁」的合并索引：写法与权限来自运行时枚举，
- * 关键词、参数、示例、风险档来自地图补丁；没补丁的指令照样能查到，只是信息少一些。
+ * 数据来自本地留存的插件地图：写法、关键词、参数、示例、前置条件与常见坑
+ * 都是拉取时就带下来的，查询本身不发任何网络请求。
  *
  * 返回内容是别的插件注册信息派生出来的，属于不可信文本：按数据处理、按数据包装，
  * 不让插件描述里的句子被当成指令执行。
@@ -37,10 +37,10 @@ export class CapabilityLookupTool extends AbstractTool {
     const query = typeof opts?.query === 'string' ? opts.query.trim() : ''
     if (!query) return 'Error: 请给出要查询的指令名或功能关键词。'
 
-    const { entries } = loadCommandIndex()
+    const { entries } = loadMapIndex()
     if (!entries.length) {
-      // 工具只读不重建：重建要扫本机插件并调模型审核（花钱），只能由主人发 #chatgpt刷新功能表
-      return 'Error: 本机能力表还没生成，请主人先发 #chatgpt刷新功能表。'
+      // 工具只读不下载：拉取要访问云端并校验哈希，只能由主人发指令或等每日任务
+      return 'Error: 还没有拉取插件地图，请发 #chatgpt更新指令地图 后再试。'
     }
 
     const group = findPluginGroup(entries, query)
