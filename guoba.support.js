@@ -10,7 +10,12 @@ import { RECALL_MODE_ALL } from './utils/memory/recallMode.js'
 import lodash from "lodash";
 
 /**
- * 「Bot 响应白名单」的候选账号：遍历所有已注册适配器下的账号（TRSS 的 Bot.bots）。
+ * 「Bot 响应白名单」的候选账号：以宿主的登录账号表 Bot.uin 为准。
+ *
+ * 不遍历 Bot.bots 的键：Bot 是 new Proxy(this.bots, { get })，只拦了读，没有 set 陷阱，
+ * 谁往 Bot 上写属性都会落进 bots——宿主 serverLoad 的 url、EventEmitter 的
+ * _events / _eventsCount、第三方插件的 Bot.xiaofei_plugin 都会在面板里变成「账号」。
+ * 取舍与替代方案见 docs/adr/0014-bot-account-candidates-from-uin.md。
  *
  * 已保存但当前不在线的账号也补进候选——否则面板可能把它当脏值丢掉，
  * 而「先配好白名单再上号」是很常见的顺序。
@@ -18,23 +23,31 @@ import lodash from "lodash";
 function botAccountOptions() {
   const options = []
   const listed = new Set()
-  const bots = globalThis.Bot?.bots
-  for (const [selfId, bot] of Object.entries(bots || {})) {
-    const value = String(selfId).trim()
-    if (!value || listed.has(value)) continue
-    listed.add(value)
+  const add = (value, label) => {
+    const id = String(value ?? '').trim()
+    if (!id || listed.has(id)) return
+    listed.add(id)
+    options.push({ label, value: id })
+  }
+
+  // TRSS 的 uin 是数组，每个账号连接时由宿主追加（含「标准输入」适配器）；
+  // 原版 Yunzai v3 的 uin 是单个账号，退化成一条候选。
+  const loggedInIds = Array.isArray(globalThis.Bot?.uin) ? globalThis.Bot.uin : [globalThis.Bot?.uin]
+  for (const selfId of loggedInIds) {
+    const id = String(selfId ?? '').trim()
+    if (!id) continue
     // 只读 info 上的普通属性：部分适配器把 nickname 写成 getter，未登录时读它会抛错
+    const bot = globalThis.Bot?.bots?.[id]
     const nickname = bot?.info?.nickname || ''
     const adapter = bot?.adapter?.name || bot?.adapter?.id || ''
     const suffix = [nickname, adapter].filter(Boolean).join('｜')
-    options.push({ label: suffix ? `${value}（${suffix}）` : value, value })
+    add(id, suffix ? `${id}（${suffix}）` : id)
   }
+
   const saved = Array.isArray(Config.botReplyWhitelist) ? Config.botReplyWhitelist : []
   for (const item of saved) {
-    const value = String(item ?? '').trim()
-    if (!value || listed.has(value)) continue
-    listed.add(value)
-    options.push({ label: `${value}（当前未登录）`, value })
+    const id = String(item ?? '').trim()
+    if (id) add(id, `${id}（当前未登录）`)
   }
   return options
 }
@@ -1580,12 +1593,6 @@ export function supportGuoba() {
           component: 'Switch'
         },
         {
-          field: 'enableGroupMemberSkillTool',
-          label: '工具新增-群友Nuwa Skill',
-          bottomHelpMessage: '仅Bot主人可用。读取当前群指定群友的历史文本，脱敏后提交当前子LLM分阶段蒸馏，并生成符合Agent Skills规范的ZIP附件；默认关闭。',
-          component: 'Switch'
-        },
-        {
           field: 'enableDefaultMessageTriggerTool',
           label: '工具新增-云崽消息触发',
           bottomHelpMessage: '允许LLM触发当前群或全局的云崽 #添加 生成指令（LLM只能理解触发词，无法获取触发内容）；可用指令：#[全局][添加|删除|消息]',
@@ -1799,6 +1806,12 @@ export function supportGuoba() {
           field: 'enableAtGraph',
           label: '启用 AT 图谱',
           bottomHelpMessage: '生成 @ 互动图谱，在授权群内可用指令： #at图谱[At群友]',
+          component: 'Switch'
+        },
+        {
+          field: 'enableGroupMemberSkillTool',
+          label: 'nuwa-skill（#女娲蒸馏）',
+          bottomHelpMessage: 'Bot 主人专用。取样优先本群记忆采集的原文（保留期内最多 60000 条）与已存个人事实，不足 30 条则执行群历史消息扫描，返回 nuwa-skill ZIP；可用指令： #女娲蒸馏[at]',
           component: 'Switch'
         },
         {

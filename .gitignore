@@ -15,3 +15,4 @@ output/avatar-validation/
 
 # 调试时重定向输出留下的（git add -A 会顺手收进提交）
 /*.log
+temp/
