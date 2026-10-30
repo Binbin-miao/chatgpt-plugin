@@ -333,7 +333,7 @@ const defaultConfig = {
   generateMathRender_ToolSwitch: false,
   generateHtml_ToolSwitch: false,
   generateGraphCalculator_ToolSwitch: false,
-  enableGroupMemberSkillTool: false,
+  enableGroupMemberSkillTool: true,
   enableDefaultMessageTriggerTool: false,
 
   // 指令地图：把外部维护的「每个插件有哪些指令」同步到本地，供 AI 查询与代执行
