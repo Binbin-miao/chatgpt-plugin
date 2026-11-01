@@ -135,7 +135,7 @@ export let helpData = [
     list: [
       {
         icon: 'chat',
-        title: '#chatgpt切换模型',
+        title: '#chatgpt切换(模型|接口)',
         desc: '主人通过数字列表依次选择主模型和同协议备用模型；两步完成后生效。所有用户跟随全局选择。'
       },
       {
