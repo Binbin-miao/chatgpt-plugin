@@ -661,7 +661,7 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
   }
 
   async useChatGLMSolution(e) {
-    await this.reply('旧 ChatGLM 模式已移除，请使用 #chatgpt切换模型')
+    await this.reply('旧 ChatGLM 模式已移除，请使用 #chatgpt切换模型/接口')
   }
 
   async useClaudeAPIBasedSolution(e = this.e) {
@@ -719,7 +719,7 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
 
   async modeHelp() {
     const row = resolveProvider()
-    await this.reply(`当前提供商：${providerLabel(row)}\n主人发送 #chatgpt切换模型，依次通过数字列表选择主模型和同协议备用模型；所有用户跟随全局。新增条目请使用锅巴。`)
+    await this.reply(`当前提供商：${providerLabel(row)}\n主人发送 #chatgpt切换模型/接口，依次通过数字列表选择主模型和同协议备用模型；所有用户跟随全局。新增条目请使用锅巴。`)
   }
 
   async shutUp(e) {

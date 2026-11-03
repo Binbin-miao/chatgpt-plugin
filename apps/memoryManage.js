@@ -263,7 +263,9 @@ export class memoryManage extends plugin {
 
 
   async sendChunkedForwardMsg(e, messages, title) {
-    const CHUNK_SIZE = 20
+    // 单条合并转发装 50 个节点：记忆条目一段约 200 字，50 条正文 ≈ 1 万字，
+    // 既在协议端单条转发能承载的范围内，也少发几次消息、少刷屏。
+    const CHUNK_SIZE = 50
     if (messages.length <= CHUNK_SIZE) {
       await e.reply(await makeForwardMsg(e, messages, title))
       return
