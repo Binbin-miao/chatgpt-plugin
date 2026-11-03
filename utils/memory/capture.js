@@ -15,10 +15,12 @@
  */
 
 import { Config } from '../config.js'
-import { MemoryStore } from './store.js'
+import { MemoryStore, normalizeRetentionDays } from './store.js'
 import { createHash } from 'node:crypto'
 
 const DEFAULT_RETENTION_DAYS = 30
+/** 关闭采集的群，其记忆默认保留天数（0 = 永不自动清理，见 Config.memoryGroupCapture.closedGroupRetentionDays） */
+const DEFAULT_CLOSED_RETENTION_DAYS = 90
 const BACKFILL_HOURS = 24
 const BACKFILL_MAX_MESSAGES = 500
 
@@ -377,11 +379,11 @@ export class GroupCapture {
 
   /**
    * 原文保留天数。
-   * 注意这里用 `|| 默认值` 兜底：锅巴面板对该项设了 `min: 1`，**0 不是允许的用户值**，
-   * 所以「0=永久」只是 `store.saveRawMessage` 这层 API 的能力，采集层不会走到。
+   * 锅巴面板该项 min: 0，所以 0 是合法用户值，语义是「永久保留」；
+   * 口径统一走 `normalizeRetentionDays`（全仓唯一实现），不要在这里再写一份 `|| 默认值`。
    */
   retentionDays() {
-    return Number(Config.memoryGroupCapture?.rawRetentionDays) || DEFAULT_RETENTION_DAYS
+    return normalizeRetentionDays(Config.memoryGroupCapture?.rawRetentionDays, DEFAULT_RETENTION_DAYS)
   }
 
   isAuthorized(groupId) {
@@ -552,13 +554,17 @@ export class GroupCapture {
     Config.memoryGroupCapture = { ...(Config.memoryGroupCapture || {}), groups: next }
     Config.save?.()
 
+    // 重新开启即撤销软关闭标记，避免下次到期清理把刚恢复的群又清掉
+    await this.store.clearGroupClosedAt(gid)
+
     // 补录最近 24 小时
     const backfill = await this.backfillHistory(e, { hours: 24, maxMessages: 500 })
     return { ok: true, message: `已开启本群记忆采集，并补录最近 24 小时（扫描 ${backfill.scanned} 条，入库 ${backfill.collected} 条）。\n可在锅巴「智能模式 记忆设置」查看/管理授权群。` }
   }
 
   /**
-   * 关闭群记忆：取消授权 + 来源级清理
+   * 关闭群记忆：取消授权 + 记录关闭时间（软关闭，不删任何数据）
+   * 数据由每日任务的到期清理或 #清理无效记忆 处理，给反悔留出保留期窗口。
    */
   async disableGroup(e) {
     const gid = String(e.group_id)
@@ -570,9 +576,13 @@ export class GroupCapture {
     }
     Config.save?.()
 
-    const result = await this.store.clearGroup(gid)
-    logger?.info?.(`[MemoryV2] 群 ${gid} 记忆已关闭并清理: ${JSON.stringify(result)}`)
-    return { ok: true, message: `已关闭本群记忆采集，并完成来源级清理（清理原文/任务/证据，共处理记忆 ${result.memoryIds} 条）。` }
+    await this.store.markGroupClosed(gid)
+    const retentionDays = normalizeRetentionDays(Config.memoryGroupCapture?.closedGroupRetentionDays, DEFAULT_CLOSED_RETENTION_DAYS)
+    const retentionText = retentionDays > 0
+      ? `已采集的原文与记忆会保留 ${retentionDays} 天后自动清理`
+      : '已采集的原文与记忆不自动清理（关闭后保留天数为 0）'
+    logger?.info?.(`[MemoryV2] 群 ${gid} 记忆已关闭（软关闭，数据保留，保留期 ${retentionDays} 天）`)
+    return { ok: true, message: `已停止采集本群消息。${retentionText}；要立即清理请用 #清理无效记忆。` }
   }
 }
 

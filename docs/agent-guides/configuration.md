@@ -39,4 +39,12 @@
 - **`Number(x) ?? 默认值` 在 x 缺失时得到 NaN 而不是默认值**：`Number(undefined)` 返回 NaN，`??` 只回退 null/undefined——`Number(Config.xxx) ?? 0.7` 在配置缺失时阈值/上限会变 NaN 导致校验失效。**读取数字配置用 `||` 回退**（`Number(...) || 0.7`）。但 `||` 会把合法的 `0` 也当缺失，**只适用于"0 不是合法取值"的字段**；0 有业务意义的配置（如 `meme_CD <= 0` 表示关闭 CD）必须显式判空 + 范围校验，例如 `const n = Number(Config.x); const v = Number.isFinite(n) ? n : 默认值`，别套 `||`。
 - 锅巴 GSubForm 保存的是数组（如 `memoryGroupCapture.groups`），读取用 `Array.isArray` 防护。
 
-`eventRetentionDays` / `maxMemoriesPerUser` 的 0 不是合法值，可使用 `Number(...) || 默认值`；`minConfidence` 已移除，见 [记忆指南](memory.md)；`inputTokenLimit` 已不是配置项（改为 `extractor.js` 的 `MEMORY_INPUT_TOKEN_LIMIT` 常量，锅巴无入口）。
+`eventRetentionDays` / `maxMemoriesPerUser` 的 0 不是合法值，可使用 `Number(...) || 默认值`；但 **`rawRetentionDays` 与 `closedGroupRetentionDays` 的 0 是合法值**（分别表示永久保留、永不自动清理），必须走 `utils/memory/store.js` 的 `normalizeRetentionDays(value, fallback)`，不要另写一份 `|| 默认值`；`minConfidence` 已移除，见 [记忆指南](memory.md)；`inputTokenLimit` 已不是配置项（改为 `extractor.js` 的 `MEMORY_INPUT_TOKEN_LIMIT` 常量，锅巴无入口）。
+
+## 记忆原文存储与保留期
+
+- `memoryStorage`：`redis`（默认）或 `file`。切到 `file` 前先执行 `#记忆迁移到文件`，把历史原文导出到 `data/chatgpt/memory/raw/<群号>/<YYYY-MM-DD>.ndjson`；切换**不会删除** Redis 任何数据，可随时切回。
+- `memoryGroupCapture.rawRetentionDays`：群消息原文保留天数，默认 30，**0 = 永久保留**。Redis 与文件同一口径；文件模式按天删文件，语义是「至少保留 N 天」（可能多留一天）。
+- `memoryGroupCapture.closedGroupRetentionDays`：关闭采集的群，其长期记忆保留天数，默认 90，**0 = 永不自动清理**。
+- 三个保留期各管一摊：原文看 `rawRetentionDays`，关闭后的记忆看 `closedGroupRetentionDays`，临时事件看 `eventRetentionDays`（只认 > 0）。
+- 路径以 `process.cwd()` 为基准（即云崽根目录），容器部署必须把 `data/` 挂载出来，否则重建容器丢文件。

@@ -364,9 +364,12 @@ const defaultConfig = {
     groups: [], // 授权采集的群列表 [{groupId, switchOn}]，锅巴 GSubForm 管理或 #群记忆开启
     cronTime: '0 0 4 * * ? *', // 每日提炼 EasyCron，修改后重启生效
     provider: 'current', // 提炼使用的模型供应商条目 ID 或 'current'（跟随全局对话模型）；锅巴「提炼模型来源」，保存后即时生效
-    rawRetentionDays: 30, // 群原文保留天数
+    rawRetentionDays: 30, // 群原文保留天数（0 = 永久保留；redis 与文件后端同口径）
+    closedGroupRetentionDays: 90, // 关闭采集的群，其记忆保留天数（0 = 永不自动清理）
     eventRetentionDays: 90,
   },
+  // 群消息原文存储后端：redis（默认）/ file（data/chatgpt/memory/raw，按群按天 NDJSON）
+  memoryStorage: 'redis',
 
   // MCP 协议配置
   enableMcp: false, // 是否启用通用的 MCP 协议

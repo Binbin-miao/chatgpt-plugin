@@ -12,7 +12,13 @@
  * - 提炼任务        CHATGPT:MEMORY:V2:task:{groupId}:{day}     Hash
  * - 群运行时策略    CHATGPT:MEMORY:V2:policy:{groupId}         Hash
  * - 元信息          CHATGPT:MEMORY:V2:meta                     Hash
+ *
+ * 原文有两种后端（`Config.memoryStorage`）：`redis`（默认）与 `file`（NDJSON 按群按天，见 rawStore.js）。
+ * 分流只发生在 5 个原文接缝（save/get/cleanup/timeRange/recent）与 clearGroup，其余逻辑与后端无关。
  */
+
+import { Config } from '../config.js'
+import { RawStore, dayKeyOf } from './rawStore.js'
 
 const PREFIX = 'CHATGPT:MEMORY:V2'
 const IDX = (scope, ownerId, groupId) => `${PREFIX}:idx:${scope}:${ownerId}:${groupId || '-'}`
@@ -28,6 +34,23 @@ const SCOPE_LOCK = (scope, ownerId, groupId) => `${PREFIX}:scopeLock:${scope}:${
 
 const SCOPES = ['user', 'user_group', 'group']
 const KINDS = ['identity', 'preference', 'relationship', 'plan', 'group_rule', 'experience', 'episode']
+
+/**
+ * 保留天数归一（全仓唯一实现：采集层、每日任务、管理指令、锅巴面板共用同一口径）
+ *
+ * 0 是**合法值**，语义由调用方决定（原文 = 永久保留，关闭群记忆 = 永不自动清理），
+ * 所以不能用 `Number(x) || 默认值`——那会把用户明确填的 0 静默改回默认值。
+ * 缺失/非数字/负数一律回退 `fallback`；必须是有限数，否则 NaN 会让
+ * `now - closedAt < NaN * DAY_MS` 恒为 false，把「非法值回退」变成「一到期就立刻清」。
+ *
+ * @param {*} value 配置或调用方传入的天数
+ * @param {number} fallback 非法/缺失时的默认天数
+ * @returns {number} 非负整数天数
+ */
+export function normalizeRetentionDays(value, fallback) {
+  const days = Number(value)
+  return Number.isFinite(days) && days >= 0 ? Math.trunc(days) : fallback
+}
 
 /** 单值槽位：新值替换旧值；其余（如 preference.*）多值共存 */
 export function isSingleValueFact(factKey) {
@@ -76,11 +99,8 @@ export function genMemoryId() {
 const nowSec = () => Math.floor(Date.now() / 1000)
 const nowMs = () => Date.now()
 
-/** 时间戳（秒）→ 北京时间 YYYY-MM-DD（与 dailyTask.dayKey 保持一致，避免循环依赖） */
-function dayKeyOf(tsSec) {
-  const d = new Date(Number(tsSec) * 1000 + 8 * 3600 * 1000)
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`
-}
+// dayKeyOf 由 rawStore 导出（原文按北京时间自然日分文件，与提炼窗口同口径），这里复用同一实现
+
 
 /**
  * manual 是存储层预留的来源标记，不代表插件已经开放「主人手动新增/修改/锁定记忆」。
@@ -192,9 +212,23 @@ export function validateCandidateShape(candidate) {
 }
 
 export class MemoryStore {
-  constructor(redisClient) {
+  /**
+   * @param {Object} [redisClient] redis 客户端，缺省取 `global.redis`（记忆与提炼任务仍需要它）
+   * @param {Object} [options]
+   * @param {RawStore} [options.rawStore] 原文文件后端（`memoryStorage === 'file'` 时使用），测试可注入临时目录
+   */
+  constructor(redisClient, options = {}) {
     this.redis = redisClient || global.redis
     if (!this.redis) throw new Error('MemoryStore: 无可用 redis 客户端')
+    this.rawStore = options.rawStore || new RawStore()
+  }
+
+  /**
+   * 原文存储后端：`'file'` 走磁盘 NDJSON，其余一律 `'redis'`（默认）
+   * 只在 5 个原文接缝与 clearGroup 里分流；记忆本体、任务、策略始终在 redis。
+   */
+  memoryStorage() {
+    return Config?.memoryStorage === 'file' ? 'file' : 'redis'
   }
 
   /** 作用域级写入互斥：实时写入与夜间合并/归档共享此锁。 */
@@ -909,6 +943,10 @@ export class MemoryStore {
     for (let i = 0; i < unique.length; i += 500) {
       await redis.del(...unique.slice(i, i + 500))
     }
+    // 文件模式没有 TTL：只删 Redis 会留下整目录原文，表现为「清空后磁盘还在」
+    if (this.memoryStorage() === 'file') {
+      for (const gid of await this.rawStore.listGroups()) await this.rawStore.removeGroup(gid)
+    }
     return unique.length
   }
 
@@ -959,33 +997,17 @@ export class MemoryStore {
   }
 
   /**
-   * 关闭某群记忆：来源级清理
-   * - 删除该群原文、任务、运行时策略
-   * - user_group/group 且 groupId=该群 → 整条删除
-   * - user 派生记忆（`group-window*` / `profile-scan` / `Memory_Tool`，见 `isDerivedMemory`）：
-   *   仅本群证据 → 整条删除；多群证据 → 仅移除本群证据
-   * - user 手工确认的记忆 → 仅移除本群证据，记忆本体保留
+   * 只清某群的记忆与索引，**不动原文/任务/策略**
+   *
+   * 「只清记忆」的两个入口都走这里：到期清理（`dailyTask.sweepClosedGroups`）与 `#清理无效记忆`。
+   * 原文只归 rawRetentionDays 管（用户填 365 天时，90 天的关闭清理不得提前删它）；
+   * policy 里存 lastDailyEnd，一并删掉会让将来重新授权时游标归零、残留原文整段重提炼，
+   * 把刚清掉的记忆又造回来（spec D6）。
+   * @returns {Promise<{memoryIds: number}>}
    */
-  async clearGroup(groupId) {
+  async clearGroupMemories(groupId) {
     const redis = this.redis
     const gid = String(groupId)
-
-    // 1. 原文 + 原文索引
-    const rawIds = await redis.zRange(RAWIDX(gid), 0, -1)
-    for (const mid of rawIds) await redis.del(RAW(gid, mid))
-    await redis.del(RAWIDX(gid))
-
-    // 2. 任务
-    const taskKeys = []
-    if (redis.scanIterator) {
-      for await (const key of redis.scanIterator({ MATCH: `${PREFIX}:task:${gid}:*`, COUNT: 1000 })) taskKeys.push(key)
-    }
-    for (const k of taskKeys) await redis.del(k)
-
-    // 3. 运行时策略
-    await redis.del(POLICY(gid))
-
-    // 4. 记忆（遍历群反向索引）
     const memoryIds = await redis.sMembers(GRP(gid))
     for (const id of memoryIds) {
       const m = await this._getMemory(id)
@@ -1010,7 +1032,52 @@ export class MemoryStore {
       }
     }
     await redis.del(GRP(gid))
-    return { rawCleaned: rawIds.length, memoryIds: memoryIds.length }
+    return { memoryIds: memoryIds.length }
+  }
+
+  /**
+   * 关闭某群记忆：来源级清理
+   * - 删除该群原文、任务、运行时策略
+   * - user_group/group 且 groupId=该群 → 整条删除
+   * - user 派生记忆（`group-window*` / `profile-scan` / `Memory_Tool`，见 `isDerivedMemory`）：
+   *   仅本群证据 → 整条删除；多群证据 → 仅移除本群证据
+   * - user 手工确认的记忆 → 仅移除本群证据，记忆本体保留
+   *
+   * 只有真正的「来源级清理」（如手工整群清理）才用它；到期清理与 #清理无效记忆 用
+   * `clearGroupMemories`，原文与提炼游标都要留着（见该方法的说明）。
+   *
+   * 当前生产路径没有调用方：`#群记忆关闭` 已改为软关闭。保留它是为了手工排障
+   * （一次清干净某群）与 `test/memoryV2.test.js` 的多源证据用例，不要因为"没人调"删掉。
+   */
+  async clearGroup(groupId) {
+    const redis = this.redis
+    const gid = String(groupId)
+
+    // 1. 原文 + 原文索引（文件模式删整个群目录）
+    let rawCleaned = 0
+    if (this.memoryStorage() === 'file') {
+      rawCleaned = await this.rawStore.count(gid)
+      await this.rawStore.removeGroup(gid)
+    } else {
+      const rawIds = await redis.zRange(RAWIDX(gid), 0, -1)
+      for (const mid of rawIds) await redis.del(RAW(gid, mid))
+      await redis.del(RAWIDX(gid))
+      rawCleaned = rawIds.length
+    }
+
+    // 2. 任务
+    const taskKeys = []
+    if (redis.scanIterator) {
+      for await (const key of redis.scanIterator({ MATCH: `${PREFIX}:task:${gid}:*`, COUNT: 1000 })) taskKeys.push(key)
+    }
+    for (const k of taskKeys) await redis.del(k)
+
+    // 3. 运行时策略
+    await redis.del(POLICY(gid))
+
+    // 4. 记忆（遍历群反向索引）
+    const { memoryIds } = await this.clearGroupMemories(gid)
+    return { rawCleaned, memoryIds }
   }
 
   /** 删除过期记忆（archived 超过宽限期 / validTo 过期超过宽限期） */
@@ -1077,7 +1144,6 @@ export class MemoryStore {
   async saveRawMessage(row, retentionDays = 30) {
     const redis = this.redis
     const gid = String(row.groupId)
-    const key = RAW(gid, row.messageId)
     const payload = {
       messageId: String(row.messageId),
       senderId: String(row.senderId),
@@ -1096,10 +1162,19 @@ export class MemoryStore {
     if (row.forward) payload.forward = row.forward
     if (Array.isArray(row.cards) && row.cards.length) payload.cards = row.cards
     if (row.poke) payload.poke = row.poke
-    await redis.set(key, JSON.stringify(payload))
-    if (retentionDays > 0) await redis.expire(key, retentionDays * 86400)
-    // score 统一为秒（与 getRawMessages 的秒级范围查询一致）
-    await redis.zAdd(RAWIDX(gid), { score: Number(payload.time) || Math.floor(Date.now() / 1000), value: String(row.messageId) })
+    if (this.memoryStorage() === 'file') {
+      // 文件模式：只追加到当天文件，不写 redis 原文与索引（TTL 由 cleanup 按日期文件处理）
+      await this.rawStore.append(gid, payload)
+    } else {
+      const key = RAW(gid, row.messageId)
+      // 顺序很重要：先建索引、再写正文。
+      // 中途失败时只会留下「索引有、正文无」的无害孤儿——所有读取/迁移/校验都显式跳过 null；
+      // 反过来的「正文有、索引无」迁移根本看不见，切到文件后端后会被当成残留清理掉（2026-11-04 实测 18,197 条）。
+      // score 统一为秒（与 getRawMessages 的秒级范围查询一致）
+      await redis.zAdd(RAWIDX(gid), { score: Number(payload.time) || Math.floor(Date.now() / 1000), value: String(row.messageId) })
+      await redis.set(key, JSON.stringify(payload))
+      if (retentionDays > 0) await redis.expire(key, retentionDays * 86400)
+    }
     // needs_reextract：补录/新消息改变了原文
     // - completed：窗口已提炼，需重提炼
     // - running：消息在模型生成期间到达，不在当前输入中，必须标记，完成后由下一轮重提炼
@@ -1126,8 +1201,13 @@ export class MemoryStore {
     }
   }
 
-  /** 取某群指定时间范围（秒）内的原文，按时间升序 */
-  async getRawMessages(groupId, startTime, endTime) {
+  /**
+   * 从 Redis 读某群原文（**忽略 memoryStorage 分流**）
+   *
+   * 迁移/校验要在两个后端之间比对，不能用 `getRawMessages`（file 模式下它读的是文件）。
+   * 只读、不删；`rawIdx` 里有但正文已被 TTL 清掉的 key 直接跳过（与迁移对账口径一致）。
+   */
+  async getRawMessagesFromRedis(groupId, startTime = 0, endTime = Number.MAX_SAFE_INTEGER) {
     const redis = this.redis
     const gid = String(groupId)
     const ids = await redis.zRangeByScore(RAWIDX(gid), startTime, endTime)
@@ -1135,10 +1215,29 @@ export class MemoryStore {
     for (const mid of ids) {
       const raw = await redis.get(RAW(gid, mid))
       if (!raw) continue
-      try { out.push(JSON.parse(raw)) } catch { /* ignore */ }
+      try { out.push(JSON.parse(raw)) } catch { /* 坏记录跳过，与 getRawMessages 一致 */ }
     }
     out.sort((a, b) => a.time - b.time)
     return out
+  }
+
+  /** 列出 Redis 里有原文索引的群号（迁移/校验用；限定 rawIdx 前缀，禁止 KEYS *） */
+  async listGroupsWithRaw() {
+    const prefix = `${PREFIX}:rawIdx:`
+    const groupIds = new Set()
+    if (!this.redis.scanIterator) return []
+    for await (const key of this.redis.scanIterator({ MATCH: `${prefix}*`, COUNT: 1000 })) {
+      const k = String(key)
+      if (k.startsWith(prefix)) groupIds.add(k.slice(prefix.length))
+    }
+    return [...groupIds]
+  }
+
+  /** 取某群指定时间范围（秒）内的原文，按时间升序 */
+  async getRawMessages(groupId, startTime, endTime) {
+    const gid = String(groupId)
+    if (this.memoryStorage() === 'file') return await this.rawStore.readRange(gid, startTime, endTime)
+    return await this.getRawMessagesFromRedis(gid, startTime, endTime)
   }
 
   /**
@@ -1169,6 +1268,10 @@ export class MemoryStore {
   async getRecentRawMessages(groupId, endTime) {
     const gid = String(groupId)
     const limit = 20000
+    if (this.memoryStorage() === 'file') {
+      // 文件模式按天倒序读，凑够 limit 条即停（与 redis 的 LIMIT 语义一致）
+      return await this.rawStore.readRecent(gid, endTime, limit)
+    }
     // ZRANGE BYSCORE REV 要求 Redis >= 6.2；宿主仍可能使用 6.0。
     // node-redis v4 没有旧命令的快捷方法，用 sendCommand 保留同样的倒序、时间与条数边界。
     const ids = await this.redis.sendCommand([
@@ -1189,6 +1292,13 @@ export class MemoryStore {
     const gid = String(groupId)
     const start = Math.max(0, Math.floor(Number(offset) || 0))
     const size = Math.max(1, Math.min(5000, Math.floor(Number(limit) || 0)))
+    if (this.memoryStorage() === 'file') {
+      // 文件后端没有 rawIdx，只能「读够 offset+size 条再截取」；每页重读一次最近窗口，
+      // 页大小上限 5000、单次调用最多几十页，量级远小于迁移，不做额外索引
+      const { rows } = await this.rawStore.readRecent(gid, endTime, start + size)
+      const page = rows.slice(start, start + size)
+      return { rows: page, count: page.length }
+    }
     const ids = await this.redis.sendCommand([
       'ZREVRANGEBYSCORE', RAWIDX(gid), String(endTime), '-inf', 'LIMIT', String(start), String(size)
     ])
@@ -1200,6 +1310,18 @@ export class MemoryStore {
   async getRawTimeRange(groupId) {
     const redis = this.redis
     const gid = String(groupId)
+    if (this.memoryStorage() === 'file') {
+      // 必须实现：返回 null 会让 dailyTask 直接 early-return（「文件模式一切正常但永远没有记忆」）
+      const rows = await this.rawStore.readRange(gid, 0, Number.MAX_SAFE_INTEGER)
+      if (rows.length === 0) return null
+      let min = Infinity, max = 0
+      for (const row of rows) {
+        const time = Number(row.time) || 0
+        if (time < min) min = time
+        if (time > max) max = time
+      }
+      return Number.isFinite(min) ? { minTime: min, maxTime: max } : null
+    }
     const all = await redis.zRange(RAWIDX(gid), 0, -1)
     if (all.length === 0) return null
     let min = Infinity, max = 0
@@ -1219,6 +1341,9 @@ export class MemoryStore {
   /** 清理过期的原文与索引（保留期内无需处理） */
   async cleanupExpiredRaw(groupId, retentionDays) {
     if (retentionDays <= 0) return 0
+    if (this.memoryStorage() === 'file') {
+      return await this.rawStore.cleanup(String(groupId), retentionDays, Date.now())
+    }
     const redis = this.redis
     const cutoff = Date.now() / 1000 - retentionDays * 86400
     const ids = await redis.zRangeByScore(RAWIDX(String(groupId)), 0, cutoff)
@@ -1278,6 +1403,97 @@ export class MemoryStore {
     for (const [k, v] of Object.entries(fields)) entries[k] = String(v ?? '')
     if (Object.keys(entries).length > 0) await this.redis.hSet(key, entries)
     return key
+  }
+
+  /* ================= 软关闭与无效群识别 ================= */
+
+  /**
+   * 记录某群的关闭时间（软关闭：只停采集，不删数据）
+   * 幂等：已有 closedAt 时保留最早时间，不覆盖——反悔窗口从第一次关闭起算，
+   * 否则反复点击 #群记忆关闭 就能无限推迟自动清理。
+   * @returns {Promise<boolean>} 本次是否真的写入（false = 早已关闭）
+   */
+  async markGroupClosed(groupId, ts = Date.now()) {
+    const policy = await this.getPolicy(groupId)
+    if (policy.closedAt) return false
+    await this.setPolicy(groupId, { closedAt: String(ts) })
+    return true
+  }
+
+  /** 清除关闭标记（#群记忆开启 时调用）；保留 lastDailyEnd 等提炼状态 */
+  async clearGroupClosedAt(groupId) {
+    return await this.redis.hDel(POLICY(String(groupId)), 'closedAt', 'closedBy')
+  }
+
+  /** 列出有记忆数据的群号（扫群反向索引，限定前缀，禁止 KEYS *） */
+  async listGroupsWithData() {
+    const prefix = `${PREFIX}:grp:`
+    const groupIds = new Set()
+    if (!this.redis.scanIterator) return []
+    for await (const key of this.redis.scanIterator({ MATCH: `${prefix}*`, COUNT: 1000 })) {
+      const k = String(key)
+      if (!k.startsWith(prefix)) continue
+      const gid = k.slice(prefix.length)
+      if (gid) groupIds.add(gid)
+    }
+    return [...groupIds]
+  }
+
+  /** 某群记忆条数：与 clearGroup 返回的 memoryIds 同口径（都数群反向索引） */
+  async countGroupMemories(groupId) {
+    const key = GRP(String(groupId))
+    if (typeof this.redis.sCard === 'function') return await this.redis.sCard(key)
+    return (await this.redis.sMembers(key)).length
+  }
+
+  /**
+   * 已打关闭标记的群数（关闭中 = 非授权且有 closedAt）
+   * 只遍历有数据的群，不按配置里的群号空转。
+   */
+  async countClosedGroups(authorizedIds) {
+    const authorized = new Set((Array.isArray(authorizedIds) ? authorizedIds : []).map(String))
+    let count = 0
+    for (const gid of await this.listGroupsWithData()) {
+      if (authorized.has(gid)) continue
+      const policy = await this.getPolicy(gid)
+      if (Number(policy.closedAt || 0) > 0) count++
+    }
+    return count
+  }
+
+  /**
+   * 列出「不在授权列表」且有记忆的群及条数（#清理无效记忆 的清单来源）
+   * 没有记忆的群不列出：空索引没有可清理的内容，列出只会误导。
+   * @returns {Promise<{groups: Array<{groupId: string, memoryCount: number}>, hasMore: boolean}>}
+   *          hasMore = 还有超出 limit 的群，调用方应提示「再执行一次」
+   */
+  async listUnauthorizedGroups(authorizedIds, limit = 50) {
+    const authorized = new Set((Array.isArray(authorizedIds) ? authorizedIds : []).map(String))
+    const max = Number.isInteger(limit) && limit > 0 ? limit : 50
+    const groups = []
+    let hasMore = false
+    for (const gid of await this.listGroupsWithData()) {
+      if (authorized.has(gid)) continue
+      const memoryCount = await this.countGroupMemories(gid)
+      if (memoryCount <= 0) continue
+      if (groups.length >= max) { hasMore = true; break }
+      groups.push({ groupId: gid, memoryCount })
+    }
+    return { groups, hasMore }
+  }
+
+  /* ================= 元信息 ================= */
+
+  async getMeta() {
+    const raw = await this.redis.hGetAll(META)
+    return raw && Object.keys(raw).length > 0 ? raw : {}
+  }
+
+  async setMeta(fields) {
+    const entries = {}
+    for (const [k, v] of Object.entries(fields || {})) entries[k] = String(v ?? '')
+    if (Object.keys(entries).length > 0) await this.redis.hSet(META, entries)
+    return META
   }
 
   /** 授权群列表（来自 Config.memoryGroupCapture.groups） */

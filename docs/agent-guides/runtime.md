@@ -11,7 +11,11 @@
 
 - 业务态前缀 `CHATGPT:`：`CHATGPT:CONVERSATIONS:*`（会话）、`CHATGPT:USE`（当前模型）、`CHATGPT:MESSAGE*` 等。
 - 偷图撤销 `CHATGPT:EMOJI_UNDO:<群号|8888>_<回执消息id>`：值为 `{ path, emotion, isNew }`，TTL 两周；`#gpt撤销偷图` 按被引用回执的消息 id 取回图片路径，`isNew=false` 表示这张图早就在库里、只清记录不删文件。私聊与群聊用 8888／群号分隔，避免消息 id 跨会话撞车。
-- 记忆 V2 前缀 `CHATGPT:MEMORY:V2:`：`item:{id}`（记忆本体）、`idx:*/slot:*/grp:*`（索引）、`evd:{id}`（证据集）、`raw:*/rawIdx:*`（原文）、`task:{gid}:{day}`（提炼任务）、`policy:{gid}`（游标）。
+- 记忆 V2 前缀 `CHATGPT:MEMORY:V2:`：`item:{id}`（记忆本体）、`idx:*/slot:*/grp:*`（索引）、`evd:{id}`（证据集）、`raw:*/rawIdx:*`（原文）、`task:{gid}:{day}`（提炼任务）、`policy:{gid}`（游标 + 软关闭时间戳 `closedAt`）。
+- 原文存储后端由 `Config.memoryStorage` 决定：`redis` 写 `raw:*/rawIdx:*`；`file` 写 `data/chatgpt/memory/raw/<群号>/<YYYY-MM-DD>.ndjson`（北京时间分天、只追加、读取按 `messageId` 去重，`rawIdx` 不再写入）。文件模式为单实例假设，多实例同时写同一群目录不在支持范围。
+- 关闭采集是**软关闭**：`#群记忆关闭` 只置 `switchOn:false` 并在 `policy:{gid}` 写 `closedAt`，不删任何数据。每日任务对非授权群先打标、满 `closedGroupRetentionDays` 后才清记忆与索引（`clearGroupMemories`，不动原文、不动 `policy`）；授权中的群若残留 `closedAt` 会被自愈清除。`#清理无效记忆` 是手动立即清理，执行前会重判授权，避免确认期间重新勾选的群被误清。
+- `#记忆迁移到文件` 的顺序：先迁移（只 append 缺失的 `messageId`，不删 Redis）→ 再切 `memoryStorage` → 观察 1~2 天 → 再考虑清 Redis 旧原文。一次处理全部群、不分批；重复执行幂等，`dbsize` 前后比对只告警不阻断。
+- 迁移按群一次性读入该群全部原文（Redis 与文件两侧各读一遍），单群原文量很大时会有内存峰值；`校验` 里的 `extra-in-file` 是切到文件模式后新采集的数据，属正常，只有 `missing-in-file` / `changed` 才需要处理。
 - 旧记忆 Hash `CHATGPT:MEMORY:USER:*`：**只读用于清理**，首次 V2 写入即删，不要读取/展示其内容。
 - **node-redis 4.7 API 注意**：`zAdd(key, { score, value })`（对象形式）；`hSet(key, obj)`；`scanIterator({ MATCH })`；`del(...keys)` 支持多键。
 - **客户端 API 不等于服务端版本保证**：`zRange(..., { BY: 'SCORE', REV: true })` 发送的 `ZRANGE BYSCORE REV` 需要 Redis 6.2，6.0 会报整数范围错误。图谱的倒序时间查询用 `sendCommand(['ZREVRANGEBYSCORE', ...])` 保持 6.0 兼容，且仍带 `LIMIT`；node-redis v4 没有该旧命令的快捷方法。

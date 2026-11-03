@@ -7,7 +7,30 @@ import { speakers, vits_emotion_map } from './utils/tts.js'
 import { supportConfigurations as azureRoleList } from './utils/tts/microsoft-azure.js'
 import { formatMcpServersForGuoba, stringifyMcpServersFromGuoba } from './utils/mcpServersGuoba.js'
 import { RECALL_MODE_ALL } from './utils/memory/recallMode.js'
+import { MemoryStore } from './utils/memory/store.js'
 import lodash from "lodash";
+
+/**
+ * 面板重新勾选群时清掉历史 `closedAt`。
+ *
+ * 场景：群 3 月关闭（policy.closedAt=3 月）→ 4 月面板重新勾选（不走 #群记忆开启，标记还在）
+ * → 5 月又取消 → 次日 sweep 看到「已关闭 90 天以上」，直接清空且没有反悔窗口。
+ *
+ * 面板保存是最先能观察到「重新授权」的时刻，所以在这里清；`memory/store.js` 不创建 redis 客户端，
+ * 这里只借用它的 `clearGroupClosedAt`（避免在面板里重复一份 policy key 拼装逻辑）。
+ * 整个动作 best-effort：redis 不可用或没有对应方法时静默跳过，绝不让保存失败。
+ */
+async function clearClosedAtForReopenedGroups(groupIds) {
+  if (!Array.isArray(groupIds) || groupIds.length === 0) return
+  const redis = globalThis.redis
+  if (!redis || typeof redis.hDel !== 'function') return
+  try {
+    const store = new MemoryStore(redis)
+    for (const gid of groupIds) await store.clearGroupClosedAt(gid)
+  } catch (err) {
+    logger.warn?.(`[MemoryV2] 清除重新授权群的关闭标记失败（不影响保存）：${err.message}`)
+  }
+}
 
 /**
  * 「Bot 响应白名单」的候选账号：以宿主的登录账号表 Bot.uin 为准。
@@ -50,6 +73,20 @@ function botAccountOptions() {
     if (id) add(id, `${id}（当前未登录）`)
   }
   return options
+}
+
+/**
+ * 群选择器（GSelectGroup）交回的是群号数组，但历史配置与手工调用可能是三种形态：
+ * 纯群号、数字、`[{ groupId }]` 旧对象。统一成去重后的群号字符串，
+ * 面板保存与旧配置共用同一条入口，避免「换了组件就丢群」。
+ */
+function normalizeGroupIds(value) {
+  const list = Array.isArray(value) ? value : String(value ?? '').split(/[,，;；|\s]/)
+  const ids = list
+    .map(item => (item && typeof item === 'object' ? item.groupId : item))
+    .map(item => String(item ?? '').trim())
+    .filter(item => /^\d+$/.test(item))
+  return [...new Set(ids)]
 }
 
 // 支持锅巴
@@ -1893,34 +1930,42 @@ export function supportGuoba() {
         {
           field: 'memoryGroupCapture.groups',
           label: '授权采集群',
-          bottomHelpMessage: '群聊采集必须由 Bot 主人在此显式授权或群内 #群记忆开启；仅采集授权群的非指令、非Bot纯文本；⚠️ 注意：关闭某群的"开启采集"开关仅停止后续采集，不会删除已采集的原文与记忆，如需来源级清理请在群内使用 #群记忆关闭 指令',
-          component: 'GSubForm',
+          bottomHelpMessage: '群聊采集必须由 Bot 主人在此显式授权或群内 #群记忆开启；只有选中的群会被采集，仅采集非指令、非Bot纯文本；面板取消选中或群内 #群记忆关闭 都只停止采集，不删数据；记忆按下面的关闭保留天数到期清理，要立刻清用 #清理无效记忆',
+          component: 'GSelectGroup',
           componentProps: {
-            multiple: true,
-            schemas: [
-              {
-                field: 'groupId',
-                label: '群号',
-                component: 'Input',
-                required: true,
-              },
-              {
-                field: 'switchOn',
-                label: '开启采集',
-                component: 'Switch',
-                bottomHelpMessage: '需要群内使用 #群记忆开启 #群记忆关闭 指令来触发记忆清理功能',
-              },
-            ],
+            placeholder: '点击选择要采集的群',
           },
         },
         {
           field: 'memoryGroupCapture.rawRetentionDays',
           label: '原文保留天数',
-          bottomHelpMessage: '采集到的群消息原文保留天数，默认 30 天',
+          bottomHelpMessage: '采集到的群消息原文保留天数，默认 30 天；0 = 永久保留。Redis 与文件后端同一口径，文件模式按天删文件（保留至少 N 天）',
           component: 'InputNumber',
           componentProps: {
-            min: 1,
+            min: 0,
             step: 1
+          }
+        },
+        {
+          field: 'memoryGroupCapture.closedGroupRetentionDays',
+          label: '关闭后记忆保留天数',
+          bottomHelpMessage: '关闭采集的群，其记忆与索引再保留多少天，到期由每日任务自动清理，默认 90 天；填 0 表示永不自动清理（仍可用 #清理无效记忆 手动清）。原文不参与这条清理，只看上面的原文保留天数',
+          component: 'InputNumber',
+          componentProps: {
+            min: 0,
+            step: 1
+          }
+        },
+        {
+          field: 'memoryStorage',
+          label: '群消息原文存储后端',
+          bottomHelpMessage: '一般不用在这里手改：在群里发 #记忆存储 文件 会「迁移 + 切换」一次做完，发 #记忆存储 查看状态、#记忆存储 清理 释放 Redis 内存。手动切换前也必须先迁移，否则旧原文不会出现在新后端里；切换不删 Redis 任何数据，可随时切回。文件以 NDJSON 存在 data/chatgpt/memory/raw/<群号>/<日期>.ndjson，按群按天追加；记忆本体、提炼任务与策略始终在 Redis；不支持多实例同时写同一文件目录',
+          component: 'Select',
+          componentProps: {
+            options: [
+              { label: 'Redis（默认）', value: 'redis' },
+              { label: '文件（data/chatgpt/memory）', value: 'file' }
+            ]
           }
         },
         // {
@@ -2040,13 +2085,27 @@ export function supportGuoba() {
         {
           field: 'groupReply.groups',
           label: '自主回复群',
-          bottomHelpMessage: '仅从开启后采集，最近记录暂存在内存，重启清空；关闭停止采集和待发回复，缓存最多一分钟内清理，不读取或修改记忆 V2 的授权与数据；可用指令： #群聊自主回复[开启|关闭]',
+          bottomHelpMessage: '只有选中的群会被采集并判断是否回复；最近记录暂存在内存，重启清空；取消选中立即停止采集并释放待发回复，缓存最多一分钟内清理，不读取或修改记忆 V2 的授权与数据；每群参数在下方“每群判断参数”里微调；群内可用指令： #群聊自主回复[开启|关闭]',
+          component: 'GSelectGroup',
+          componentProps: {
+            placeholder: '点击选择要自主回复的群',
+          }
+        },
+        {
+          field: 'groupReply.groupTuning',
+          label: '每群判断参数（可选）',
+          bottomHelpMessage: '只对上方已选中的群生效；留空的项用默认值（判断间隔 60 秒、热情度 40%）。群号必须与上方选中的群一致，未选中的群不会因为这里有记录而被启用',
           component: 'GSubForm',
           componentProps: {
             multiple: true,
             schemas: [
-              { field: 'groupId', label: '群号', component: 'Input', required: true },
-              { field: 'switchOn', label: '开启采集与回复', component: 'Switch' },
+              {
+                field: 'groupId',
+                label: '群号',
+                bottomHelpMessage: '需先在“自主回复群”里选中该群',
+                component: 'Input',
+                required: true,
+              },
               {
                 field: 'debounceSeconds',
                 label: '每隔多久判断是否回复（秒）',
@@ -2096,8 +2155,11 @@ export function supportGuoba() {
         {
           field: 'initiativeChatGroups',
           label: '主动发起聊天群聊的群号',
-          bottomHelpMessage: '在这些群聊里会不定时主动说一些随机的打招呼的话，用英文逗号隔开。必须配置了OpenAI Key。呆毛:"经测试喵崽无法使用"，推荐使用 sf插件 的自动打招呼 https://github.com/AIGC-Yunzai/siliconflow-plugin',
-          component: 'Input'
+          bottomHelpMessage: '在这些群聊里会不定时主动说一些随机的打招呼的话，点选即可（可多选）。必须配置了OpenAI Key。呆毛:"经测试喵崽无法使用"，推荐使用 sf插件 的自动打招呼 https://github.com/AIGC-Yunzai/siliconflow-plugin',
+          component: 'GSelectGroup',
+          componentProps: {
+            placeholder: '点击选择要主动打招呼的群',
+          },
         },
         {
           field: 'helloPrompt',
@@ -2830,7 +2892,31 @@ export function supportGuoba() {
           const content = (t.content || '').replace(/\[CQ:[^\]]+\]/g, '').trim()
           return `${t.user_id} | ${t.group_id || '私聊'} | [${t.taskId}] | ${t.cronExpression} | ${content}`
         })
-        configObj.groupReply = normalizeGroupReplyConfig(configObj.groupReply)
+        // 群选择器（GSelectGroup）只认群号数组：面板显示「启用中的群」，
+        // 落盘仍是 [{ groupId, switchOn, ... }]，运行时的授权判断与每群参数都不用改。
+        // 回填必须用数字：锅巴群列表的 rowKey 是数字，字符串会让弹窗里的已选群勾不上。
+        configObj.memoryGroupCapture = {
+          ...(Config.memoryGroupCapture || {}),
+          groups: (Array.isArray(Config.memoryGroupCapture?.groups) ? Config.memoryGroupCapture.groups : [])
+            .filter(g => g && g.groupId && g.switchOn)
+            .map(g => Number(g.groupId))
+            .filter(id => Number.isSafeInteger(id) && id > 0)
+        }
+        const groupReplyConfig = normalizeGroupReplyConfig(configObj.groupReply)
+        const enabledReplyGroups = groupReplyConfig.groups.filter(g => g.switchOn)
+        configObj.groupReply = {
+          ...groupReplyConfig,
+          // GSelectGroup 只认群号数组；启用的群由对象数组投影而来
+          groups: enabledReplyGroups.map(g => Number(g.groupId)),
+          // 派生视图：只用于面板回显每群参数，不落盘（保存时由 setConfigData 写回 groups）
+          groupTuning: enabledReplyGroups.map(g => ({
+            groupId: g.groupId,
+            debounceSeconds: g.debounceSeconds,
+            enthusiasm: g.enthusiasm
+          }))
+        }
+        // 旧配置里这个键可能是逗号字符串，统一走同一个群号归一，组件只吃数组
+        configObj.initiativeChatGroups = normalizeGroupIds(Config.initiativeChatGroups).map(Number)
         configObj.avatarReply = normalizeAvatarReplyConfig(configObj.avatarReply)
         configObj.mcpServers = formatMcpServersForGuoba(configObj.mcpServers)
 
@@ -2839,6 +2925,8 @@ export function supportGuoba() {
       // 设置配置的方法（前端点确定后调用的方法）
       async setConfigData(data, { Result }) {
         const candidate = lodash.cloneDeep(Config.getConfig())
+        let groupTuning
+        let reopenedGroups = []
         try {
           for (let [keyPath, value] of Object.entries(data)) {
             // 处理循环任务标签删除同步
@@ -2864,7 +2952,7 @@ export function supportGuoba() {
               value = [...new Set(list.map(item => String(item).trim()).filter(Boolean))]
             }
             // 处理黑名单
-            else if (keyPath === 'blockWords' || keyPath === 'promptBlockWords' || keyPath === 'initiativeChatGroups' || keyPath === 'paimon_chuoyichuo_ByMsgGroups') {
+            else if (keyPath === 'blockWords' || keyPath === 'promptBlockWords' || keyPath === 'paimon_chuoyichuo_ByMsgGroups') {
               value = value.toString().split(/[,，;；\|]/)
             }
             else if (keyPath === 'blacklist' || keyPath === 'whitelist') {
@@ -2878,12 +2966,88 @@ export function supportGuoba() {
                 return acc
               }, [])
             }
+            // 群选择器（GSelectGroup）只交群号数组；落盘仍保持对象数组，
+            // 运行时的授权判断、每群参数与群内指令都不用跟着换数据结构。
+            else if (keyPath === 'memoryGroupCapture.groups') {
+              if (value == null) continue
+              const previousAuthorized = new Set((Array.isArray(candidate.memoryGroupCapture?.groups) ? candidate.memoryGroupCapture.groups : [])
+                .filter(g => g && g.groupId && g.switchOn)
+                .map(g => String(g.groupId)))
+              // 旧缓存页面按对象数组提交时保留它自己的开关状态，新面板只交群号（一律视为开启）
+              const incoming = new Map((Array.isArray(value) ? value : [])
+                .filter(g => g && typeof g === 'object' && g.groupId)
+                .map(g => [String(g.groupId).trim(), g]))
+              value = normalizeGroupIds(value).map(groupId => ({
+                groupId,
+                switchOn: incoming.get(groupId)?.switchOn !== false
+              }))
+              // 本次新勾选的群：保存后要清掉它们的 closedAt，否则「重开又取消」会被判满期直清
+              reopenedGroups = value
+                .filter(g => g.switchOn && !previousAuthorized.has(String(g.groupId)))
+                .map(g => g.groupId)
+            }
+            else if (keyPath === 'memoryGroupCapture.rawRetentionDays') {
+              // 0 是合法值（永久保留），不能走 Number(value) || 30
+              const days = Number(value)
+              value = Number.isFinite(days) && days >= 0 ? Math.trunc(days) : 30
+            }
+            else if (keyPath === 'memoryGroupCapture.closedGroupRetentionDays') {
+              const days = Number(value)
+              value = Number.isFinite(days) && days >= 0 ? Math.trunc(days) : 90
+            }
+            else if (keyPath === 'memoryStorage') {
+              value = value === 'file' ? 'file' : 'redis'
+            }
+            else if (keyPath === 'groupReply.groups') {
+              if (value == null) continue
+              const previous = new Map((Array.isArray(candidate.groupReply?.groups) ? candidate.groupReply.groups : [])
+                .filter(g => g && g.groupId)
+                .map(g => [String(g.groupId), g]))
+              // 旧缓存页面仍可能按对象数组提交；能带的每群参数一并带上，避免保存一次就被重置成默认值
+              const legacy = new Map((Array.isArray(value) ? value : [])
+                .filter(g => g && typeof g === 'object' && g.groupId)
+                .map(g => [String(g.groupId).trim(), g]))
+              value = normalizeGroupIds(value).map(groupId => {
+                const prev = previous.get(groupId) || {}
+                const old = legacy.get(groupId) || {}
+                return {
+                  ...prev,
+                  groupId,
+                  switchOn: old.switchOn !== false,
+                  debounceSeconds: old.debounceSeconds ?? prev.debounceSeconds ?? 60,
+                  enthusiasm: old.enthusiasm ?? prev.enthusiasm ?? 40
+                }
+              })
+            }
+            else if (keyPath === 'groupReply.groupTuning') {
+              // 派生表只回写每群参数，不落盘；等循环结束再合并，避免对象键顺序影响结果
+              if (value == null) continue
+              groupTuning = value
+              continue
+            }
+            else if (keyPath === 'initiativeChatGroups') {
+              if (value == null) continue
+              value = normalizeGroupIds(value)
+            }
             // else if (keyPath === 'autoEmoticons.allowGroups' || keyPath === 'autoEmoticons.getBotByQQ_targetQQArr') {
             //   value = value.map(item => item.trim()).filter(item => item !== '')
             // }
 
             // 使用 lodash 处理锅巴传入的 点分隔 keyPath
             lodash.set(candidate, keyPath, value)
+          }
+
+          // 每群参数必须在选群结果确定后合并：新加的群在上一轮还不存在，先合并会被跳过
+          if (groupTuning !== undefined) {
+            const groups = Array.isArray(candidate.groupReply?.groups) ? candidate.groupReply.groups : []
+            const byId = new Map(groups.filter(g => g && g.groupId).map(g => [String(g.groupId), g]))
+            for (const row of Array.isArray(groupTuning) ? groupTuning : []) {
+              const target = byId.get(String(row?.groupId ?? '').trim())
+              if (!target) continue
+              target.debounceSeconds = row.debounceSeconds
+              target.enthusiasm = row.enthusiasm
+            }
+            candidate.groupReply = { ...(candidate.groupReply || {}), groups }
           }
 
           // 正确储存azureRoleSelect结果
@@ -2904,6 +3068,8 @@ export function supportGuoba() {
 
           // 对于 config 中对象/对象数组 的修改 Proxy 对象不会执行 set() 所以要手动保存
           Config.commit(candidate)
+          // 面板新勾选的群：清掉历史关闭标记（sweep 自愈的窄窗口）
+          if (reopenedGroups.length) await clearClosedAtForReopenedGroups(reopenedGroups)
           return Result.ok({}, '保存成功~')
         } catch (err) {
           return Result.error(`配置保存失败：${err.message}`)

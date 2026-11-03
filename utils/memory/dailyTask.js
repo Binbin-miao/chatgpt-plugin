@@ -17,7 +17,7 @@
  */
 
 import { Config } from '../config.js'
-import { MemoryStore } from './store.js'
+import { MemoryStore, normalizeRetentionDays } from './store.js'
 import { runExtraction, toPromptRows, isRetryableLLMError, MEMORY_INPUT_TOKEN_LIMIT } from './extractor.js'
 import { contentHash } from './capture.js'
 import { compressMemoryScope } from './compression.js'
@@ -30,6 +30,9 @@ const MAX_ATTEMPTS = 20
 const MAX_ATTEMPTS_PER_RUN = 3
 const MAX_WINDOWS_PER_SCAN = 2
 const CRASH_TIMEOUT_MS = 10 * 60 * 1000
+/** 关闭群清理单轮上限：一次清太多群会长时间占住事件循环（只限清理，打标不设限） */
+const MAX_SWEEP_GROUPS = 50
+const DAY_MS = 86400000
 
 /* ================= 北京时间工具 ================= */
 
@@ -88,9 +91,11 @@ export class DailyConsolidation {
     return {
       groups: g.groups || [],
       inputTokenLimit: MEMORY_INPUT_TOKEN_LIMIT,
-      rawRetentionDays: Number(g.rawRetentionDays) || 30,
+      rawRetentionDays: normalizeRetentionDays(g.rawRetentionDays, 30),
       // 临时事件（episode/plan）的默认有效期，独立于原文保留天数；锅巴面板不暴露，改配置即可
       eventRetentionDays: Number(g.eventRetentionDays) || 90,
+      // 关闭采集的群，其记忆保留天数（0 = 永不自动清理）
+      closedGroupRetentionDays: normalizeRetentionDays(g.closedGroupRetentionDays, 90),
       maxAttempts: MAX_ATTEMPTS,
       // 提炼供应商：条目 ID 或 'current'（跟随全局对话模型），对应锅巴「提炼模型来源」
       use: typeof g.provider === 'string' && g.provider ? g.provider : 'current',
@@ -131,11 +136,87 @@ export class DailyConsolidation {
       // 无论压缩模型成功与否，确定性过期清理都独立执行。
       const removed = await this.store.deleteExpired(30)
       report.expiredRemoved = removed
+      // 关闭采集的群（不在授权列表）：首次只打标，满保留期才清记忆，不清原文以外的授权群数据
+      try {
+        report.closedGroupsSweep = await this.sweepClosedGroups(cfg)
+      } catch (err) {
+        logger?.warn?.(`[MemoryV2] 关闭群清理失败，数据保持原样：${err.message}`)
+        report.closedGroupsSweepError = err.message
+      }
       logger?.info?.(`[MemoryV2] 每日提炼完成: ${JSON.stringify(report)}`)
       return report
     } finally {
       this.processing = false
     }
+  }
+
+  /**
+   * 清理「已不在授权列表」的群记忆（在逐群 cleanupExpiredRaw 之后执行）
+   *
+   * 语义（spec D5/D6）：
+   * - 非授权群没有 closedAt → 本轮只打标，不删（防止面板取消选中被第二天清空）
+   * - 有 closedAt 且 retentionDays > 0 且已满期 → `clearGroupMemories`：**只清记忆与索引**，
+   *   不动原文（原文只归 rawRetentionDays）、不动 policy（lastDailyEnd 一删，重新授权会把残留原文整段重提炼）
+   * - retentionDays = 0 → 永不自动清理
+   * - 授权中的群 → 不可清理；若还留着历史 closedAt 则**顺手清掉**（自愈，计入 healed）：
+   *   面板重新勾选不走 #群记忆开启，旧 closedAt 会让「下次取消选中」直接满期被清
+   *
+   * @param {Object} cfg cfg() 结果（测试可直接注入 groups / closedGroupRetentionDays）
+   * @returns {Promise<{scanned: number, marked: number, healed: number, purged: number, purgedGroups: Array}>}
+   */
+  async sweepClosedGroups(cfg = this.cfg()) {
+    const store = this.store
+    const now = Date.now()
+    const retentionDaysValue = normalizeRetentionDays(cfg.closedGroupRetentionDays, 90)
+    const rawRetentionDays = normalizeRetentionDays(cfg.rawRetentionDays, 30)
+    const authorized = new Set(MemoryStore.authorizedGroups(cfg.groups).map(g => g.groupId))
+    const purgedGroups = []
+    let scanned = 0
+    let marked = 0
+    let healed = 0
+
+    const memoryGroups = new Set(await store.listGroupsWithData())
+    // 文件模式没有 TTL：只在原文里出现过、从未提炼过的群不在 grp 索引中，
+    // 必须把原文目录也纳入扫描，否则关闭后这些群的 ndjson 永远不会过期。
+    const candidates = new Set(memoryGroups)
+    if (store.memoryStorage() === 'file') {
+      for (const gid of await store.rawStore.listGroups()) candidates.add(gid)
+    }
+
+    for (const gid of candidates) {
+      const policy = await store.getPolicy(gid)
+      const closedAt = Number(policy.closedAt || 0)
+      if (authorized.has(gid)) {
+        // 自愈：重新授权的群不该背着他日的关闭时间戳
+        if (closedAt) {
+          await store.clearGroupClosedAt(gid)
+          healed++
+          logger?.info?.(`[MemoryV2] 群 ${gid} 已重新授权，清除历史关闭标记 ${policy.closedAt}`)
+        }
+        continue
+      }
+      scanned++
+      // 原文只按 rawRetentionDays 过期。redis 模式有 TTL 兜底，文件模式没有，
+      // 关闭群又不在逐群提炼循环里，所以必须在这里主动删过期日期文件。
+      if (rawRetentionDays > 0) await store.cleanupExpiredRaw(gid, rawRetentionDays)
+      if (!closedAt) {
+        // 首次发现：只打标，留着完整的反悔窗口（只有原文、没有记忆的群不写 policy）
+        if (memoryGroups.has(gid) && await store.markGroupClosed(gid, now)) marked++
+        continue
+      }
+      if (retentionDaysValue <= 0) continue
+      if (now - closedAt < retentionDaysValue * DAY_MS) continue
+      // 上限只限「清理」这一个动作：打标与自愈照常走完全部群，多出的清理留到下一轮
+      if (purgedGroups.length >= MAX_SWEEP_GROUPS) continue
+      const result = await store.clearGroupMemories(gid)
+      purgedGroups.push({ groupId: gid, memories: result.memoryIds })
+      logger?.info?.(`[MemoryV2] 群 ${gid} 关闭已满 ${retentionDaysValue} 天，清理 ${result.memoryIds} 条记忆（原文按 ${rawRetentionDays} 天保留）`)
+    }
+
+    const summary = { scanned, marked, healed, purged: purgedGroups.length, purgedGroups }
+    // 状态展示（#群记忆状态）读这两个字段；写入失败不影响清理结果
+    await store.setMeta({ lastSweepAt: now, lastSweepPurged: purgedGroups.length })
+    return summary
   }
 
   /**

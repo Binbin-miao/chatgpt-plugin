@@ -93,7 +93,7 @@ test('锅巴记忆召回模型：默认关闭、接口选项、保存与重载',
   `))
   const saved = run(`
     const field = guoba.schemas.find(s => s.field === 'memoryRecallProvider')
-    assert.equal(field.label, '记忆召回判断模型')
+    assert.equal(field.label, '记忆召回判断方式')
     // '' 之后紧跟「按权重导入」哨兵 'all'，再是跟随全局与已配置接口
     assert.deepEqual(field.componentProps.options.map(o => o.value), ['', 'all', 'current', 'prov-aaa'])
     // 召回条数上限不再有"达到个人容量就全量注入"的语义，文案必须改成推荐值
