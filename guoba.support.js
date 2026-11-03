@@ -52,20 +52,6 @@ function botAccountOptions() {
   return options
 }
 
-/**
- * 群选择器（GSelectGroup）交回的是群号数组，但历史配置与手工调用可能是三种形态：
- * 纯群号、数字、`[{ groupId }]` 旧对象。统一成去重后的群号字符串，
- * 面板保存与旧配置共用同一条入口，避免「换了组件就丢群」。
- */
-function normalizeGroupIds(value) {
-  const list = Array.isArray(value) ? value : String(value ?? '').split(/[,，;；|\s]/)
-  const ids = list
-    .map(item => (item && typeof item === 'object' ? item.groupId : item))
-    .map(item => String(item ?? '').trim())
-    .filter(item => /^\d+$/.test(item))
-  return [...new Set(ids)]
-}
-
 // 支持锅巴
 export function supportGuoba() {
   const roleOptions = avatarOptions()
@@ -1907,10 +1893,24 @@ export function supportGuoba() {
         {
           field: 'memoryGroupCapture.groups',
           label: '授权采集群',
-          bottomHelpMessage: '群聊采集必须由 Bot 主人在此显式授权或群内 #群记忆开启；只有选中的群会被采集，仅采集非指令、非Bot纯文本；⚠️ 面板取消选中只停止后续采集，不会删除已采集的原文与记忆；如需来源级清理，请在群内使用 #群记忆关闭 指令',
-          component: 'GSelectGroup',
+          bottomHelpMessage: '群聊采集必须由 Bot 主人在此显式授权或群内 #群记忆开启；仅采集授权群的非指令、非Bot纯文本；⚠️ 注意：关闭某群的"开启采集"开关仅停止后续采集，不会删除已采集的原文与记忆，如需来源级清理请在群内使用 #群记忆关闭 指令',
+          component: 'GSubForm',
           componentProps: {
-            placeholder: '点击选择要采集的群',
+            multiple: true,
+            schemas: [
+              {
+                field: 'groupId',
+                label: '群号',
+                component: 'Input',
+                required: true,
+              },
+              {
+                field: 'switchOn',
+                label: '开启采集',
+                component: 'Switch',
+                bottomHelpMessage: '需要群内使用 #群记忆开启 #群记忆关闭 指令来触发记忆清理功能',
+              },
+            ],
           },
         },
         {
@@ -2040,27 +2040,13 @@ export function supportGuoba() {
         {
           field: 'groupReply.groups',
           label: '自主回复群',
-          bottomHelpMessage: '只有选中的群会被采集并判断是否回复；最近记录暂存在内存，重启清空；取消选中立即停止采集并释放待发回复，缓存最多一分钟内清理，不读取或修改记忆 V2 的授权与数据；每群参数在下方“每群判断参数”里微调；群内可用指令： #群聊自主回复[开启|关闭]',
-          component: 'GSelectGroup',
-          componentProps: {
-            placeholder: '点击选择要自主回复的群',
-          }
-        },
-        {
-          field: 'groupReply.groupTuning',
-          label: '每群判断参数（可选）',
-          bottomHelpMessage: '只对上方已选中的群生效；留空的项用默认值（判断间隔 60 秒、热情度 40%）。群号必须与上方选中的群一致，未选中的群不会因为这里有记录而被启用',
+          bottomHelpMessage: '仅从开启后采集，最近记录暂存在内存，重启清空；关闭停止采集和待发回复，缓存最多一分钟内清理，不读取或修改记忆 V2 的授权与数据；可用指令： #群聊自主回复[开启|关闭]',
           component: 'GSubForm',
           componentProps: {
             multiple: true,
             schemas: [
-              {
-                field: 'groupId',
-                label: '群号',
-                bottomHelpMessage: '需先在“自主回复群”里选中该群',
-                component: 'Input',
-                required: true,
-              },
+              { field: 'groupId', label: '群号', component: 'Input', required: true },
+              { field: 'switchOn', label: '开启采集与回复', component: 'Switch' },
               {
                 field: 'debounceSeconds',
                 label: '每隔多久判断是否回复（秒）',
@@ -2110,11 +2096,8 @@ export function supportGuoba() {
         {
           field: 'initiativeChatGroups',
           label: '主动发起聊天群聊的群号',
-          bottomHelpMessage: '在这些群聊里会不定时主动说一些随机的打招呼的话，点选即可（可多选）。必须配置了OpenAI Key。呆毛:"经测试喵崽无法使用"，推荐使用 sf插件 的自动打招呼 https://github.com/AIGC-Yunzai/siliconflow-plugin',
-          component: 'GSelectGroup',
-          componentProps: {
-            placeholder: '点击选择要主动打招呼的群',
-          },
+          bottomHelpMessage: '在这些群聊里会不定时主动说一些随机的打招呼的话，用英文逗号隔开。必须配置了OpenAI Key。呆毛:"经测试喵崽无法使用"，推荐使用 sf插件 的自动打招呼 https://github.com/AIGC-Yunzai/siliconflow-plugin',
+          component: 'Input'
         },
         {
           field: 'helloPrompt',
@@ -2847,31 +2830,7 @@ export function supportGuoba() {
           const content = (t.content || '').replace(/\[CQ:[^\]]+\]/g, '').trim()
           return `${t.user_id} | ${t.group_id || '私聊'} | [${t.taskId}] | ${t.cronExpression} | ${content}`
         })
-        // 群选择器（GSelectGroup）只认群号数组：面板显示「启用中的群」，
-        // 落盘仍是 [{ groupId, switchOn, ... }]，运行时的授权判断与每群参数都不用改。
-        // 回填必须用数字：锅巴群列表的 rowKey 是数字，字符串会让弹窗里的已选群勾不上。
-        configObj.memoryGroupCapture = {
-          ...(Config.memoryGroupCapture || {}),
-          groups: (Array.isArray(Config.memoryGroupCapture?.groups) ? Config.memoryGroupCapture.groups : [])
-            .filter(g => g && g.groupId && g.switchOn)
-            .map(g => Number(g.groupId))
-            .filter(id => Number.isSafeInteger(id) && id > 0)
-        }
-        const groupReplyConfig = normalizeGroupReplyConfig(configObj.groupReply)
-        const enabledReplyGroups = groupReplyConfig.groups.filter(g => g.switchOn)
-        configObj.groupReply = {
-          ...groupReplyConfig,
-          // GSelectGroup 只认群号数组；启用的群由对象数组投影而来（同样用数字，见上）
-          groups: enabledReplyGroups.map(g => Number(g.groupId)),
-          // 派生视图：只用于面板回显每群参数，不落盘（保存时由 setConfigData 写回 groups）
-          groupTuning: enabledReplyGroups.map(g => ({
-            groupId: g.groupId,
-            debounceSeconds: g.debounceSeconds,
-            enthusiasm: g.enthusiasm
-          }))
-        }
-        // 旧配置里这个键可能是逗号字符串，统一走同一个群号归一，组件只吃数组
-        configObj.initiativeChatGroups = normalizeGroupIds(Config.initiativeChatGroups).map(Number)
+        configObj.groupReply = normalizeGroupReplyConfig(configObj.groupReply)
         configObj.avatarReply = normalizeAvatarReplyConfig(configObj.avatarReply)
         configObj.mcpServers = formatMcpServersForGuoba(configObj.mcpServers)
 
@@ -2880,7 +2839,6 @@ export function supportGuoba() {
       // 设置配置的方法（前端点确定后调用的方法）
       async setConfigData(data, { Result }) {
         const candidate = lodash.cloneDeep(Config.getConfig())
-        let groupTuning
         try {
           for (let [keyPath, value] of Object.entries(data)) {
             // 处理循环任务标签删除同步
@@ -2906,7 +2864,7 @@ export function supportGuoba() {
               value = [...new Set(list.map(item => String(item).trim()).filter(Boolean))]
             }
             // 处理黑名单
-            else if (keyPath === 'blockWords' || keyPath === 'promptBlockWords' || keyPath === 'paimon_chuoyichuo_ByMsgGroups') {
+            else if (keyPath === 'blockWords' || keyPath === 'promptBlockWords' || keyPath === 'initiativeChatGroups' || keyPath === 'paimon_chuoyichuo_ByMsgGroups') {
               value = value.toString().split(/[,，;；\|]/)
             }
             else if (keyPath === 'blacklist' || keyPath === 'whitelist') {
@@ -2920,69 +2878,12 @@ export function supportGuoba() {
                 return acc
               }, [])
             }
-            // 群选择器（GSelectGroup）只交群号数组；落盘仍保持对象数组，
-            // 运行时的授权判断、每群参数与群内指令都不用跟着换数据结构。
-            else if (keyPath === 'memoryGroupCapture.groups') {
-              if (value == null) continue
-              // 旧缓存页面按对象数组提交时保留它自己的开关状态，新面板只交群号（一律视为开启）
-              const incoming = new Map((Array.isArray(value) ? value : [])
-                .filter(g => g && typeof g === 'object' && g.groupId)
-                .map(g => [String(g.groupId).trim(), g]))
-              value = normalizeGroupIds(value).map(groupId => ({
-                groupId,
-                switchOn: incoming.get(groupId)?.switchOn !== false
-              }))
-            }
-            else if (keyPath === 'groupReply.groups') {
-              if (value == null) continue
-              const previous = new Map((Array.isArray(candidate.groupReply?.groups) ? candidate.groupReply.groups : [])
-                .filter(g => g && g.groupId)
-                .map(g => [String(g.groupId), g]))
-              // 旧缓存页面仍可能按对象数组提交；能带的每群参数一并带上，避免保存一次就被重置成默认值
-              const legacy = new Map((Array.isArray(value) ? value : [])
-                .filter(g => g && typeof g === 'object' && g.groupId)
-                .map(g => [String(g.groupId).trim(), g]))
-              value = normalizeGroupIds(value).map(groupId => {
-                const prev = previous.get(groupId) || {}
-                const old = legacy.get(groupId) || {}
-                return {
-                  ...prev,
-                  groupId,
-                  switchOn: old.switchOn !== false,
-                  debounceSeconds: old.debounceSeconds ?? prev.debounceSeconds ?? 60,
-                  enthusiasm: old.enthusiasm ?? prev.enthusiasm ?? 40
-                }
-              })
-            }
-            else if (keyPath === 'groupReply.groupTuning') {
-              // 派生表只回写每群参数，不落盘；等循环结束再合并，避免对象键顺序影响结果
-              if (value == null) continue
-              groupTuning = value
-              continue
-            }
-            else if (keyPath === 'initiativeChatGroups') {
-              if (value == null) continue
-              value = normalizeGroupIds(value)
-            }
             // else if (keyPath === 'autoEmoticons.allowGroups' || keyPath === 'autoEmoticons.getBotByQQ_targetQQArr') {
             //   value = value.map(item => item.trim()).filter(item => item !== '')
             // }
 
             // 使用 lodash 处理锅巴传入的 点分隔 keyPath
             lodash.set(candidate, keyPath, value)
-          }
-
-          // 每群参数必须在选群结果确定后合并：新加的群在上一轮还不存在，先合并会被跳过
-          if (groupTuning !== undefined) {
-            const groups = Array.isArray(candidate.groupReply?.groups) ? candidate.groupReply.groups : []
-            const byId = new Map(groups.filter(g => g && g.groupId).map(g => [String(g.groupId), g]))
-            for (const row of Array.isArray(groupTuning) ? groupTuning : []) {
-              const target = byId.get(String(row?.groupId ?? '').trim())
-              if (!target) continue
-              target.debounceSeconds = row.debounceSeconds
-              target.enthusiasm = row.enthusiasm
-            }
-            candidate.groupReply = { ...(candidate.groupReply || {}), groups }
           }
 
           // 正确储存azureRoleSelect结果
