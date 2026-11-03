@@ -25,6 +25,17 @@ function menu(answers, beforeAnswer = () => {}) {
   return instance
 }
 
+test('切换指令同时接受「模型」与「接口」两种写法', async () => {
+  const [rule] = new ProviderManagement().rule
+  for (const msg of ['#chatgpt切换模型', '#chatgpt切换接口', '#chatgpt切换模型Gemini', '#chatgpt切换接口api', '#chatgpt切换提供商', '#chatgpt切换API']) {
+    assert.match(msg, rule.reg)
+  }
+  for (const msg of ['#chatgpt切换', '#chatgpt切换接口设定', '#chatgpt切换模型名']) assert.doesNotMatch(msg, rule.reg)
+  await menu(['1', '0']).switchProvider({ ...event, msg: '#chatgpt切换接口' })
+  assert.equal(commits, 1)
+  assert.equal(config.defaultProviderId, 'a')
+})
+
 test('主备两步完成才保存，同协议列表排除主条目；0 可关闭备用', async () => {
   await menu(['1', '1']).switchProvider(event)
   assert.equal(commits, 1)

@@ -209,6 +209,22 @@ test('查看记忆：底层顺序任意变化时编号都是「updatedAt 降序 
   }
 })
 
+test('记忆列表每 50 个节点打一个合并转发，余数单独一条', async () => {
+  const list = Array.from({ length: 51 }, (_, i) => memory(`m${i}`, 1000 + i, `记忆 ${i}`))
+  forwards.length = 0
+  recallQueue = [[...list]]
+  const e = mkEvent('#我的记忆')
+  await new memoryManage(e).myMemories(e)
+
+  assert.equal(forwards.length, 2, '51 条应分成 50 + 1 两条合并转发')
+  assert.equal(forwards[0].messages.length, 50)
+  assert.equal(forwards[1].messages.length, 1)
+  assert.match(forwards[0].title, /\[1\/2\]$/)
+  assert.match(forwards[1].title, /\[2\/2\]$/)
+  // 编号跨分片连续，最后一个分片接着数而不是重新从 1 开始
+  assert.match(forwards[1].messages[0], /【记忆 51】/)
+})
+
 test('按序号删除：展示的第 N 条就是实际删除的那条（底层顺序不同也不行）', async () => {
   const a = memory('m_a', 1000, 'A')
   const b = memory('m_b', 1000, 'B')

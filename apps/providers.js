@@ -8,7 +8,8 @@ import { chooseFromMenu } from '../utils/menu.js'
 export class ProviderManagement extends plugin {
   constructor() {
     super({ name: 'ChatGPT-Plugin 模型提供商', event: 'message', priority: 450, rule: [
-      { reg: /^#chatgpt切换(?:模型(?:提供商|api|gemini|claude|responses)?|提供商|api|gemini|claude|responses)$/i, fnc: 'switchProvider', permission: 'master' },
+      // 「接口」与「模型」是同一动作的两种叫法（锅巴里这些条目也叫接口配置），两种写法都要能进菜单。
+      { reg: /^#chatgpt切换(?:(?:模型|接口)(?:提供商|api|gemini|claude|responses)?|提供商|api|gemini|claude|responses)$/i, fnc: 'switchProvider', permission: 'master' },
       { reg: /^#chatgpt设置(api|gemini|claude|responses)?(key|模型|地址|反代|设定)$/i, fnc: 'editProvider', permission: 'master' },
       { reg: /^#chatgpt(开启|关闭)(api流|gemini搜索|gemini代码执行)$/i, fnc: 'toggleProvider', permission: 'master' },
       { reg: /^#chatgpt设置翻译来源.*$/i, fnc: 'translationProvider', permission: 'master' },
