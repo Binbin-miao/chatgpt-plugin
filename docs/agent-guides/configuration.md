@@ -32,11 +32,11 @@
 - **锅巴里任何「选账号」的候选取宿主的登录账号表 `Bot.uin`，不要遍历 `Bot.bots` 的键**：`Bot` 上的键不等于账号，第三方插件往它上面写的属性会混进候选。机制与替代方案见 [ADR 0014](../adr/0014-bot-account-candidates-from-uin.md)。
 - **锅巴里的说明文案描述的是运行时语义，改注册条件或鉴权档位时要回头核对它。** 文案与 `collectTools` 的注入条件、工具自身的鉴权分处两地、各自演化，没有任何检查保证三者一致。`toolGroupAdminArr` 的 `bottomHelpMessage` 就曾把「Bot 是群管即注入」与「还要求提问者是主人或群管」两个档位笼统写成一档，直到评审才发现——部署者在面板里只有这一句说明，写错就是误导。
 - **`Config.githubAPI` 按常量对待**：默认值 `https://api.github.com`，部署者不会修改、锅巴也不暴露它。不要围绕"它可能是别的反代地址"做多形态兼容（尾斜杠归一化、同 host 判据、专门的测试等）；`resolveBaseUrl()` 现有的归一化已经够用。
-- GSubForm 子字段（包括提供商的 `id`/`name`/协议参数及群表单的 `groupId`/`switchOn`）不属于 Config 顶层，校验时需排除。
+- GSubForm 子字段（包括提供商的 `id`/`name`/协议参数、`groupReply.groupTuning` 的 `groupId`/`debounceSeconds`/`enthusiasm`）不属于 Config 顶层，校验时需排除。群选择器 `GSelectGroup`（`memoryGroupCapture.groups`、`groupReply.groups`、`initiativeChatGroups`）交回的是群号数组，落盘仍是原来的对象数组：转换只在 `guoba.support.js` 的 `getConfigData()`/`setConfigData()`，运行时读到的结构不变。
+- 锅巴 `GSelectGroup` 交回群号数组、`GSubForm` 交回对象数组；落盘统一是对象数组（`memoryGroupCapture.groups`、`groupReply.groups`），读取用 `Array.isArray` 防护。`groupReply.groupTuning` 只是面板派生视图，不落盘，保存时由 `setConfigData` 写回 `groupReply.groups`。
 
 ## 数字与表单读取
 
 - **`Number(x) ?? 默认值` 在 x 缺失时得到 NaN 而不是默认值**：`Number(undefined)` 返回 NaN，`??` 只回退 null/undefined——`Number(Config.xxx) ?? 0.7` 在配置缺失时阈值/上限会变 NaN 导致校验失效。**读取数字配置用 `||` 回退**（`Number(...) || 0.7`）。但 `||` 会把合法的 `0` 也当缺失，**只适用于"0 不是合法取值"的字段**；0 有业务意义的配置（如 `meme_CD <= 0` 表示关闭 CD）必须显式判空 + 范围校验，例如 `const n = Number(Config.x); const v = Number.isFinite(n) ? n : 默认值`，别套 `||`。
-- 锅巴 GSubForm 保存的是数组（如 `memoryGroupCapture.groups`），读取用 `Array.isArray` 防护。
 
 `eventRetentionDays` / `maxMemoriesPerUser` 的 0 不是合法值，可使用 `Number(...) || 默认值`；`minConfidence` 已移除，见 [记忆指南](memory.md)；`inputTokenLimit` 已不是配置项（改为 `extractor.js` 的 `MEMORY_INPUT_TOKEN_LIMIT` 常量，锅巴无入口）。
