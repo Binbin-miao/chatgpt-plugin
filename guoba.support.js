@@ -3109,16 +3109,16 @@ export function supportGuoba() {
           candidate.groupReply = normalizeGroupReplyConfig(candidate.groupReply)
           candidate.avatarReply = normalizeAvatarReplyConfig(candidate.avatarReply)
 
-          // 切到文件后端：先记住意图，commit 后立刻落回 redis，迁完再由后台任务切 file
+          // 切到文件后端：落盘前就把 memoryStorage 写回 redis，迁完再由后台任务切 file。
+          // commit 内部会立即 saveDiff 落盘，若先写 file 再改回来，中间那一下磁盘上就是
+          // 「配置已 file、文件还空着」；进程正好在这时被杀，switchingStorageToFile 从此
+          // 永远为 false，迁移再也不会被触发，而读路径已经全切到文件——历史直接读不到。
           const switchingStorageToFile = candidate.memoryStorage === 'file' && Config.memoryStorage !== 'file'
+          if (switchingStorageToFile) candidate.memoryStorage = 'redis'
           // 对于 config 中对象/对象数组 的修改 Proxy 对象不会执行 set() 所以要手动保存
           Config.commit(candidate)
-          if (switchingStorageToFile) {
-            // 迁移期间继续写 Redis：新消息不会丢，读原文也完整；迁完文件里已有全量副本再切
-            Config.memoryStorage = 'redis'
-            Config.save()
-            scheduleRawMigration({ notify: notifyMasterAboutStorage })
-          }
+          // 迁移期间继续写 Redis：新消息不会丢，读原文也完整；迁完文件里已有全量副本再切
+          if (switchingStorageToFile) scheduleRawMigration({ notify: notifyMasterAboutStorage })
           // 面板新勾选的群：清掉历史关闭标记（sweep 自愈的窄窗口）
           if (reopenedGroups.length) await clearClosedAtForReopenedGroups(reopenedGroups)
           return Result.ok({}, switchingStorageToFile
