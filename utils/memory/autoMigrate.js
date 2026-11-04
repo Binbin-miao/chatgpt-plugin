@@ -61,6 +61,12 @@ function groupCount(...passes) {
  * @returns {Promise<{ok: boolean, appended?: number, failed?: Array, reason?: string, error?: any}>}
  */
 export async function migrateRawOnSwitch(options = {}) {
+  // 已经是文件后端就直接返回：再跑两遍是几分钟的浪费，而失败分支会把配置写回 redis——
+  // file 模式下 Redis 里的原文可能早被清理过（#记忆存储 清理），这一降级会让历史整体读不到
+  if (Config.memoryStorage === 'file') {
+    safeNotify(options.notify, '当前已经是文件后端，无需迁移')
+    return { ok: true, reason: 'already' }
+  }
   if (!acquireHeavyTask(LOCK_LABEL)) {
     safeNotify(options.notify, `已有「${heavyTaskOwner()}」在跑，本次切换未执行；等它结束后重新保存一次即可`)
     return { ok: false, reason: 'busy' }

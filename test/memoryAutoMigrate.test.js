@@ -87,6 +87,15 @@ test('通知抛异常：迁移结果不受影响，配置照样切到 file', asy
   assert.equal(Config.memoryStorage, 'file')
 })
 
+test('已经是 file：直接返回，不重复跑也不改写配置', async () => {
+  Config.memoryStorage = 'file'
+  const result = await run()
+
+  assert.equal(result.ok, true)
+  assert.equal(result.reason, 'already')
+  assert.equal(calls, 0, '不该白跑两遍几十万条，失败还会把配置降级回 redis')
+})
+
 test('锁被占用：直接跳过，不重复跑迁移', async () => {
   acquireHeavyTask('记忆迁移')
   const result = await run()

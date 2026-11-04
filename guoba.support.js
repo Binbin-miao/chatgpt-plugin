@@ -40,7 +40,10 @@ function notifyMasterAboutStorage(text) {
     const master = globalThis.Bot?.config?.masterQQ
     const qq = Array.isArray(master) ? master[0] : master
     if (!qq) return
-    globalThis.Bot.pickFriend(Number(qq)).sendMsg(`[记忆] ${text}`)
+    // sendMsg 是异步的，try/catch 只能接住同步抛错；返回的 Promise 一旦 reject，
+    // Node 22 会当成未捕获异常直接终止进程。这里必须显式接住。
+    Promise.resolve(globalThis.Bot.pickFriend(Number(qq)).sendMsg(`[记忆] ${text}`))
+      .catch(err => logger.warn?.(`[MemoryV2] 迁移结果通知发送失败（不影响结果）：${err?.message || err}`))
   } catch (err) {
     logger.warn?.(`[MemoryV2] 迁移结果通知失败（不影响结果）：${err.message}`)
   }
