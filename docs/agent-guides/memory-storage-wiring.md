@@ -101,12 +101,16 @@ runDaily
 | 键 | 默认 | 语义 | 读取方 |
 |---|---|---|---|
 | `memoryStorage` | `redis` | `redis` / `file`，只影响原文 | `store.memoryStorage()` |
+| `memoryStorageTailPendingAt` | `0` | 非 0 = 已切成 file 但尾窗还没补完；启动与面板保存据此自愈，**只有尾遍真的成功才清** | `autoMigrate.resumePendingRawTail()` |
 | `memoryGroupCapture.rawRetentionDays` | `30` | 原文保留天数，`0` = 永久 | `dailyTask` / `capture` |
 | `memoryGroupCapture.closedGroupRetentionDays` | `90` | 关闭群记忆保留天数，`0` = 永不自动清理 | `dailyTask.sweepClosedGroups` |
 
-两条写入路径，同一个 `Config` 单例：
+三条写入路径，同一个 `Config` 单例：
 - 锅巴面板 → `Config.commit(candidate)`（保存后对本次新勾选的群清 `closedAt`）
 - 指令 → `Config.memoryStorage = 'file'; Config.save()`（立即生效，无需重启）
+- 后台迁移 → 面板切「文件」或指令切换时：先立 `memoryStorageTailPendingAt` → 切 file → 补尾窗 → **成功才清标记**
+
+**尾窗为什么要单独标记**：切到 file 之后新消息写文件，但「第一遍读完到切换之间」那段只在 Redis。所以补尾窗必须跑在切换之后（Redis 已冻结，一遍收敛）；若补到一半进程被杀，标记会让下次启动或面板保存再补一次，否则那批消息会随 Redis TTL 静默消失。
 
 ## 5. 关键改动点（按风险排序）
 
@@ -118,6 +122,7 @@ runDaily
 | 4 | **迁移只 append、不删、幂等** | Redis 始终是完整副本，可随时切回 |
 | 5 | **清理前三重对账** | 先收集键再删（SCAN 期间删键会漏）、删除前逐群比对「Redis 有 / 文件无」、删完自检残留 |
 | 6 | **`#记忆存储` 一条命令完成迁移+切换** | 原来要「迁移 → 面板切 → 等一段时间 → 手清 Redis」五步 |
+| 7 | **先切后补 + 标记自愈** | 先跑两遍再切关不上窗口：第二遍读完到写盘之间的新消息只落 Redis，切过去后读路径只读文件。改成切完再补（Redis 已冻结，一遍收敛），中途被杀由标记在下次启动补 |
 | 7 | **重任务锁 + 开始回执** | 迁移 30 万条要几分钟，无回执会诱发重复确认；两轮并发实测多写 7.8 万行 |
 | 8 | **关闭群原文由 sweep 清理** | Redis 有 TTL 兜底，文件没有；不补就会在磁盘上无限增长 |
 

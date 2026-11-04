@@ -1976,12 +1976,12 @@ export function supportGuoba() {
         {
           field: 'memoryStorage',
           label: '群消息原文存储后端',
-          bottomHelpMessage: '一般不用在这里手改：在群里发 #记忆存储 文件 会「迁移 + 切换」一次做完，发 #记忆存储 查看状态、#记忆存储 清理 释放 Redis 内存。手动切换前也必须先迁移，否则旧原文不会出现在新后端里；切换不删 Redis 任何数据，可随时切回。文件以 NDJSON 存在 data/chatgpt/memory/raw/<群号>/<日期>.ndjson，按群按天追加；记忆本体、提炼任务与策略始终在 Redis；不支持多实例同时写同一文件目录',
+          bottomHelpMessage: '面板切到「文件」会自动迁移历史原文（全量 + 补最后几分钟，共几分钟，完成后私聊通知）；迁移期间这里显示 Redis 属正常，别重复保存。切回 Redis 请在群里发 #记忆存储 redis——面板会直接拒绝，因为文件里的历史不会回灌，切过去旧原文就读不到了。发 #记忆存储 看状态、#记忆存储 清理 释放 Redis 内存。文件以 NDJSON 存在 data/chatgpt/memory/raw/<群号>/<日期>.ndjson，按群按天追加；记忆本体、提炼任务与策略始终在 Redis；不支持多实例同时写同一文件目录',
           component: 'Select',
           componentProps: {
             options: [
               { label: 'Redis（默认）', value: 'redis' },
-              { label: '文件（data/chatgpt/memory）', value: 'file' }
+              { label: '文件（data/chatgpt/memory/raw）', value: 'file' }
             ]
           }
         },
