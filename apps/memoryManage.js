@@ -8,6 +8,7 @@ import { planMigration, runMigration, verifyMigration } from '../utils/memory/mi
 import { groupCapture } from '../utils/memory/capture.js'
 import { dailyConsolidation, normalizeCron } from '../utils/memory/dailyTask.js'
 import { MEMORY_INPUT_TOKEN_LIMIT } from '../utils/memory/extractor.js'
+import { acquireHeavyTask, releaseHeavyTask, heavyTaskOwner } from '../utils/memory/heavyTask.js'
 import { RECALL_MODE_ALL } from '../utils/memory/recallMode.js'
 import { findProvider, providerLabel } from '../utils/providerProfiles.js'
 import { canDeleteOwnMemory } from '../utils/memory/policy.js'
@@ -30,25 +31,6 @@ const SCOPE_LABELS = {
 
 /** #清理无效记忆 单轮最多处理的群数：超出部分提示再执行一次 */
 const PURGE_MAX_GROUPS = 50
-
-/**
- * 重任务锁：「记忆迁移 / 迁移校验 / 清理无效记忆」同时只允许一个。
- *
- * 为什么需要：这些操作要遍历几十个群、几十万条原文，耗时几分钟，用户看不到反馈就会重复发指令。
- * 重复触发不加快，反而会让两次迁移各持一份「文件已有 id」快照，把同一批行写两遍
- * （2026-11-04 实测连发两次「是」多写了 78,673 行）。
- */
-let heavyTaskOwner = ''
-
-function acquireHeavyTask(label) {
-  if (heavyTaskOwner) return false
-  heavyTaskOwner = label
-  return true
-}
-
-function releaseHeavyTask() {
-  heavyTaskOwner = ''
-}
 
 /**
  * 容量目标与夜间整理阈值：#记忆统计 与 #群记忆状态 共用同一份文案，避免两处各写一遍后漂移。
@@ -310,7 +292,7 @@ export class memoryManage extends plugin {
     }
     const gid = String(e.group_id)
     if (!acquireHeavyTask('立即提取群记忆')) {
-      await this.reply(`「${heavyTaskOwner}」正在执行，完成会回结果；重复发送不会加快，请等它结束`, true)
+      await this.reply(`「${heavyTaskOwner()}」正在执行，完成会回结果；重复发送不会加快，请等它结束`, true)
       return
     }
     try {
@@ -336,7 +318,7 @@ export class memoryManage extends plugin {
       return
     }
     if (!acquireHeavyTask('无效记忆清理')) {
-      await this.reply(`「${heavyTaskOwner}」正在执行，完成会回结果；重复发送不会加快，请等它结束`, true)
+      await this.reply(`「${heavyTaskOwner()}」正在执行，完成会回结果；重复发送不会加快，请等它结束`, true)
       return
     }
     const store = getStore()
@@ -416,7 +398,7 @@ export class memoryManage extends plugin {
       return
     }
     if (!acquireHeavyTask('记忆迁移')) {
-      await this.reply(`「${heavyTaskOwner}」正在执行，完成会回结果；重复发送不会加快，请等它结束`, true)
+      await this.reply(`「${heavyTaskOwner()}」正在执行，完成会回结果；重复发送不会加快，请等它结束`, true)
       return
     }
     try {
@@ -563,7 +545,7 @@ export class memoryManage extends plugin {
     }
 
     if (!acquireHeavyTask('记忆存储操作')) {
-      await this.reply(`「${heavyTaskOwner}」正在执行，完成会回结果；重复发送不会加快，请等它结束`, true)
+      await this.reply(`「${heavyTaskOwner()}」正在执行，完成会回结果；重复发送不会加快，请等它结束`, true)
       return
     }
     try {

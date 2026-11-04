@@ -8,6 +8,7 @@ import { supportConfigurations as azureRoleList } from './utils/tts/microsoft-az
 import { formatMcpServersForGuoba, stringifyMcpServersFromGuoba } from './utils/mcpServersGuoba.js'
 import { RECALL_MODE_ALL } from './utils/memory/recallMode.js'
 import { MemoryStore } from './utils/memory/store.js'
+import { scheduleRawMigration } from './utils/memory/autoMigrate.js'
 import lodash from "lodash";
 
 /**
@@ -29,6 +30,19 @@ async function clearClosedAtForReopenedGroups(groupIds) {
     for (const gid of groupIds) await store.clearGroupClosedAt(gid)
   } catch (err) {
     logger.warn?.(`[MemoryV2] 清除重新授权群的关闭标记失败（不影响保存）：${err.message}`)
+  }
+}
+
+/** 迁移结果通知主人：拿不到 Bot 就只写日志，绝不因为通知失败影响保存 */
+function notifyMasterAboutStorage(text) {
+  logger.info?.(`[MemoryV2] ${text}`)
+  try {
+    const master = globalThis.Bot?.config?.masterQQ
+    const qq = Array.isArray(master) ? master[0] : master
+    if (!qq) return
+    globalThis.Bot.pickFriend(Number(qq)).sendMsg(`[记忆] ${text}`)
+  } catch (err) {
+    logger.warn?.(`[MemoryV2] 迁移结果通知失败（不影响结果）：${err.message}`)
   }
 }
 
@@ -3095,11 +3109,21 @@ export function supportGuoba() {
           candidate.groupReply = normalizeGroupReplyConfig(candidate.groupReply)
           candidate.avatarReply = normalizeAvatarReplyConfig(candidate.avatarReply)
 
+          // 切到文件后端：先记住意图，commit 后立刻落回 redis，迁完再由后台任务切 file
+          const switchingStorageToFile = candidate.memoryStorage === 'file' && Config.memoryStorage !== 'file'
           // 对于 config 中对象/对象数组 的修改 Proxy 对象不会执行 set() 所以要手动保存
           Config.commit(candidate)
+          if (switchingStorageToFile) {
+            // 迁移期间继续写 Redis：新消息不会丢，读原文也完整；迁完文件里已有全量副本再切
+            Config.memoryStorage = 'redis'
+            Config.save()
+            scheduleRawMigration({ notify: notifyMasterAboutStorage })
+          }
           // 面板新勾选的群：清掉历史关闭标记（sweep 自愈的窄窗口）
           if (reopenedGroups.length) await clearClosedAtForReopenedGroups(reopenedGroups)
-          return Result.ok({}, '保存成功~')
+          return Result.ok({}, switchingStorageToFile
+            ? '已保存，正在后台迁移历史原文（几分钟，完成后私聊通知你）'
+            : '保存成功~')
         } catch (err) {
           return Result.error(`配置保存失败：${err.message}`)
         }
