@@ -38,6 +38,7 @@ for (let i in files) {
   apps[name] = ret[i].value[Object.keys(ret[i].value)[0]]
 }
 import McpManager from './utils/mcp.js'
+import { resumePendingRawTail } from './utils/memory/autoMigrate.js'
 
 global.chatgpt = {
 
@@ -50,6 +51,14 @@ if (Config.enableMcp) {
   } catch (err) {
     logger.error(`[Chatgpt][mcp] 初始化失败: ${err.message}`)
   }
+}
+
+// 上次切文件后端时尾窗没补完（进程被杀 / 补迁失败）：启动后补一遍。
+// 放 setImmediate 里不阻塞加载；补齐前 file 模式照常能读，只是少最后几十条。
+if (Config.memoryStorage === 'file' && Config.memoryStorageTailPendingAt) {
+  setImmediate(() => {
+    resumePendingRawTail().catch(err => logger.warn?.(`[Chatgpt][memory] 补尾窗失败: ${err?.message || err}`))
+  })
 }
 
 // 启动服务器

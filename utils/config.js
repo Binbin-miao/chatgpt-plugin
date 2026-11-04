@@ -375,6 +375,10 @@ const defaultConfig = {
   },
   // 群消息原文存储后端：redis（默认）/ file（data/chatgpt/memory/raw，按群按天 NDJSON）
   memoryStorage: 'redis',
+  // 面板切到文件后端时的「尾窗未补完」标记（时间戳，0 表示没有待办）。
+  // 非 0 说明已经切成 file，但最后一段只存在于 Redis 的新原文还没补进文件；
+  // 进程若在补迁途中被杀，就靠这个标记在下次启动时自愈，否则那批消息会随 Redis TTL 无声消失。
+  memoryStorageTailPendingAt: 0,
 
   // MCP 协议配置
   enableMcp: false, // 是否启用通用的 MCP 协议
