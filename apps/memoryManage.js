@@ -586,13 +586,21 @@ export class memoryManage extends plugin {
     }
     await this.reply(`开始迁移并切换：待写 ${t.toAppend} 条，需要几分钟，完成会再回一条汇总；期间不要重复发「是」`, true)
     const result = await runMigration({ store, rawStore })
+    // 有群没迁完就不切：file 模式只读文件、不回退 Redis，切过去那些群的历史会当场读不到
+    if (result.failed.length > 0) {
+      await this.reply(
+        `❌ ${result.failed.length} 个群未迁移（${result.failed.map(f => f.groupId).join('、')}），已保持 Redis 后端，历史都能读。\n` +
+        `已写入的 ${result.appended} 条不会重复写；排查后重新发 #记忆存储 文件 会补迁剩下的`,
+        true
+      )
+      return
+    }
     Config.memoryStorage = 'file'
     Config.save()
     const lines = [
       `✅ 已迁移 ${result.appended} 条、跳过已存在 ${result.skipped} 条`,
       '✅ 存储后端已切到「文件」，新消息立即写入 data/chatgpt/memory/raw，无需重启',
     ]
-    if (result.failed.length > 0) lines.push(`⚠️ ${result.failed.length} 个群未迁移：${result.failed.map(f => f.groupId).join('、')}`)
     const r = await this._redisRawStat(store)
     if (r.keys > 0) lines.push(`Redis 里还有 ${r.keys} 条旧原文${r.mb > 0 ? `（约 ${r.mb} MB）` : ''}，观察 1~2 天后发 #记忆存储 清理 可释放`)
     await this.reply(lines.join('\n'), true)
