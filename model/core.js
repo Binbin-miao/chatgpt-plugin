@@ -163,12 +163,14 @@ async function handleSystem(e, system, settings) {
         system += chats
           .map(chat => {
             let sender = chat.sender || {}
-            // if (sender.user_id === e.bot.uin && chat.raw_message.startsWith('建议的回复')) {
-            if (chat.raw_message.startsWith('建议的回复')) {
+            // 历史条目由各 adapter 的接口返回，字段并不总是齐全（NapCat 是必填，别家未必）：
+            // 直接 startsWith 会抛错，整段群历史被 catch 丢弃，日志只剩「获取群聊聊天记录失败」。
+            const rawMessage = typeof chat.raw_message === 'string' ? chat.raw_message : ''
+            if (rawMessage.startsWith('建议的回复')) {
               // 建议的回复太容易污染设定导致对话太固定跑偏了
               return ''
             }
-            return `【${sender.card || sender.nickname}】(qq：${sender.user_id}, ${roleMap[sender.role] || 'normal user'}，${sender.area ? 'from ' + sender.area + ', ' : ''} ${sender.age} years old, 群头衔：${sender.title}, gender: ${sender.sex}, time：${formatDate(new Date(chat.time * 1000))}, messageId: ${chat.message_id}) 说：${chat.raw_message}`
+            return `【${sender.card || sender.nickname}】(qq：${sender.user_id}, ${roleMap[sender.role] || 'normal user'}，${sender.area ? 'from ' + sender.area + ', ' : ''} ${sender.age} years old, 群头衔：${sender.title}, gender: ${sender.sex}, time：${formatDate(new Date(chat.time * 1000))}, messageId: ${chat.message_id}) 说：${rawMessage}`
           })
           .join('\n')
       }

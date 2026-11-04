@@ -230,16 +230,21 @@ class MessageHistoryManager {
    * @return {Promise<Array>} 补全了发送者信息的历史消息数组（时间升序）
    */
   async getGroupHistoryContext(e, num, { fromLatest = false } = {}) {
-    if (!e.group) return [e];
+    // 定时提醒、戳一戳等合成事件没有 message_id/seq，不是群里的真实消息：
+    // 既不能拿去当翻页起点，也不能作为历史条目渲染（历史接口返回的消息字段是齐的）。
+    const currentSeq = e.seq || e.message_id
+    if (!e.group) return currentSeq ? [e] : []
 
     this._collectMessages(e.group_id, [e]);
 
-    const startSeq = fromLatest ? 0 : (e.seq || e.message_id);
+    const startSeq = fromLatest ? 0 : currentSeq;
+    // 少取一条是给当前事件留位置；合成事件不补进来，就按窗口大小取满
+    const fetchCount = (!fromLatest && currentSeq) ? num - 1 : num;
 
-    let chats = await this.getChatHistorySafe(e.group, fromLatest ? num : num - 1, startSeq);
+    let chats = await this.getChatHistorySafe(e.group, fetchCount, startSeq);
 
     // 最新窗口不为旧引用消息预留位置；旧消息仍作为用户提问传入模型。
-    if (!fromLatest) {
+    if (!fromLatest && currentSeq) {
       const seenIds = new Set(chats.map(msg => msg.message_id || msg.seq));
       const currentId = e.message_id || e.seq;
       if (!seenIds.has(currentId)) {
