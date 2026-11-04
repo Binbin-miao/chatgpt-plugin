@@ -16,3 +16,6 @@ output/avatar-validation/
 # 调试时重定向输出留下的（git add -A 会顺手收进提交）
 /*.log
 temp/
+
+# 运行时数据（原文 NDJSON 等），测试也可能在默认路径下写出，永不提交
+data/

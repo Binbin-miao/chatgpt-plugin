@@ -3112,6 +3112,13 @@ export function supportGuoba() {
           candidate.groupReply = normalizeGroupReplyConfig(candidate.groupReply)
           candidate.avatarReply = normalizeAvatarReplyConfig(candidate.avatarReply)
 
+          // 面板把后端从文件改回 Redis：文件里的历史不会回灌，切过去后读路径只读 Redis，
+          // 旧消息的原文就再也读不到了。指令路径（#记忆存储 redis）有明确警告 + 二次确认，
+          // 面板这条必须同样拦住，否则同一个不可逆动作两条路的安全等级不对称。
+          if (candidate.memoryStorage !== 'file' && Config.memoryStorage === 'file') {
+            return Result.error('切回 Redis 后，文件里的历史原文不会回灌，旧消息就再也读不到了。确需切换请在群里发 #记忆存储 redis（会二次确认）')
+          }
+
           // 切到文件后端：落盘前就把 memoryStorage 写回 redis，迁完再由后台任务切 file。
           // commit 内部会立即 saveDiff 落盘，若先写 file 再改回来，中间那一下磁盘上就是
           // 「配置已 file、文件还空着」；进程正好在这时被杀，switchingStorageToFile 从此
@@ -3120,8 +3127,11 @@ export function supportGuoba() {
           if (switchingStorageToFile) candidate.memoryStorage = 'redis'
           // 对于 config 中对象/对象数组 的修改 Proxy 对象不会执行 set() 所以要手动保存
           Config.commit(candidate)
-          // 迁移期间继续写 Redis：新消息不会丢，读原文也完整；迁完文件里已有全量副本再切
-          if (switchingStorageToFile) scheduleRawMigration({ notify: notifyMasterAboutStorage })
+          // 迁移期间继续写 Redis：新消息不会丢，读原文也完整；迁完文件里已有全量副本再切。
+          // 第二种情况：上次切完尾窗没补完（标记还在），借这次保存顺手补掉，不用等重启。
+          if (switchingStorageToFile || (Config.memoryStorage === 'file' && Config.memoryStorageTailPendingAt)) {
+            scheduleRawMigration({ notify: notifyMasterAboutStorage })
+          }
           // 面板新勾选的群：清掉历史关闭标记（sweep 自愈的窄窗口）
           if (reopenedGroups.length) await clearClosedAtForReopenedGroups(reopenedGroups)
           return Result.ok({}, switchingStorageToFile

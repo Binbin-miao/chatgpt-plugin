@@ -597,10 +597,21 @@ export class memoryManage extends plugin {
     }
     Config.memoryStorage = 'file'
     Config.save()
+    // 切完再补一遍：迁移跑的这一两分钟里新消息仍在写 Redis，切过去后读路径只读文件，
+    // 不补就会静默漏掉这几分钟。切换后 Redis 侧已无新写入，一遍即收敛。
+    let tail = { appended: 0, failed: [] }
+    try {
+      tail = await runMigration({ store, rawStore })
+    } catch (err) {
+      await this.reply(`⚠️ 已切到文件后端，但补最后几分钟的新原文时出错：${err?.message || err}；这批仍在 Redis，发 #记忆迁移到文件 可补齐`, true)
+    }
     const lines = [
-      `✅ 已迁移 ${result.appended} 条、跳过已存在 ${result.skipped} 条`,
+      `✅ 已迁移 ${(result.appended || 0) + (tail.appended || 0)} 条、跳过已存在 ${result.skipped} 条`,
       '✅ 存储后端已切到「文件」，新消息立即写入 data/chatgpt/memory/raw，无需重启',
     ]
+    if ((tail.failed || []).length > 0) {
+      lines.push(`⚠️ ${tail.failed.length} 个群的最后几分钟原文没补上（${tail.failed.map(f => f.groupId).join('、')}），仍在 Redis，可发 #记忆迁移到文件 补齐`)
+    }
     const r = await this._redisRawStat(store)
     if (r.keys > 0) lines.push(`Redis 里还有 ${r.keys} 条旧原文${r.mb > 0 ? `（约 ${r.mb} MB）` : ''}，观察 1~2 天后发 #记忆存储 清理 可释放`)
     await this.reply(lines.join('\n'), true)
