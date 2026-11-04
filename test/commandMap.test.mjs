@@ -755,17 +755,22 @@ describe('清理已卸载的插件', () => {
     assert.equal(readLocalMap('keep').plugin.key, 'keep')
   })
 
-  test('同步时顺手清掉，并在结果里报出来', async () => {
+  test('连续三轮都没扫到才清掉，并在结果里报出来', async () => {
     writeRawEntry('ghost', entry('ghost'))
     const body = mapText('a-plugin')
     const fetchImpl = fakeFetch({
       [INDEX_URL]: indexOf({ 'a-plugin': { file: 'maps/a-plugin.json', sha256: sha256(body) } }),
       [`${BASE}maps/a-plugin.json`]: body
     })
+    const opts = { indexUrl: INDEX_URL, plugins: [{ key: 'a-plugin' }], fetchImpl, mirrors: DIRECT }
 
-    const result = await syncMaps({ indexUrl: INDEX_URL, plugins: [{ key: 'a-plugin' }], fetchImpl, mirrors: DIRECT })
+    assert.deepEqual((await syncMaps(opts)).removed, [])
+    assert.ok(readLocalMap('ghost'), '第一轮只是记一笔，不该删')
+    assert.deepEqual((await syncMaps(opts)).removed, [])
+    assert.ok(readLocalMap('ghost'), '第二轮也不删')
 
-    assert.deepEqual(result.removed, ['ghost'])
+    const third = await syncMaps(opts)
+    assert.deepEqual(third.removed, ['ghost'])
     assert.equal(readLocalMap('ghost'), null)
   })
 })
@@ -816,7 +821,7 @@ describe('审计修复：清理顺序、歧义、索引地址与占位符', () =
 
   const cachedKeys = () => fs.readdirSync(path.join(tmp, 'data', 'chatgpt', 'maps')).sort()
 
-  test('清单骤减时整轮不清理：同步失败也不会净损失', async () => {
+  test('清单骤减时首轮不清理：同步失败也不会净损失', async () => {
     for (const key of ['A', 'B', 'C']) writeCached(key)
     const fetchImpl = fakeFetch({
       [INDEX_URL]: indexOf({
@@ -826,14 +831,14 @@ describe('审计修复：清理顺序、歧义、索引地址与占位符', () =
       })
     })
 
-    // 本机只扫到 A（3 -> 1 是骤减），这轮必须一份都不删
+    // 本机只扫到 A（3 -> 1 是骤减）：插件目录短暂缺项时不该立刻删
     const result = await syncMaps({ indexUrl: INDEX_URL, plugins: [{ key: 'A' }], fetchImpl })
 
     assert.deepEqual(result.removed, [])
     assert.deepEqual(cachedKeys(), ['A', 'B', 'C'])
   })
 
-  test('确实卸载了插件时仍然清理', async () => {
+  test('确实卸载了插件，连续三轮后清理', async () => {
     for (const key of ['A', 'B', 'C', 'D']) writeCached(key)
     const fetchImpl = fakeFetch({
       [INDEX_URL]: indexOf({
@@ -842,16 +847,47 @@ describe('审计修复：清理顺序、歧义、索引地址与占位符', () =
         C: { file: 'maps/C.json', version: '1.0.0', sha256: 'c'.repeat(64) }
       })
     })
-
-    // 4 -> 3 属于正常卸载，不该被骤减保护永远挡住
-    const result = await syncMaps({
+    const opts = {
       indexUrl: INDEX_URL,
       plugins: [{ key: 'A' }, { key: 'B' }, { key: 'C' }],
       fetchImpl
-    })
+    }
 
-    assert.deepEqual(result.removed, ['D'])
+    // 4 -> 3 这类小数量卸载，旧的比例阈值会永远拦住；连续确认三轮后必须真的清掉
+    assert.deepEqual((await syncMaps(opts)).removed, [])
+    assert.deepEqual((await syncMaps(opts)).removed, [])
+    const third = await syncMaps(opts)
+
+    assert.deepEqual(third.removed, ['D'])
     assert.deepEqual(cachedKeys(), ['A', 'B', 'C'])
+  })
+
+  test('连续确认：中途又出现，消失计数清零', () => {
+    for (const key of ['A', 'B']) writeCached(key)
+    const absent = new Map()
+
+    assert.deepEqual(pruneUninstalled(['A'], { absent }), [])
+    assert.equal(absent.get('B'), 1)
+    assert.deepEqual(pruneUninstalled(['A'], { absent }), [])
+    assert.equal(absent.get('B'), 2)
+
+    // 插件更新完又扫到了，之前攒的两轮作废
+    assert.deepEqual(pruneUninstalled(['A', 'B'], { absent }), [])
+    assert.equal(absent.has('B'), false)
+
+    assert.deepEqual(pruneUninstalled(['A'], { absent }), [])
+    assert.deepEqual(pruneUninstalled(['A'], { absent }), [])
+    assert.deepEqual(pruneUninstalled(['A'], { absent }), ['B'])
+  })
+
+  test('2 -> 1 的小数量卸载，三轮后照样清掉（旧阈值死区已修）', () => {
+    for (const key of ['A', 'B']) writeCached(key)
+    const absent = new Map()
+
+    assert.deepEqual(pruneUninstalled(['A'], { absent }), [])
+    assert.deepEqual(pruneUninstalled(['A'], { absent }), [])
+    assert.deepEqual(pruneUninstalled(['A'], { absent }), ['B'])
+    assert.deepEqual(cachedKeys(), ['A'])
   })
 
   test('别名撞车时，主写法就是输入的条目优先', () => {
@@ -911,5 +947,17 @@ describe('审计修复：清理顺序、歧义、索引地址与占位符', () =
     assert.equal(isPlaceholderCommand('[]'), true)
     assert.equal(isPlaceholderCommand('{参数}'), true)
     assert.equal(isPlaceholderCommand('#RBQ'), false)
+  })
+
+  test('条目在加载期就带好归一化字段，查询期不必重算', () => {
+    writeCached('A')
+    const { entries } = loadEntries()
+
+    assert.equal(entries[0]._norm.cmd, '甲', '指令前缀与大小写归一应在加载期算好')
+    assert.deepEqual(entries[0]._lower.cmd, '#甲')
+    assert.equal(entries[0]._norm.pluginBare, 'a')
+    assert.equal(entries[0]._norm.pluginKeyLower, 'a')
+    assert.ok(Array.isArray(entries[0]._norm.keys))
+    assert.ok(Array.isArray(entries[0]._norm.scenarios))
   })
 })

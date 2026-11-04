@@ -152,10 +152,20 @@ function entryPath (key) {
 }
 
 /**
- * 拍平结果的缓存。每条消息都要用这张表，而二三十份地图加起来几 MB——每轮重新读盘解析
- * 要白占掉几十毫秒的事件循环。失效不看时间，看 `entriesSignature()` 算出的签名。
+/**
+ * 拍平结果的缓存。每条消息都要用这张表，二三十份地图加起来几 MB。
+ *
+ * 失效走两条：同步落盘 / 清理目录后主动置空（立即生效），再加一个低频签名复核，
+ * 兜住「有人绕过插件手工改了 entry.json」。稳态下每条消息只读一次时间，零磁盘 IO。
  */
 let entriesCache = null
+
+/** 签名复核的最小间隔：手工改文件时最多等这么久生效 */
+const SIGNATURE_TTL_MS = 10_000
+
+function invalidateEntries () {
+  entriesCache = null
+}
 
 /**
  * 读云端索引。索引没有哈希可校验（它就是用来校验别的东西的根），所以只查结构与版本，
@@ -243,6 +253,7 @@ function writeEntry (key, meta, map) {
   fs.writeFileSync(temporary, JSON.stringify({ meta, map }, null, 2) + '\n', 'utf8')
   try {
     fs.renameSync(temporary, file)
+    invalidateEntries()
   } catch (err) {
     fs.rmSync(temporary, { force: true })
     throw err
@@ -442,12 +453,35 @@ export function isPlaceholderCommand (text) {
  * @returns {{ entries: Array<object>, stats: { plugins: number, commands: number } }}
  */
 export function loadEntries () {
+  const now = Date.now()
+  const dirMtime = mapsDirMtime()
+
+  // 写侧已置空时这里不会命中。命中条件是两个：没到复核间隔，且地图目录本身没被动过。
+  // 只 stat 目录本身（1 次 IO）——删掉/重建子目录会改它，比逐个 stat 31 份文件便宜一个数量级；
+  // 单份文件内容被手工改写则靠写侧失效与 10 秒复核兜住。
+  if (entriesCache &&
+      now - entriesCache.checkedAt < SIGNATURE_TTL_MS &&
+      entriesCache.dirMtime === dirMtime) return entriesCache.value
+
   const signature = entriesSignature()
-  if (entriesCache?.signature === signature) return entriesCache.value
+  if (entriesCache?.signature === signature) {
+    entriesCache.checkedAt = now
+    entriesCache.dirMtime = dirMtime
+    return entriesCache.value
+  }
 
   const value = flattenEntries()
-  entriesCache = { signature, value }
+  entriesCache = { signature, value, checkedAt: now, dirMtime }
   return value
+}
+
+/** 地图目录的修改时间：只反映子目录增删，不反映单份 entry.json 的内容改写 */
+function mapsDirMtime () {
+  try {
+    return fs.statSync(mapsDir()).mtimeMs
+  } catch {
+    return 0
+  }
 }
 
 /**
@@ -494,6 +528,29 @@ function flattenEntries () {
       // 没有写法的条目（「任意含某词的消息都会触发」这类）检索不到、也代执行不了，不收
       if (!command) continue
       const params = Array.isArray(item.params) ? item.params : []
+      const keys = buildKeys(item, command)
+      const description = String(item.summary ?? item.title ?? '').trim()
+      const scenarios = stringList(item.scenarios)
+
+      // 加载期把归一化结果算好。`searchEntries` 每轮要对上千条做 NFKC + 正则去噪、
+      // 还有插件名的括号/后缀裁剪，实测这是 7ms 查询里的大头；这些数据只要地图不变就不会变。
+      const norm = {
+        cmd: normalizeText(command),
+        keys: keys.map(normalizeText),
+        desc: normalizeText(description),
+        scenarios: scenarios.map(normalizeText),
+        pluginBare: bareName(display),
+        pluginKeyLower: key.toLowerCase(),
+        pluginCategoryLower: category.toLowerCase(),
+        pluginSuffixless: stripPluginSuffix(display)
+      }
+      const lower = {
+        cmd: command.toLowerCase(),
+        keys: keys.map(key => key.toLowerCase()),
+        desc: description.toLowerCase(),
+        scenarios: scenarios.map(item => item.toLowerCase())
+      }
+
       entries.push({
         plugin: display,
         pluginKey: key,
@@ -501,9 +558,9 @@ function flattenEntries () {
         pluginSummary: summary,
         command,
         aliases: stringList(item.aliases),
-        keys: buildKeys(item, command),
+        keys,
         hasParams: params.length > 0,
-        description: String(item.summary ?? item.title ?? '').trim(),
+        description,
         what: String(item.what ?? '').trim(),
         returns: String(item.returns ?? '').trim(),
         risk: normalizeRisk(item.risk),
@@ -514,13 +571,15 @@ function flattenEntries () {
         pitfalls: stringList(item.pitfalls),
         failures: failureList(item.failures),
         edgeCases: stringList(item.edgeCases),
-        scenarios: stringList(item.scenarios),
+        scenarios,
         vs: vsList(item.vs),
         related: stringList(item.related),
         timing: String(item.timing ?? '').trim(),
         cost: String(item.cost ?? '').trim(),
         enabledByDefault: item.enabled_by_default !== false,
-        implementedIn: String(item.implemented_in ?? '').trim()
+        implementedIn: String(item.implemented_in ?? '').trim(),
+        _norm: norm,
+        _lower: lower
       })
     }
   }
@@ -608,7 +667,37 @@ function dice (left, right) {
  * 让最通用的 `#点赞` 稳定排在第一位。
  */
 function commandWeight (entry) {
-  return normalizeText(entry?.command || '').length
+  return (entry?._norm?.cmd ?? normalizeText(entry?.command || '')).length
+}
+
+/**
+ * 查询期用的归一化视图。真实条目在 `flattenEntries()` 里已经算好，这里只是取引用；
+ * 测试里手工构造的条目没有预计算字段，走一次等价的现场计算，保证行为一致。
+ */
+function viewOf (entry) {
+  if (entry._norm && entry._lower) return { norm: entry._norm, lower: entry._lower }
+
+  const keys = entry.keys || []
+  const description = entry.description || ''
+  const scenarios = entry.scenarios || []
+  return {
+    norm: {
+      cmd: normalizeText(entry.command),
+      keys: keys.map(normalizeText),
+      desc: normalizeText(description),
+      scenarios: scenarios.map(normalizeText),
+      pluginBare: bareName(entry.plugin),
+      pluginKeyLower: String(entry.pluginKey || '').toLowerCase(),
+      pluginCategoryLower: String(entry.pluginCategory || '').toLowerCase(),
+      pluginSuffixless: stripPluginSuffix(entry.plugin)
+    },
+    lower: {
+      cmd: String(entry.command || '').toLowerCase(),
+      keys: keys.map(key => key.toLowerCase()),
+      desc: description.toLowerCase(),
+      scenarios: scenarios.map(item => item.toLowerCase())
+    }
+  }
 }
 
 /**
@@ -644,10 +733,12 @@ export function searchEntries (entries, query) {
   }
 
   const cleanNeedle = stripPluginSuffix(needle) || needle
-  const loosePlugin = list.filter(entry =>
-    entry.pluginKey.toLowerCase().includes(cleanNeedle) ||
-    bareName(entry.plugin).includes(cleanNeedle) ||
-    (entry.pluginCategory && entry.pluginCategory.toLowerCase() === cleanNeedle))
+  const loosePlugin = list.filter(entry => {
+    const norm = entry._norm
+    return (norm?.pluginKeyLower ?? entry.pluginKey.toLowerCase()).includes(cleanNeedle) ||
+      (norm?.pluginBare ?? bareName(entry.plugin)).includes(cleanNeedle) ||
+      (entry.pluginCategory && (norm?.pluginCategoryLower ?? entry.pluginCategory.toLowerCase()) === cleanNeedle)
+  })
   if (loosePlugin.length) return pluginResult(loosePlugin)
 
   return { mode: 'none', matches: [], total: 0 }
@@ -667,17 +758,17 @@ function stripPluginSuffix (value) {
 }
 
 function isSamePlugin (entry, needle) {
-  const b = bareName(entry.plugin)
-  const k = entry.pluginKey.toLowerCase()
+  const norm = entry._norm
+  const b = norm?.pluginBare ?? bareName(entry.plugin)
+  const k = norm?.pluginKeyLower ?? entry.pluginKey.toLowerCase()
   const n = bareName(needle)
   if (b === n || k === n) return true
 
   // 用户显式带了「插件 / plugin」问某插件全表（如「椰奶插件」对 display「椰奶」）
   if (needle.includes('插件') || needle.includes('plugin')) {
     const ns = stripPluginSuffix(needle)
-    if (ns && (stripPluginSuffix(entry.plugin) === ns || stripPluginSuffix(entry.pluginKey) === ns)) {
-      return true
-    }
+    const own = norm?.pluginSuffixless ?? stripPluginSuffix(entry.plugin)
+    if (ns && (own === ns || stripPluginSuffix(entry.pluginKey) === ns)) return true
   }
   return false
 }
@@ -701,26 +792,23 @@ function scoreEntries (list, needle, { allowFuzzy = false } = {}) {
   const coreQuery = isCommandSyntax ? normRaw : (stripFillers(normRaw) || normRaw)
 
   for (const entry of list) {
-    const command = entry.command.toLowerCase()
+    const { norm, lower } = viewOf(entry)
     let score = 0
-    if (command === needle) score = 4
-    else if (entry.keys.some(key => key.toLowerCase() === needle)) score = 3
-    else if (command.includes(needle)) score = 2
-    else if (entry.keys.some(key => key.toLowerCase().includes(needle))) score = 1
-    else if (entry.description.toLowerCase().includes(needle)) score = 1
-    else if (entry.scenarios?.some(item => item.toLowerCase().includes(needle))) score = 1
+    if (lower.cmd === needle) score = 4
+    else if (lower.keys.some(key => key === needle)) score = 3
+    else if (lower.cmd.includes(needle)) score = 2
+    else if (lower.keys.some(key => key.includes(needle))) score = 1
+    else if (lower.desc.includes(needle)) score = 1
+    else if (lower.scenarios.some(item => item.includes(needle))) score = 1
 
     if (!score && coreQuery.length >= 2) {
-      const normCmd = normalizeText(entry.command)
+      const normCmd = norm.cmd
       if (normCmd === coreQuery) score = 3.5
-      else if (entry.keys.some(key => normalizeText(key) === coreQuery)) score = 2.8
+      else if (norm.keys.some(nk => nk === coreQuery)) score = 2.8
       else if (normCmd.includes(coreQuery)) score = 1.8
-      else if (entry.keys.some(key => {
-        const nk = normalizeText(key)
-        return nk.length >= 2 && (nk.includes(coreQuery) || coreQuery.includes(nk))
-      })) score = 1.2
-      else if (normalizeText(entry.description).includes(coreQuery)) score = 0.9
-      else if (entry.scenarios?.some(item => normalizeText(item).includes(coreQuery))) score = 0.8
+      else if (norm.keys.some(nk => nk.length >= 2 && (nk.includes(coreQuery) || coreQuery.includes(nk)))) score = 1.2
+      else if (norm.desc.includes(coreQuery)) score = 0.9
+      else if (norm.scenarios.some(ns => ns.includes(coreQuery))) score = 0.8
     }
 
     if (score) scored.push({ entry, score })
@@ -731,9 +819,10 @@ function scoreEntries (list, needle, { allowFuzzy = false } = {}) {
     const qChars = new Set([...coreQuery])
     for (const entry of list) {
       let best = 0
-      const targets = [entry.command, ...entry.keys, entry.description, ...(entry.scenarios || [])]
-      for (const candidate of targets) {
-        const normCand = normalizeText(candidate)
+      const { norm } = viewOf(entry)
+      // 归一化结果加载期已经算好；bigrams 内部再过一次是幂等的，结果与原实现一致
+      const targets = [norm.cmd, ...norm.keys, norm.desc, ...norm.scenarios]
+      for (const normCand of targets) {
         if (!normCand) continue
         const cGrams = bigrams(normCand)
         const shared = countShared(qGrams, cGrams)
@@ -1106,25 +1195,36 @@ async function downloadOne ({ key, entry, base, fetchImpl, mirrors }) {
  * 功能，这正是地图要避免的「瞎说」。`installed` 为空时一律不动：插件目录扫不到（路径不对、
  * 权限不足）与「一个插件都没装」在代码里长得一样，而清空缓存是不可逆的，宁可留着脏数据。
  *
+ * 传 `absent` 时启用「连续 N 轮确认」：某个目录要连着 N 轮都没被扫到才删。插件目录在
+ * git/pnpm 改写期间会短暂缺项，靠「清单少了百分之多少」区分扫描故障与真卸载在小样本上
+ * 不可靠（实测 2→1、3→2、5→3 的正常卸载都会被误拦、缓存永远清不掉），连续确认才是
+ * 可判定的信号。不传 `absent` 时立即删除，供测试与手工清理用。
+ *
  * @param {string[]} installed 本机插件 key
+ * @param {{ absent?: Map<string, number>, threshold?: number }} [options]
  * @returns {string[]} 被删掉的 key（按目录名，已编码）
  */
-export function pruneUninstalled (installed, { previous = 0 } = {}) {
+export function pruneUninstalled (installed, { absent = null, threshold = 3 } = {}) {
   const keep = new Set((Array.isArray(installed) ? installed : []).map(safeKey))
   if (!keep.size) return []
 
-  // 清单骤减时一律不动：插件目录在 git/pnpm 改写期间会短暂扫不到，按「扫不到=已卸载」
-  // 删缓存是净损失，且这轮下载失败就再也补不回来。宁可多留一份脏数据。
-  if (previous > 0 && keep.size < previous * 0.7) {
-    globalThis.logger?.warn?.(
-      `${LOG_PREFIX} 本机插件清单从 ${previous} 个降到 ${keep.size} 个，这轮不清理缓存`
-    )
-    return []
-  }
-
   const removed = []
   for (const dir of listDirs()) {
-    if (keep.has(dir.name)) continue
+    if (keep.has(dir.name)) {
+      // 插件又出现了：之前攒的消失计数作废，避免「更新时短暂缺项」攒到第三轮被误删
+      absent?.delete(dir.name)
+      continue
+    }
+
+    if (absent) {
+      const seen = (absent.get(dir.name) || 0) + 1
+      if (seen < threshold) {
+        absent.set(dir.name, seen)
+        continue
+      }
+      absent.delete(dir.name)
+    }
+
     try {
       fs.rmSync(path.join(mapsDir(), dir.name), { recursive: true, force: true })
       removed.push(decodeSegment(dir.name) || dir.name)
@@ -1132,6 +1232,7 @@ export function pruneUninstalled (installed, { previous = 0 } = {}) {
       globalThis.logger?.warn?.(`${LOG_PREFIX} 清不掉已卸载插件的缓存（${dir.name}）：${err?.message || err}`)
     }
   }
+  if (removed.length) invalidateEntries()
   return removed
 }
 
@@ -1186,10 +1287,6 @@ export async function syncMaps ({ indexUrl, plugins = [], fetchImpl, mirrors } =
     if (meta) localMeta.set(plugin.key, meta)
   }
 
-  // 清理用的「原有份数」必须在下载前采样：本轮新下的地图会让目录变多，
-  // 下载后再数会把「新增一份 + 删除一份」误判成骤减。
-  const cachedBefore = listLocalPlugins().length
-
   const plan = planSync({ index, plugins, localMeta })
   let updated = 0
   const errors = []
@@ -1207,9 +1304,10 @@ export async function syncMaps ({ indexUrl, plugins = [], fetchImpl, mirrors } =
     }
   }
 
-  // 清理放在下载之后：清单在插件目录被改写时会短暂缺项，先删后下会把还能用的地图删掉，
-  // 而这一轮若又下载失败，缓存就净损失了。
-  const removed = pruneUninstalled(plugins.map(plugin => plugin.key), { previous: cachedBefore })
+  // 清理放在下载之后：清单在插件目录被改写时会短暂缺项，先删后下会把还能用的地图删掉。
+  // 传 absent 启用「连续 3 轮确认」——插件更新时短暂缺项不会攒够次数，真卸载三轮后自动清掉。
+  const absent = new Map(Object.entries(before.absent || {}))
+  const removed = pruneUninstalled(plugins.map(plugin => plugin.key), { absent })
 
   // 一份都没下成、却有该下的：当作这轮失败。只要有一份落地，地图就比上一轮全，计数归零
   const ok = plan.pending.length === 0 || updated > 0
@@ -1219,7 +1317,8 @@ export async function syncMaps ({ indexUrl, plugins = [], fetchImpl, mirrors } =
     lastRunAt: now,
     lastOkAt: ok ? now : before.lastOkAt,
     failures: ok ? 0 : before.failures + 1,
-    missing: plan.missing
+    missing: plan.missing,
+    absent: Object.fromEntries(absent)
   }
   saveState(state)
 
@@ -1263,7 +1362,7 @@ function statePath () {
 }
 
 function emptyState () {
-  return { revision: 0, lastRunAt: '', lastOkAt: '', failures: 0, missing: [] }
+  return { revision: 0, lastRunAt: '', lastOkAt: '', failures: 0, missing: [], absent: {} }
 }
 
 /** 读同步状态。读不出来或结构不对时当作「从没同步过」——状态只用于展示，坏了不该拦住任何事 */
@@ -1272,12 +1371,21 @@ export function readMapState () {
     const state = JSON.parse(fs.readFileSync(statePath(), 'utf8'))
     if (!state || typeof state !== 'object') return emptyState()
     const missing = Array.isArray(state.missing) ? state.missing.filter(key => typeof key === 'string') : []
+    // absent: 目录名 -> 连续几轮没被扫到。坏值一律丢掉，免得状态文件被改坏后误删缓存
+    const absent = {}
+    if (state.absent && typeof state.absent === 'object' && !Array.isArray(state.absent)) {
+      for (const [key, count] of Object.entries(state.absent)) {
+        const n = Number(count)
+        if (key && Number.isInteger(n) && n > 0 && n < 100) absent[key] = n
+      }
+    }
     return {
       revision: Number(state.revision) || 0,
       lastRunAt: typeof state.lastRunAt === 'string' ? state.lastRunAt : '',
       lastOkAt: typeof state.lastOkAt === 'string' ? state.lastOkAt : '',
       failures: Number(state.failures) || 0,
-      missing
+      missing,
+      absent
     }
   } catch {
     return emptyState()
@@ -1390,6 +1498,7 @@ export function statusReport (state, stats, switches) {
     `最近一次运行：${state.lastRunAt || '无'}`,
     `连续失败：${state.failures} 次`,
     `地图仓还没收录：${state.missing.length ? state.missing.join('、') : '无'}`,
+    `等待确认卸载：${Object.keys(state.absent || {}).length || '无'}`,
     `开关：同步${switches.sync ? '开' : '关'}，代执行${switches.delegate ? '开' : '关'}`
   ]
 }
