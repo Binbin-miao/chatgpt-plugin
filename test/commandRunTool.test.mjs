@@ -17,7 +17,7 @@ if (!globalThis.logger) {
 }
 
 const { loadEntries, resolveCommand, UPDATE_COMMAND } = await import('../utils/capability/map.js')
-const { CommandRunTool, setCommandDispatcher } = await import('../utils/tools/CommandRunTool.js')
+const { CommandRunTool, setCommandDispatcher, guardAccept } = await import('../utils/tools/CommandRunTool.js')
 
 let cwd
 let tmp
@@ -589,5 +589,79 @@ describe('代执行', () => {
     assert.equal(schema.name, 'commandRun')
     assert.deepEqual(schema.parameters.required, ['command'])
     assert.deepEqual(Object.keys(schema.parameters.properties), ['command'])
+  })
+})
+
+describe('审计修复：风险闸门、并发计数与守卫', () => {
+  test('管理指令的权限位不可信时，拒绝代执行', async () => {
+    writeMap('admin', { display: '管理插件', summary: '管理' }, [
+      { command: '#删库', summary: '删数据', risk: 'a', permission: '实际无校验（任何群成员可执行）' }
+    ])
+    const calls = spyDispatcher()
+
+    const out = await tool.func({ command: '#删库' }, asker())
+
+    assert.match(out, /自己发/)
+    assert.equal(calls.length, 0, '拒绝时不能派发')
+  })
+
+  test('管理指令的权限位写了 master 时，仍然代执行', async () => {
+    writeMap('admin', { display: '管理插件', summary: '管理' }, [
+      { command: '#升级', summary: '升级插件', risk: 'a', permission: 'master' }
+    ])
+    const calls = spyDispatcher()
+
+    const out = await tool.func({ command: '#升级' }, asker({ isMaster: true }))
+
+    assert.match(out, /执行成功/)
+    assert.equal(calls.length, 1)
+  })
+
+  test('插件并发发两条时，计数不丢', async () => {
+    seed()
+    setCommandDispatcher(async event => {
+      await Promise.all([event.reply('一'), event.reply('二')])
+      return true
+    })
+
+    const out = await tool.func({ command: '#签到' }, asker({ reply: async () => undefined }))
+
+    assert.match(out, /2 条/)
+  })
+
+  test('首条发送失败、次条成功时，不能误报没回话', async () => {
+    seed()
+    setCommandDispatcher(async event => {
+      await Promise.all([event.reply('一'), event.reply('二')])
+      return true
+    })
+
+    const out = await tool.func({ command: '#签到' }, asker({
+      reply: async text => (text === '一' ? false : undefined)
+    }))
+
+    assert.match(out, /1 条/)
+  })
+
+  test('两路守卫并发，先收尾的一路不拆后一路', async () => {
+    const original = async function (event) {
+      event.msg = '#角色详情'
+      return true
+    }
+    const proto = { accept: original }
+    const Cls = function () {}
+    Cls.prototype = proto
+    const loader = { priority: [{ class: Cls }] }
+
+    const releaseA = guardAccept(loader)
+    const releaseB = guardAccept(loader)
+    releaseA()
+
+    const event = { __commandMapNested: true, msg: '#点赞' }
+    await proto.accept(event)
+    assert.equal(event.msg, '#点赞', 'A 收尾后 B 的守卫仍要生效，不能被拆掉')
+
+    releaseB()
+    assert.equal(proto.accept, original, '全部收尾后必须还原成原始函数')
   })
 })

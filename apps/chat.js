@@ -612,6 +612,9 @@ export class chatgpt extends plugin {
    * #chatgpt
    */
   async chatgpt(e) {
+    // 代执行派发出去的消息已经指定了要跑哪条指令，不能再当成闲聊喂给模型：
+    // 否则会多跑一整轮对话，它的回复还会被计成「插件回话」，把失败说成成功。
+    if (e?.__commandMapNested) return false
     let msg = e.msg
     let prompt
     let forcePictureMode = false
@@ -701,6 +704,8 @@ export class chatgpt extends plugin {
    * bot现在可以对「包含第一人称的句子」回复
    */
   async chatgpt_for_firstperson_call(e, { automatic = false } = {}) {
+    // 同 chatgpt()：代执行的消息不再触发新一轮对话
+    if (e?.__commandMapNested) return false
     if (!automatic && !Config.chat_for_First_person) {
       logger.info('[chatgpt] AI回应第一人称呼叫已关闭，不予理会')
       return false

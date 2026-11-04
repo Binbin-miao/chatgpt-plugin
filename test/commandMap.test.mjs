@@ -24,6 +24,8 @@ import {
   readMapState,
   shouldNotifyFailures,
   pruneUninstalled,
+  resolveCommand,
+  isPlaceholderCommand,
   suggestEntries,
   updateReport,
   statusReport,
@@ -798,5 +800,116 @@ describe('打错字时的建议', () => {
   test('重复写法只建议一次', () => {
     const near = suggestEntries(seedNear(), '#签到')
     assert.equal(near.filter(entry => entry.command === '#签到').length, 1)
+  })
+})
+
+describe('审计修复：清理顺序、歧义、索引地址与占位符', () => {
+  /** 直接在缓存目录里放一份可用地图，meta 决定版本比对结果 */
+  function writeCached(key, version = '1.0.0') {
+    const dir = path.join(tmp, 'data', 'chatgpt', 'maps', encodeURIComponent(key))
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'entry.json'), JSON.stringify({
+      meta: { key, version },
+      map: { schema: 2, plugin: { key, display: key }, instructions: [{ command: '#甲' }] }
+    }), 'utf8')
+  }
+
+  const cachedKeys = () => fs.readdirSync(path.join(tmp, 'data', 'chatgpt', 'maps')).sort()
+
+  test('清单骤减时整轮不清理：同步失败也不会净损失', async () => {
+    for (const key of ['A', 'B', 'C']) writeCached(key)
+    const fetchImpl = fakeFetch({
+      [INDEX_URL]: indexOf({
+        A: { file: 'maps/A.json', version: '1.0.0', sha256: 'a'.repeat(64) },
+        B: { file: 'maps/B.json', version: '1.0.0', sha256: 'b'.repeat(64) },
+        C: { file: 'maps/C.json', version: '1.0.0', sha256: 'c'.repeat(64) }
+      })
+    })
+
+    // 本机只扫到 A（3 -> 1 是骤减），这轮必须一份都不删
+    const result = await syncMaps({ indexUrl: INDEX_URL, plugins: [{ key: 'A' }], fetchImpl })
+
+    assert.deepEqual(result.removed, [])
+    assert.deepEqual(cachedKeys(), ['A', 'B', 'C'])
+  })
+
+  test('确实卸载了插件时仍然清理', async () => {
+    for (const key of ['A', 'B', 'C', 'D']) writeCached(key)
+    const fetchImpl = fakeFetch({
+      [INDEX_URL]: indexOf({
+        A: { file: 'maps/A.json', version: '1.0.0', sha256: 'a'.repeat(64) },
+        B: { file: 'maps/B.json', version: '1.0.0', sha256: 'b'.repeat(64) },
+        C: { file: 'maps/C.json', version: '1.0.0', sha256: 'c'.repeat(64) }
+      })
+    })
+
+    // 4 -> 3 属于正常卸载，不该被骤减保护永远挡住
+    const result = await syncMaps({
+      indexUrl: INDEX_URL,
+      plugins: [{ key: 'A' }, { key: 'B' }, { key: 'C' }],
+      fetchImpl
+    })
+
+    assert.deepEqual(result.removed, ['D'])
+    assert.deepEqual(cachedKeys(), ['A', 'B', 'C'])
+  })
+
+  test('别名撞车时，主写法就是输入的条目优先', () => {
+    const dir = path.join(tmp, 'data', 'chatgpt', 'maps', 'demo')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'entry.json'), JSON.stringify({
+      meta: { key: 'demo' },
+      map: {
+        schema: 2,
+        plugin: { key: 'demo', display: '演示' },
+        instructions: [
+          { command: '#芙宁娜', summary: '角色图鉴', risk: 'q' },
+          { command: '#图鉴升级', aliases: ['芙宁娜'], summary: '升级图鉴库', risk: 'a', permission: 'master' }
+        ]
+      }
+    }), 'utf8')
+
+    const { entry, candidates } = resolveCommand(loadEntries().entries, '芙宁娜')
+
+    assert.equal(entry?.command, '#芙宁娜')
+    assert.equal(candidates, undefined)
+  })
+
+  test('大小写变体算同一条，不互相撞成歧义', () => {
+    const dir = path.join(tmp, 'data', 'chatgpt', 'maps', 'demo')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'entry.json'), JSON.stringify({
+      meta: { key: 'demo' },
+      map: {
+        schema: 2,
+        plugin: { key: 'demo', display: '演示' },
+        instructions: [
+          { command: '#chatgpt开启api流', summary: '开', risk: 'q' },
+          { command: '#chatgpt开启API流', summary: '开', risk: 'q' }
+        ]
+      }
+    }), 'utf8')
+
+    const { entry } = resolveCommand(loadEntries().entries, '开启api流')
+
+    assert.ok(entry, '大小写变体不该把唯一答案变成歧义')
+    assert.match(entry.command, /开启api流/i)
+  })
+
+  test('索引地址带 query 时，base 仍然只到目录', async () => {
+    const url = 'https://x.test/dist/index.json?raw=1'
+    const { base } = await readIndex({
+      indexUrl: url,
+      fetchImpl: fakeFetch({ [url]: indexOf({}) })
+    })
+
+    assert.equal(base, 'https://x.test/dist/')
+  })
+
+  test('方括号与花括号占位不当作可执行指令', () => {
+    assert.equal(isPlaceholderCommand('[话题]'), true)
+    assert.equal(isPlaceholderCommand('[]'), true)
+    assert.equal(isPlaceholderCommand('{参数}'), true)
+    assert.equal(isPlaceholderCommand('#RBQ'), false)
   })
 })

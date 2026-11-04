@@ -181,7 +181,9 @@ export async function readIndex ({ indexUrl, fetchImpl } = {}) {
     throw new Error(`索引缺少 plugins（来自 ${source}）`)
   }
 
-  return { base: url.replace(/[^/]+$/, ''), index, revision: Number(index.revision) || 0 }
+  // 用 URL 解析而不是正则截尾：索引地址带 query 时正则会把 query 也当成目录，
+  // 裸域名时又会退化成 `https://`，让后面的同目录校验形同虚设。
+  return { base: new URL('.', url).href, index, revision: Number(index.revision) || 0 }
 }
 
 /**
@@ -421,6 +423,9 @@ export function isPlaceholderCommand (text) {
   if (!value) return true
   if (value.startsWith('（') || value.startsWith('(')) return true
   if (/<[^<>]+>/.test(value)) return true
+  // 地图里把「填这里」写成方括号/花括号占位：`[话题]`、`[]`、`{参数}`
+  if (/^\[[^\]]*\]$/.test(value)) return true
+  if (/^\{[^}]*\}$/.test(value)) return true
   return false
 }
 
@@ -866,6 +871,13 @@ export function resolveCommand (entries, text) {
 
   // 3. 别名精确命中或别名带参前缀命中（在去重前的可调用条目上查，以保留各插件自己的 aliases）
   const needle = input.toLowerCase()
+
+  // 3.0 主写法去掉指令前缀后与输入完全一致时优先：`芙宁娜` 首先是 `#芙宁娜`，
+  // 不能因为另一个条目把「芙宁娜」写进别名，就把用户改派到那条去。
+  const bareNeedle = needle.replace(/^#/, '')
+  const bareMatches = list.filter(entry => entry.command.replace(/^#/, '').toLowerCase() === bareNeedle)
+  if (bareMatches.length === 1) return { entry: bareMatches[0], args: '' }
+
   const byAliasExact = dedupeCandidates(
     callableEntries.filter(entry =>
       Array.isArray(entry.aliases) &&
@@ -882,6 +894,11 @@ export function resolveCommand (entries, text) {
     }
   }
   if (byAliasExact.length > 1) {
+    // 别名撞车时，主写法本身就等于输入的那条优先：`芙宁娜` 既是 `#芙宁娜` 的主写法、
+    // 又可能被别的条目写进别名，不能因此把真正的 `#芙宁娜` 判成歧义。
+    const exactBare = byAliasExact.filter(entry =>
+      entry.command.replace(/^#/, '').toLowerCase() === needle.replace(/^#/, ''))
+    if (exactBare.length === 1) return { entry: exactBare[0], args: '' }
     return { entry: null, candidates: byAliasExact, reason: 'ambiguous' }
   }
 
@@ -962,9 +979,12 @@ function dedupeCandidates (list) {
 function dedupeByCommand (list) {
   const byCommand = new Map()
   for (const entry of list) {
-    const seen = byCommand.get(entry.command)
+    // 大小写不同的同一条指令（`#chatgpt开启api流` / `#chatgpt开启API流`）算一条：
+    // 否则它们会在歧义判定里互相撞车，用户按哪种写法都执行不了。
+    const dedupeKey = String(entry.command ?? '').toLowerCase()
+    const seen = byCommand.get(dedupeKey)
     if (!seen) {
-      byCommand.set(entry.command, {
+      byCommand.set(dedupeKey, {
         ...entry,
         keys: Array.isArray(entry.keys) ? [...entry.keys] : [],
         aliases: Array.isArray(entry.aliases) ? [...entry.aliases] : []
@@ -973,6 +993,10 @@ function dedupeByCommand (list) {
     }
     if (RISK_ORDER[entry.risk] > RISK_ORDER[seen.risk]) seen.risk = entry.risk
     if (entry.permission === 'master') seen.permission = 'master'
+    // 另一种写法也是用户可能敲的字面量，并进 keys 才能按它命中
+    if (entry.command !== seen.command && !seen.keys.some(key => String(key).toLowerCase() === dedupeKey)) {
+      seen.keys.push(entry.command)
+    }
     for (const k of entry.keys || []) {
       if (!seen.keys.includes(k)) seen.keys.push(k)
     }
@@ -1085,9 +1109,18 @@ async function downloadOne ({ key, entry, base, fetchImpl, mirrors }) {
  * @param {string[]} installed 本机插件 key
  * @returns {string[]} 被删掉的 key（按目录名，已编码）
  */
-export function pruneUninstalled (installed) {
+export function pruneUninstalled (installed, { previous = 0 } = {}) {
   const keep = new Set((Array.isArray(installed) ? installed : []).map(safeKey))
   if (!keep.size) return []
+
+  // 清单骤减时一律不动：插件目录在 git/pnpm 改写期间会短暂扫不到，按「扫不到=已卸载」
+  // 删缓存是净损失，且这轮下载失败就再也补不回来。宁可多留一份脏数据。
+  if (previous > 0 && keep.size < previous * 0.7) {
+    globalThis.logger?.warn?.(
+      `${LOG_PREFIX} 本机插件清单从 ${previous} 个降到 ${keep.size} 个，这轮不清理缓存`
+    )
+    return []
+  }
 
   const removed = []
   for (const dir of listDirs()) {
@@ -1153,8 +1186,11 @@ export async function syncMaps ({ indexUrl, plugins = [], fetchImpl, mirrors } =
     if (meta) localMeta.set(plugin.key, meta)
   }
 
+  // 清理用的「原有份数」必须在下载前采样：本轮新下的地图会让目录变多，
+  // 下载后再数会把「新增一份 + 删除一份」误判成骤减。
+  const cachedBefore = listLocalPlugins().length
+
   const plan = planSync({ index, plugins, localMeta })
-  const removed = pruneUninstalled(plugins.map(plugin => plugin.key))
   let updated = 0
   const errors = []
 
@@ -1170,6 +1206,10 @@ export async function syncMaps ({ indexUrl, plugins = [], fetchImpl, mirrors } =
       errors.push(`${item.key}: ${err?.message || err}`)
     }
   }
+
+  // 清理放在下载之后：清单在插件目录被改写时会短暂缺项，先删后下会把还能用的地图删掉，
+  // 而这一轮若又下载失败，缓存就净损失了。
+  const removed = pruneUninstalled(plugins.map(plugin => plugin.key), { previous: cachedBefore })
 
   // 一份都没下成、却有该下的：当作这轮失败。只要有一份落地，地图就比上一轮全，计数归零
   const ok = plan.pending.length === 0 || updated > 0

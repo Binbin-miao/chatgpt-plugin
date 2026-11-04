@@ -1,12 +1,37 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { AbstractTool } from './AbstractTool.js'
 import { loadEntries, resolveCommand, suggestEntries, UPDATE_COMMAND } from '../capability/map.js'
 
 const LOG_PREFIX = '[ChatGPT][map]'
 
+/**
+ * 同一次发送的调用链标记。
+ *
+ * 用它区分两种「同时在发」：
+ *   - 嵌套：`e.reply` 内部又调 `group.sendMsg`，是同一条消息走了第二层通道，只该计一次；
+ *   - 并发：插件 `Promise.all` 发两条，是两条独立消息，必须各计一次。
+ *
+ * 一个共享布尔分不开这两者——它把并发当嵌套，于是首条失败、次条成功时总数停在 0，
+ * 工具会对用户说「插件没回话」，而消息其实已经发出去了。
+ */
+const sendScope = new AsyncLocalStorage()
+
 const FAILED = 'Error: '
 
 /** 框架 filtPermission 拒绝时的固定话术：出现它就说明插件根本没干活 */
 const FRAMEWORK_DENIED = '暂无权限'
+
+/**
+ * `risk:a` 的放行判据：权限位里出现这些词，说明框架或插件有可校验的门。
+ *
+ * 留空、「实际无校验（任何群成员可执行）」这类表述一律算不可信——真实地图里有 18 条
+ * 删数据类指令没有任何权限校验、59 条权限位为空，这两类「交给框架」等于没有闸门。
+ */
+const TRUSTED_PERMISSION_RE = /master|主人|管理员|admin|本人/i
+
+function isTrustedPermission (text) {
+  return TRUSTED_PERMISSION_RE.test(String(text ?? ''))
+}
 
 /**
  * 派发器。默认走框架的 `loader.deal`，测试与宿主可以换掉。
@@ -34,6 +59,9 @@ async function getDispatcher () {
 /** 候选一次最多列几条：再多就该让模型换个说法，而不是把整张表塞回去 */
 const MAX_CANDIDATES = 6
 
+/** 每个被守卫的原型只装一次包装，按引用计数决定何时摘掉 */
+const guardStates = new WeakMap()
+
 /**
  * 挡住 accept 阶段对指令的改写。
  *
@@ -46,31 +74,50 @@ const MAX_CANDIDATES = 6
  * 就还原回我们指定的指令，并且不承认它对这条消息的「抢占」。
  * 只对带标记的事件生效，同一时刻的其它正常消息不受影响。
  *
+ * **按引用计数安装**：两路代执行并发时，先收尾的一路若直接写回原函数，会把后一路的守卫
+ * 一起拆掉（`#点赞` 又会被改写）。这里每个原型只装一次包装，计数归零才摘。
+ *
  * @param {object} loader 框架加载器
  * @returns {() => void} 还原函数
  */
-function guardAccept (loader) {
-  const patched = []
+export function guardAccept (loader) {
+  const releases = []
   const seen = new Set()
   for (const item of loader?.priority || []) {
     const proto = item?.class?.prototype
     if (!proto || typeof proto.accept !== 'function' || seen.has(proto)) continue
     seen.add(proto)
-    const original = proto.accept
-    proto.accept = async function (event) {
-      const before = event?.msg
-      const res = await original.call(this, event)
-      if (!event || !event.__commandMapNested || event.msg === before) return res
-      event.msg = before
-      if (res === true) return undefined
-      return res
+
+    let state = guardStates.get(proto)
+    if (!state) {
+      const original = proto.accept
+      const wrapper = async function (event) {
+        const before = event?.msg
+        const res = await original.call(this, event)
+        if (!event || !event.__commandMapNested || event.msg === before) return res
+        event.msg = before
+        if (res === true) return undefined
+        return res
+      }
+      state = { count: 0, original, wrapper }
+      guardStates.set(proto, state)
+      proto.accept = wrapper
     }
-    patched.push([proto, original])
+
+    state.count += 1
+    releases.push(() => {
+      state.count -= 1
+      if (state.count > 0) return
+      // 只摘自己装的那层：期间被别人换过就说明不该由我们收尾
+      if (proto.accept === state.wrapper) proto.accept = state.original
+      guardStates.delete(proto)
+    })
   }
+
   return () => {
-    for (const [proto, original] of patched) {
+    for (const release of releases) {
       try {
-        proto.accept = original
+        release()
       } catch (err) {
         // 还原失败会让 accept 守卫留下来：往后每条消息都会被多包一层，必须留痕
         logger.error(`${LOG_PREFIX} accept 守卫还原失败：${err?.message || err}`)
@@ -148,29 +195,30 @@ function textOf (msg) {
 function countReplies (delegated) {
   const state = { replies: 0, denied: false }
   const restores = []
-  let busy = false
 
-  /** 包一个发送函数：只数真发出去的那次，嵌套调用与发送失败都不算 */
+  /**
+   * 包一个发送函数：只数真发出去的那次，发送失败不算。
+   *
+   * 嵌套与并发靠 `sendScope` 区分：已在某次发送的调用链里就放走（同一条消息的第二层通道），
+   * 否则开一个新的作用域计数。这样插件 `Promise.all` 发两条会各计一次，而 `e.reply` 内部
+   * 转调 `group.sendMsg` 仍然只计一条。
+   */
   const guarded = (original, self) => async (...args) => {
-    // 已经在外层那次发送里：套着发的分段不算新消息，也不能重复计数
-    if (busy) return original.apply(self, args)
     // 框架 filtPermission 的拒绝（「暂无权限，只有…才能操作」）也走这里，
     // 但它不是插件干活的回话——插件压根没被叫醒
     if (textOf(args[0]).trim().startsWith(FRAMEWORK_DENIED)) {
       state.denied = true
       return original.apply(self, args)
     }
-    busy = true
-    try {
+    if (sendScope.getStore()) return original.apply(self, args)
+    return sendScope.run(true, async () => {
       const res = await original.apply(self, args)
       // 框架把发送失败包成 { error: [...] }，空消息返回 false：这两种都不算办成
       if (res === false) return res
       if (res && typeof res === 'object' && res.error) return res
       state.replies += 1
       return res
-    } finally {
-      busy = false
-    }
+    })
   }
 
   /**
@@ -303,6 +351,14 @@ export class CommandRunTool extends AbstractTool {
     }
 
     const entry = resolved.entry
+
+    // 管理/破坏性指令先过白名单：权限位没写出可校验的门，就不该由 AI 替人按下这个按钮。
+    // 放行的仍由框架与插件再判一次，这里是第一道、不是唯一一道。
+    if (entry.risk === 'a' && !isTrustedPermission(entry.permission)) {
+      logger.warn(`${LOG_PREFIX} 拒绝代执行 ${entry.command}（risk=a，权限位「${entry.permission || '未声明'}」不可信）`)
+      return `${FAILED}「${entry.command}」是管理或破坏性操作，地图标注的权限是「${entry.permission || '未声明'}」，代执行等于绕过插件自己的校验。没有替你执行——告诉用户这条要他自己发。`
+    }
+
     const sender = e?.sender?.card || e?.sender?.nickname || '你'
 
     // 权限与风险都不在这里判：用提问者本人身份派发，框架会按插件规则里的 permission 拦，
