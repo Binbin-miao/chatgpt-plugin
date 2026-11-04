@@ -46,7 +46,7 @@ function commitStorage(value, save) {
 }
 
 /** 标记「已切成 file，但尾窗那段新原文还没补完」。唯一清除条件是尾遍真的成功 */
-function markTailPending() {
+export function markTailPending() {
   try {
     Config.memoryStorageTailPendingAt = Date.now()
   } catch (err) {
@@ -54,7 +54,7 @@ function markTailPending() {
   }
 }
 
-function clearTailPending() {
+export function clearTailPending() {
   if (!Config.memoryStorageTailPendingAt) return
   try {
     Config.memoryStorageTailPendingAt = 0
@@ -170,7 +170,10 @@ export async function resumePendingRawTail({ store, rawStore, notify } = {}) {
     ? text => safeNotify(notify, text)
     : text => { try { logger?.info?.(`[MemoryV2] ${text}`) } catch { /* 日志失败不影响补迁 */ } }
 
-  if (!acquireHeavyTask(LOCK_LABEL)) return { ok: false, reason: 'busy' }
+  if (!acquireHeavyTask(LOCK_LABEL)) {
+    say(`已有「${heavyTaskOwner()}」在跑，上次切换遗留的原文稍后再补`)
+    return { ok: false, reason: 'busy' }
+  }
   try {
     const s = store || new MemoryStore()
     const rs = rawStore || s.rawStore

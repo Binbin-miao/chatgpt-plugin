@@ -9,6 +9,7 @@ import { groupCapture } from '../utils/memory/capture.js'
 import { dailyConsolidation, normalizeCron } from '../utils/memory/dailyTask.js'
 import { MEMORY_INPUT_TOKEN_LIMIT } from '../utils/memory/extractor.js'
 import { acquireHeavyTask, releaseHeavyTask, heavyTaskOwner } from '../utils/memory/heavyTask.js'
+import { markTailPending, clearTailPending } from '../utils/memory/autoMigrate.js'
 import { RECALL_MODE_ALL } from '../utils/memory/recallMode.js'
 import { findProvider, providerLabel } from '../utils/providerProfiles.js'
 import { canDeleteOwnMemory } from '../utils/memory/policy.js'
@@ -453,6 +454,8 @@ export class memoryManage extends plugin {
 
       await this.reply(`开始迁移：${plan.totals.groups} 个群、待写入 ${plan.totals.toAppend} 条，按群写文件需要几分钟，完成会再回一条汇总；期间不要重复发「是」`, true)
       const result = await runMigration({ store, rawStore })
+      // 手动补迁成功 = 文件已补齐，尾窗标记可以清掉；不清的话每次重启都会白扫一遍全量
+      if (result.failed.length === 0) clearTailPending()
       const done = [`✅ 迁移完成：处理 ${result.groups.length} 个群，新增 ${result.appended} 条，跳过已存在 ${result.skipped} 条`]
       if (result.failed.length > 0) {
         done.push(`⚠️ ${result.failed.length} 个群未迁移（这些群的文件保持原样）：`)
@@ -595,16 +598,24 @@ export class memoryManage extends plugin {
       )
       return
     }
+    // 先立标记再切：这条指令切完同样要补尾窗，进程若在补迁途中被杀，
+    // 靠这个标记在下次启动自愈；否则那批只在 Redis 的原文会随 TTL 无声消失。
+    markTailPending()
     Config.memoryStorage = 'file'
     Config.save()
     // 切完再补一遍：迁移跑的这一两分钟里新消息仍在写 Redis，切过去后读路径只读文件，
     // 不补就会静默漏掉这几分钟。切换后 Redis 侧已无新写入，一遍即收敛。
     let tail = { appended: 0, failed: [] }
+    let tailOk = true
     try {
       tail = await runMigration({ store, rawStore })
+      tailOk = (tail.failed || []).length === 0
     } catch (err) {
-      await this.reply(`⚠️ 已切到文件后端，但补最后几分钟的新原文时出错：${err?.message || err}；这批仍在 Redis，发 #记忆迁移到文件 可补齐`, true)
+      tailOk = false
+      await this.reply(`⚠️ 已切到文件后端，但补最后几分钟的新原文时出错：${err?.message || err}；这批仍在 Redis，下次启动会自动重试，也可发 #记忆迁移到文件 立即补`, true)
     }
+    // 只有尾遍真的成功才清标记；抛错或有失败群都留着，留给下次启动补
+    if (tailOk) clearTailPending()
     const lines = [
       `✅ 已迁移 ${(result.appended || 0) + (tail.appended || 0)} 条、跳过已存在 ${result.skipped} 条`,
       '✅ 存储后端已切到「文件」，新消息立即写入 data/chatgpt/memory/raw，无需重启',

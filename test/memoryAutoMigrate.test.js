@@ -209,6 +209,25 @@ test('顺序契约：标记必须早于 file 落盘', async () => {
   assert.ok(fileWrite.pending > 0, '切 file 那一刻标记必须已经写了，否则进程被杀就永远没人知道尾窗没补')
 })
 
+test('已是 file 但尾窗标记还在：面板再保存必须接着补，不用等重启', async () => {
+  Config.memoryStorage = 'file'
+  Config.memoryStorageTailPendingAt = Date.now()
+  const result = await run()
+
+  assert.equal(calls, 1, '标记还在就要补一遍；只回「无需迁移」的话，用户不重启就永远补不上')
+  assert.equal(result.ok, true)
+  assert.equal(Config.memoryStorageTailPendingAt, 0, '补成功要清标记')
+})
+
+test('恢复：当前是 redis 后端时直接拒绝，不在错误的后端上白跑', async () => {
+  Config.memoryStorage = 'redis'
+  Config.memoryStorageTailPendingAt = Date.now()
+  const result = await resumePendingRawTail({ store: {}, rawStore: {}, notify: t => notes.push(t) })
+
+  assert.equal(result.reason, 'not-file')
+  assert.equal(calls, 0, 'redis 后端下不该往文件里写一遍')
+})
+
 test('恢复：有标记时补一遍，成功才清标记', async () => {
   Config.memoryStorage = 'file'
   Config.memoryStorageTailPendingAt = Date.now()
