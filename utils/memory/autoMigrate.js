@@ -7,10 +7,12 @@
  * 时序（关键）：
  *   1. 面板保存时先把 memoryStorage 落回 redis（新消息继续写 Redis，不丢）
  *   2. 本模块跑一遍全量迁移，再跑一遍增量（补第 1 步之后写入的新消息，幂等）
- *   3. 两次都成功后把 memoryStorage 切到 file
+ *   3. 两次都成功**且没有群失败**才切到 file
  *   4. 任一步失败：保持 redis，不改配置，通知主人
  *
- * 迁移期间读原文仍走 Redis，数据是完整的；切到 file 的那一刻文件里已有全量副本。
+ * 为什么「有群失败也不切」：runMigration 是逐群 try/catch，它只把失败记进 failed、从不抛错。
+ * 一旦带着失败切到 file，file 模式的读路径只读文件、不回退 Redis，那些群的历史会当场读不到，
+ * 而 Redis 里其实是完整的——主人看到「已切到文件」就再也不会去救它。
  */
 import { Config } from '../config.js'
 import { MemoryStore } from './store.js'
@@ -18,6 +20,37 @@ import { runMigration } from './migrateRawToFile.js'
 import { acquireHeavyTask, releaseHeavyTask, heavyTaskOwner } from './heavyTask.js'
 
 const LOCK_LABEL = '原文迁移（面板切换）'
+
+/** 通知失败不能影响迁移结果：拿不到主人 QQ、发送超时都只是少一条消息 */
+function safeNotify(notify, text) {
+  if (!notify) return
+  try {
+    notify(text)
+  } catch (err) {
+    logger?.warn?.(`[MemoryV2] 迁移通知发送失败（不影响结果）：${err?.message || err}`)
+  }
+}
+
+/** 写配置失败不推翻已经落盘的数据：文件那边已是完整副本，内存值也对，下次保存会重试 */
+function commitStorage(value, save) {
+  try {
+    Config.memoryStorage = value
+  } catch (err) {
+    logger?.warn?.(`[MemoryV2] 写 memoryStorage=${value} 失败：${err?.message || err}`)
+  }
+  try {
+    save()
+  } catch (err) {
+    logger?.warn?.(`[MemoryV2] 保存配置失败（不影响已迁移数据）：${err?.message || err}`)
+  }
+}
+
+/** 两遍各自返回一次群列表，合并去重后才是这次实际覆盖的群数 */
+function groupCount(...passes) {
+  const ids = new Set()
+  for (const pass of passes) for (const g of pass?.groups || []) ids.add(g.groupId)
+  return ids.size
+}
 
 /**
  * @param {Object} [options]
@@ -27,35 +60,51 @@ const LOCK_LABEL = '原文迁移（面板切换）'
  * @param {Function} [options.saveConfig] 注入用；默认 `Config.save()`
  * @returns {Promise<{ok: boolean, appended?: number, failed?: Array, reason?: string, error?: any}>}
  */
-export async function migrateRawOnSwitch({ store, rawStore, notify, saveConfig } = {}) {
+export async function migrateRawOnSwitch(options = {}) {
   if (!acquireHeavyTask(LOCK_LABEL)) {
-    notify?.(`已有「${heavyTaskOwner()}」在跑，本次切换未执行；等它结束后重新保存一次即可`)
+    safeNotify(options.notify, `已有「${heavyTaskOwner()}」在跑，本次切换未执行；等它结束后重新保存一次即可`)
     return { ok: false, reason: 'busy' }
   }
-  const save = saveConfig || (() => Config.save())
   try {
-    const s = store || new MemoryStore()
-    const rs = rawStore || s.rawStore
-    const first = await runMigration({ store: s, rawStore: rs })
-    // 再跑一遍：补第一次快照之后新落 Redis 的消息；已迁过的按 messageId 跳过，不会重复写
-    const second = await runMigration({ store: s, rawStore: rs })
-    const failed = [...(first.failed || []), ...(second.failed || [])]
-    const appended = (first.appended || 0) + (second.appended || 0)
-    Config.memoryStorage = 'file'
-    save()
-    notify?.(failed.length
-      ? `⚠️ 已切到文件后端，${appended} 条已迁移；但 ${failed.length} 个群未迁完（${failed.slice(0, 5).map(f => f.groupId).join('、')}），这些群的历史仍在 Redis`
-      : `✅ 已切到文件后端：${first.groups.length} 个群、迁移 ${appended} 条`)
-    return { ok: true, appended, failed }
-  } catch (err) {
-    // 失败不切配置：继续用 Redis，数据一条不动
-    Config.memoryStorage = 'redis'
-    save()
-    notify?.(`❌ 迁移失败，已保持 Redis 后端：${err?.message || err}`)
-    return { ok: false, error: err }
+    return await migrateAndSwitch(options)
   } finally {
     releaseHeavyTask()
   }
+}
+
+async function migrateAndSwitch({ store, rawStore, notify, saveConfig } = {}) {
+  const save = saveConfig || (() => Config.save())
+
+  let first
+  let second
+  try {
+    const s = store || new MemoryStore()
+    const rs = rawStore || s.rawStore
+    first = await runMigration({ store: s, rawStore: rs })
+    second = await runMigration({ store: s, rawStore: rs })
+  } catch (err) {
+    // 迁移本身抛错：一条数据都不动，继续用 Redis
+    commitStorage('redis', save)
+    safeNotify(notify, `❌ 迁移失败，已保持 Redis 后端：${err?.message || err}`)
+    return { ok: false, error: err }
+  }
+
+  // 同一个群两遍都失败只算一次：否则文案会写成「2 个群未迁完（300、300）」，把一处故障说成两处
+  const failedByGroup = new Map()
+  for (const f of [...(first.failed || []), ...(second.failed || [])]) failedByGroup.set(f.groupId, f)
+  const failed = [...failedByGroup.values()]
+  const appended = (first.appended || 0) + (second.appended || 0)
+
+  if (failed.length > 0) {
+    const groups = failed.slice(0, 5).map(f => f.groupId).join('、')
+    commitStorage('redis', save)
+    safeNotify(notify, `❌ ${failed.length} 个群未迁完（${groups}），已保持 Redis 后端，历史都能读；稍后重新保存一次会重试`)
+    return { ok: false, failed, appended }
+  }
+
+  commitStorage('file', save)
+  safeNotify(notify, `✅ 已切到文件后端：${groupCount(first, second)} 个群、迁移 ${appended} 条`)
+  return { ok: true, appended, failed }
 }
 
 /** 面板保存时调用：不阻塞保存响应，后台跑完再切 */
