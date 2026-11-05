@@ -55,7 +55,7 @@ single-context: one root `GLOSSARY.md` plus ADRs under `docs/adr/`. See `docs/ag
 - 必须位于 Yunzai 根目录的 `plugins/chatgpt-plugin`；依赖宿主的 `logger`、`redis`、`Bot`、`segment` 和 `../../../lib/plugins/plugin.js`。这些不在插件仓库内，**不要修复这些宿主导入**。运行时还依赖宿主提供的模块（如 `md5` / `moment` / `yaml`，其中 `md5` 是宿主自带的替身模块；由 Node 从插件目录逐级向上解析命中宿主 `node_modules`），**不要**在插件 package.json 里重复声明；CI 里由 `.github/workflows/check.yml` 按同一布局模拟补齐。
 - `utils/common.js` 是重依赖入口，纯逻辑测试不要直接 import；测试需按需提供全局 stub/mock。
 - `config/config.json` 是运行时配置，**勿提交**。`utils/SydneyAIClient.js` 已废弃，不为本次任务顺手修复、重构或删除，也不删除其遗留 import；清理属于单独议题。
-- 查远端 PR/CI 用 gh：`%LOCALAPPDATA%\Programs\gh\bin\gh.exe`（已登录 misaka20002；本机新 shell 可能不在 PATH，用全路径）。公开仓库也可免认证 `curl` GitHub API 的 check-runs / jobs / annotations。
+- 查远端 PR/CI 用 gh：`C:\Program Files\GitHub CLI\gh.exe`（已登录 misaka20002；本机新 shell 可能不在 PATH，用全路径）。公开仓库也可免认证 `curl` GitHub API 的 check-runs / jobs / annotations——但注解只有「exit code 1」没有详情，失败日志要用 gh 认证拉 `run view <id> --log-failed`。
 
 | 路径 | 职责 / 数据流 |
 | --- | --- |

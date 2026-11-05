@@ -41,6 +41,11 @@ export function formatMcpServersForGuoba(value) {
     const env = config.env && typeof config.env === 'object' && !Array.isArray(config.env)
       ? Object.entries(config.env).map(([key, envValue]) => `${key}=${envValue ?? ''}`).join('\n')
       : ''
+    const headers = config.headers && typeof config.headers === 'object' && !Array.isArray(config.headers)
+      ? Object.entries(config.headers).map(([key, headerValue]) => `${key}=${headerValue ?? ''}`).join('\n')
+      : ''
+    const include = Array.isArray(config.include) ? config.include.map(item => `${item}`).join('\n') : ''
+    const exclude = Array.isArray(config.exclude) ? config.exclude.map(item => `${item}`).join('\n') : ''
 
     return {
       enabled: config.enabled !== false,
@@ -49,7 +54,10 @@ export function formatMcpServersForGuoba(value) {
       command: config.command || '',
       url: config.url || '',
       args: Array.isArray(config.args) ? config.args.map(arg => `${arg}`).join('\n') : '',
-      env
+      env,
+      headers,
+      include,
+      exclude
     }
   })
 }
@@ -89,11 +97,37 @@ function parseMcpEnv(value, rowNumber) {
   return env
 }
 
+/** 面板多行文本解析为 headers 键值对；与 env 同款 KEY=value 规则（http/sse 鉴权用） */
+function parseMcpHeaders(value, rowNumber) {
+  if (!value) {
+    return {}
+  }
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    return Object.fromEntries(Object.entries(value).filter(([key]) => `${key}`.trim()))
+  }
+
+  const headers = {}
+  for (const line of splitLines(value)) {
+    const separatorIndex = line.indexOf('=')
+    if (separatorIndex <= 0) {
+      throw new Error(`MCP row ${rowNumber}: headers must use KEY=value format`)
+    }
+
+    const key = line.slice(0, separatorIndex).trim()
+    if (!key) {
+      throw new Error(`MCP row ${rowNumber}: headers key cannot be empty`)
+    }
+    headers[key] = line.slice(separatorIndex + 1)
+  }
+
+  return headers
+}
+
 function isEmptyMcpServerRow(row) {
   if (!row || typeof row !== 'object') {
     return true
   }
-  return ['name', 'command', 'url', 'args', 'env'].every(key => !`${row[key] ?? ''}`.trim())
+  return ['name', 'command', 'url', 'args', 'env', 'headers', 'include', 'exclude'].every(key => !`${row[key] ?? ''}`.trim())
 }
 
 export function stringifyMcpServersFromGuoba(rows) {
@@ -157,6 +191,23 @@ export function stringifyMcpServersFromGuoba(rows) {
         throw new Error(`MCP row ${rowNumber}: url is required for ${type}`)
       }
       serverConfig.url = url
+
+      const headers = parseMcpHeaders(row.headers, rowNumber)
+      if (Object.keys(headers).length) {
+        serverConfig.headers = headers
+      }
+    }
+
+    // 工具面裁剪（工具名数组，所有类型通用）：include 白名单、exclude 黑名单，
+    // 并存时先 include 后 exclude（utils/mcpToolFilter.js）；留空即不写该键 = 不限制
+    const include = splitLines(row.include)
+    if (include.length) {
+      serverConfig.include = include
+    }
+
+    const exclude = splitLines(row.exclude)
+    if (exclude.length) {
+      serverConfig.exclude = exclude
     }
 
     mcpServers[name] = serverConfig

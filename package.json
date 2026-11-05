@@ -66,6 +66,10 @@
     "test:help": "node --experimental-test-module-mocks --test --test-force-exit test/helpView.test.mjs",
     "test:emoji": "node --experimental-test-module-mocks --test --test-force-exit test/emojiUndo.test.mjs",
     "test:nuwa": "node --test --test-force-exit test/groupMemberSkill.test.mjs",
-    "check": "node test/checkSyntax.mjs && node test/pathLeak.check.mjs && node test/lint.check.mjs && npm run test:config && npm run test:help && npm run test:providers && npm run test:thinking && npm run test:emoji && npm run test:media && npm run test:group-reply && npm run test:nuwa"
+    "test:contextInjection": "node --test --test-force-exit test/contextInjection.test.mjs",
+    "test:env": "node --test --test-force-exit test/envInterpolate.test.mjs",
+    "test:mcpHeaders": "node --test --test-force-exit test/mcpHeaders.test.mjs",
+    "test:mcpToolFilter": "node --test --test-force-exit test/mcpToolFilter.test.mjs",
+    "check": "node test/checkSyntax.mjs && node test/pathLeak.check.mjs && node test/lint.check.mjs && npm run test:contextInjection && npm run test:env && npm run test:mcpHeaders && npm run test:mcpToolFilter && npm run test:config && npm run test:help && npm run test:providers && npm run test:thinking && npm run test:emoji && npm run test:media && npm run test:group-reply && npm run test:nuwa"
   }
 }

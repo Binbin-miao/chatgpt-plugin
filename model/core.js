@@ -22,6 +22,7 @@ import { APTool } from '../utils/tools/APTool.js'
 import { mergeTrustedToolArgs } from '../utils/tools/AbstractTool.js'
 import { ClaudeAPIClient } from '../client/ClaudeAPIClient.js'
 import { getMessageById, upsertMessage } from '../utils/history.js'
+import { withContextInjection } from '../utils/contextInjection.js'
 import { v4 as uuid } from 'uuid'
 import fetch from 'node-fetch'
 import { CustomGoogleGeminiClient } from '../client/CustomGoogleGeminiClient.js'
@@ -385,7 +386,9 @@ class Core {
         option.system = system
         const quoted = await collectQuotedImages(e, opt.prepared)
         applyQuotedMedias(option, quoted.medias)
-        // 缓存只存基础 system；提示按本次尝试单独追加（prepared 跨主备复用）
+        // 上下文注入：文本记忆在 prepared 上，一轮只拉取一次（docs/adr/0016）
+        option.system = await withContextInjection(opt.prepared, Config, option.system, conversation)
+        // 缓存存基础 system（含上下文注入文本）；提示按本次尝试单独追加（prepared 跨主备复用）
         option.system = appendGroupAutoReplyPrompt(resolveTurnSystem(opt.prepared, option.system, quoted.failed > 0), opt)
         return await client.sendMessage(promptForClaude, option)
       }
@@ -467,6 +470,7 @@ class Core {
       option.sf_markdownPic = Config.sf_markdownPic
       option.auto_makeForwardMsg = Config.auto_makeForwardMsg
 
+      option.system = await withContextInjection(opt.prepared, Config, option.system, conversation)
       option.system = appendGroupAutoReplyPrompt(resolveTurnSystem(opt.prepared, option.system, quotedFailed), opt)
       return await client.sendMessage(prompt, option)
     } else if (use === 'responses') { // OpenAI Responses API ##############################
@@ -484,6 +488,7 @@ class Core {
         })
         instructions = mergeSystemPrompt(instructions, e, { replyTimestamps: conversation.replyTimestamps })
         if (extraSystemMessage) instructions += extraSystemMessage
+        instructions = await withContextInjection(opt.prepared, Config, instructions, conversation)
         return appendGroupAutoReplyPrompt(instructions, opt)
       }
 
@@ -661,9 +666,10 @@ class Core {
         if (extraSystemMessage) {
           system += extraSystemMessage
         }
+        system = await withContextInjection(opt.prepared, Config, system, conversation)
         return appendGroupAutoReplyPrompt(system, opt)
       }
-      // 引用图先取：失败提示按每次尝试单独追加（缓存只存基础 system）
+      // 引用图先取：失败提示按每次尝试单独追加（缓存存基础 system，含上下文注入文本）
       const quoted = await collectQuotedImages(e, opt.prepared)
       const quotedMedias = quoted.medias
       quotedFailed = quoted.failed > 0
