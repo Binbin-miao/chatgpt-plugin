@@ -9,7 +9,17 @@
 
 排查发现了前缀布局与缓存观测问题；不能据此断言某协议必然缓存为 0：
 
-**1. OpenAI / Responses**：支持自动 prompt caching 的上游通常要求稳定前缀达到该模型的最小缓存长度；具体门槛、有效窗口和兼容行为以实际上游为准，不按“新旧模型”统一划分。历史实验中的 system 拼接顺序是：
+**1. 生产链路实测**：2026-11-06 对家里云实际使用的两条上游（第三方聚合 `cpa.aichen.qzz.io` 与自建 gcli2api）做 A/B 对照，结论一致：
+
+| 请求条件 | 缓存结果 |
+| --- | --- |
+| 与上一次请求逐字节相同 | 命中约 2000 token |
+| system 里群历史多一行 | 0 |
+| system 只改末尾一行 `Current time` | 0 |
+
+也就是说，这两条上游**只有整段 system 一字不差才可能命中**，不是「前缀相同就能续用」。把稳定内容排在 system 前面因此不够——system 本身不能含每轮变化的内容。
+
+历史实验中的 system 拼接顺序曾是：
 
 ```
 basePrompt（默认一句英文）        17 tok   ← 稳定
@@ -19,7 +29,7 @@ last message id（每条消息都变）    9 tok
 插件清单（1874 tok，本来是稳定的）          ← 被前三段挡在缓存前缀之外
 ```
 
-用 31 份真实地图 / 1411 条指令的历史样本测得**稳定前缀只有 17 tokens**；这是该样本和拼接路径的结果，不代表生产请求只有这么长。后续发现 API / Responses 仍先 `handleSystem()` 注入身份与群历史、再追加插件清单，本次修正这处遗漏。
+用 31 份真实地图 / 1411 条指令的历史样本测得**稳定前缀只有 17 tokens**；这是该样本和拼接路径的结果，不代表生产请求只有这么长。仅把动态段后置、把插件清单提前，仍然不足以让上述上游命中。
 
 **2. Claude**：原 `_createMessage` 把 `body.system` 直接作为字符串，未主动声明缓存断点；本插件因此缺少显式控制稳定段缓存边界的能力，但不能推导任意上游都不会返回缓存 usage。
 
@@ -27,26 +37,39 @@ last message id（每条消息都变）    9 tok
 
 ## 决策
 
-### 1. 系统提示词按「稳定段 / 动态段」两段式拼装
+### 1. 每轮变化的内容一律不进 system
 
-- **稳定段**：人设（`promptPrefixOverride` / `claudeSystemPrompt` 等）、工具说明、插件清单
-- **动态段**：当前时间、对话时间线、`message_id`、群上下文
+四条通道（OpenAI Chat / Responses / Claude / Gemini）统一拆成两份：
 
-既有实现已用 `mergeSystemPrompt()` 合并固定说明、`buildDynamicSystemSuffix()` 产出时间与时间线，并由 `collectTools()` 把 `message_id` 从 `systemAddition` 拆到 `systemDynamic`；这不等于此前每条通道都已完整遵循顺序。
+| 位置 | 内容 | 变化频率 |
+| --- | --- | --- |
+| `system` / `instructions` | 人设、`Current date`、群聊提示语、插件规则、工具清单、自动回复提示 | 每天 / 每个群一次 |
+| 本轮 `turnContext` | 提问者、群名群号、群聊记录、`message_id`、引用消息 id、`Current time`、对话时间线 | 每轮 |
 
-本次 API / Responses 的修复顺序为 `mergeSystemPrompt(base)` → `extraSystemMessage`（插件清单）→ `handleSystem()`（身份与群历史）→ `extraSystemDynamic` → 时间与时间线。保留群历史、0 条历史及压缩重试行为，不调整 role 会话架构。API 人设附近的 `Current date` 仍每日变化，本次不扩大范围；人设替换、工具集合或插件摘要变化也会影响可复用前缀。
+`handleSystem()` 拆成 `collectGroupContext()`（返回 `{ botName, tip, turn }`）与 `wrapTurnContext()`，四条通道共用一份，避免各写一遍后逐渐跑偏。
 
-Gemini 工具返回已通过 `functionResponse` 续接，删除递归请求在 system 开头插入的临时说明；非空、空和未提供 system 的语义分别保持，原工具轮次上限及 `NONE` 限制不变。
+`turnContext` 由客户端在**请求组包阶段**插入，且只存在于请求里、不写回会话历史——写回会被下一轮当历史重放，上下文会越滚越大。插入位置各协议不同：
+
+| 协议 | 插入方式 |
+| --- | --- |
+| OpenAI Chat | 在最后一条 user 消息之前插一条 `{ role: 'user' }`，并计入上下文预算 |
+| Responses | 在 `input` 里最后一条 user 项之前插一项 |
+| Claude | 按 `turnMessageIndex` 在 `messages` 里插一条 user |
+| Gemini | 并入本轮 user 的 `parts` 首位（协议要求 user/model 交替，不能多插一轮） |
+
+顺序上，OpenAI 的插入发生在 `syncInnerOs()`（全局破限/思考模式）之后，否则破限提示会落进群聊记录块而不是用户提问里。工具回填轮不重复注入：OpenAI 按「最后一条 user」定位，Gemini 在 `functionResponse` 轮跳过。
+
+`Current date` 仍留在 system，因此跨天会有一次缓存失效；这是刻意保留的可读性代价。`withContextInjection()` 若启用（`enableHooks`）仍写在 system 末尾，属于已知的剩余变量，默认关闭。
+
+Gemini 工具返回已通过 `functionResponse` 续接，递归请求不再改写 system；非空、空和未提供 system 的语义分别保持，原工具轮次上限及 `NONE` 限制不变。
 
 已核验版本参考（不代表最新版本）：
-- [dsh-qqbot@14d5eef（2026-11-03，0.5.5）](https://github.com/tencent-connect/dsh-qqbot/blob/14d5eef97274e47f34f91dcaa833be994ba2a770/src/prompt/install.ts#L44-L65) 将 section 规则、人设与 extra 和动态 context 背景分开；[deepseek-harness@fcc0ad4](https://github.com/deepseek-ai/deepseek-harness/blob/fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159/packages/core/system-prompt/src/index.ts#L78-L90) 将 context 定义为持久 user-role 快照。本插件仅参考分层思路，不在本次照搬 role 架构。
+- [dsh-qqbot@14d5eef（2026-11-03，0.5.5）](https://github.com/tencent-connect/dsh-qqbot/blob/14d5eef97274e47f34f91dcaa833be994ba2a770/src/prompt/install.ts#L44-L65) 把 section 规则、人设与 extra 和动态 context 背景分开；[deepseek-harness@fcc0ad4](https://github.com/deepseek-ai/deepseek-harness/blob/fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159/packages/core/system-prompt/src/index.ts#L78-L90) 把 context 定义为持久 user-role 快照。本次采纳的正是「动态上下文走 user 角色」这一层，但不照搬其快照持久化策略——本插件每轮重建，不落库。
 - [AstrBot@86c24e8 的 Gemini 测试](https://github.com/AstrBotDevs/AstrBot/blob/86c24e846c0de78830f6a0bc402049edb0f0c671/tests/test_gemini_source.py#L175-L208) 验证 `usage_metadata.cached_content_token_count` 将输入 100、缓存 30 拆分为非缓存 70 / 缓存 30；生产 Gemini 源码未完整核查，不据此断言有无显式缓存。以上布局与观测参考均不证明本插件经任意中转必然命中。
 
-### 2. Claude 的缓存断点打在稳定段末尾
+### 2. Claude 的缓存断点打在 system 末尾
 
-`core.js` 用 `option.systemStableLength` 告诉客户端稳定段到哪为止；`ClaudeAPIClient` 据此把 system 切成两块，只给稳定块加 `cache_control: { type: 'ephemeral' }`。
-
-思路参考 AstrBot 的 `_apply_explicit_prompt_cache_breakpoints`，但适配本插件末尾带动态内容的布局：断点直接打在整段末尾，会因动态后缀变化降低复用机会，不能称为“永远失效”。未传 `systemStableLength` 时保留单块 + 末尾断点的既有兼容行为。
+system 现在只剩稳定段，`core.js` 直接把 `option.systemStableLength` 设为整段长度；`ClaudeAPIClient` 据此把 system 切成稳定块并加 `cache_control: { type: 'ephemeral' }`。未传 `systemStableLength` 时保留单块 + 末尾断点的既有兼容行为。
 
 ### 3. 缓存字段解析统一到 `pickCacheUsage()`
 
