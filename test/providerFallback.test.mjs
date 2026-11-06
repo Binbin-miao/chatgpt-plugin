@@ -82,3 +82,14 @@ test('0 表示不按条数裁，交给 token 预算', () => {
   const out = trimConversation(pairs(600), { ...trimCfg, chatgptBlockCount: 0 })
   assert.equal(out.length, 600)
 })
+
+test('token 预算分支：超预算也一次裁到 70%，不会连轮丢一条', () => {
+  const longPairs = n => Array.from({ length: n }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: 'x'.repeat(4000) }))
+  const cfg = { chatgptBlockCount: 0, maxModelTokens: 128000, apiMaxToken: 65536 }
+  const out = trimConversation(longPairs(40), cfg)
+  const chars = out.reduce((n, m) => n + m.content.length, 0)
+  // budget = 128000 - 65536 = 62464，字符上限 = budget * 2 = 124928，裁到 70% ≈ 87449
+  assert.ok(chars <= 87449, `应收敛到 70% 预算以内，实际 ${chars}`)
+  assert.ok(out.length < 40)
+  assert.equal(out.length % 2, 0)
+})

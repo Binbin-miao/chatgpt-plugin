@@ -56,7 +56,8 @@ export function trimConversation(messages, config) {
   // 只有涨过上界才裁，且一次裁到 70%：每轮从头部挤掉一两条的写法会让请求前缀
   // 整体前移，提示词缓存整段失效（实测命中率从 85%~90% 掉到个位数）。
   if (count > 0 && result.length > count) {
-    result = result.slice(-Math.max(2, evenFloor(count * TRIM_RATIO)))
+    // 用整数运算算 70%：`count * 0.7` 在部分 N 上会因浮点误差少留 2 条
+    result = result.slice(-Math.max(2, evenFloor(count * 7 / 10)))
   }
   // 无条数限制时仍按所选模型上下文预算裁剪完整轮次，避免 Redis 无限增长。
   const budget = Math.max(1, (config.maxModelTokens || config.responsesMaxModelTokens || 128000) - (config.apiMaxToken || config.responsesApiMaxToken || 65536))
