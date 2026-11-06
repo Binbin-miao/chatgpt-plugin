@@ -63,6 +63,23 @@ function getStoredMessageRole(role) {
     }
     return 'user';
 }
+/**
+ * 把本轮群聊环境插到本轮提问之前。
+ *
+ * 上游（Gemini 兼容层）只认「整段 system 一字不差」的缓存：群聊记录、message_id、
+ * 当前时间一旦写进 system，整条链路就恒为 0 命中，前面放多少稳定内容都白搭。
+ * 挪到请求里的独立 user 消息后 system 保持稳定，而这份上下文只存在于本次请求，
+ * 不进 currentMessages，落库的历史不会被它撑大。
+ */
+function insertTurnContext(messages, turnContext) {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+        if (messages[i].role === 'user') {
+            messages.splice(i, 0, { role: 'user', content: turnContext });
+            return;
+        }
+    }
+    messages.push({ role: 'user', content: turnContext });
+}
 export class ChatGPTAPI {
     _apiKey;
     _apiBaseUrl;
@@ -305,6 +322,12 @@ export class ChatGPTAPI {
         })
         if (trimInfo.trimmed) {
             logger.info(`[chatgpt] history trimmed: current=${trimInfo.currentTurnMessages}, keptHistory=${trimInfo.keptHistoryMessages}, attemptedHistory=${trimInfo.attemptedHistoryMessages}, droppedHistory=${trimInfo.droppedHistoryMessages}, keptToolChains=${trimInfo.keptToolChainCount}, budget=${trimInfo.promptBudget}, finalTokens=${numTokens}, reason=${trimInfo.stopReason}。若这类日志频繁出现，请检查锅巴中的“回复内容最大Token数(apiMaxToken)”与“模型总上下文Token数(maxModelTokens)”配置是否过紧。`);
+        }
+        // 本轮群聊环境放在 innerOs 之后插入：innerOs 找的是「首条 user 消息」，
+        // 先插会让全局破限提示落进群聊记录块里，而不是落进用户这句提问。
+        // 只改请求副本，currentMessages 不受影响，落库的聊天记录不会被撑大。
+        if (opts.turnContext) {
+            insertTurnContext(messages, opts.turnContext);
         }
         const result = {
             role: 'assistant',
@@ -634,9 +657,12 @@ export class ChatGPTAPI {
         let keptToolChainCount = 0;
         let stopReason = 'complete';
         let functionToken = 0;
-        let numTokens = functionToken;
+        // 本轮群聊环境不在 messages 里，但仍占上下文预算：漏算会让压缩判断失灵，
+        // 一超限就只能靠上层重试兜底。
+        const turnContextTokens = opts.turnContext ? await this._getTokenCount(opts.turnContext) : 0;
+        let numTokens = functionToken + turnContextTokens;
         do {
-            let nextNumTokensEstimate = functionToken;
+            let nextNumTokensEstimate = functionToken + turnContextTokens;
             for (const message of nextMessages) {
                 nextNumTokensEstimate += await this._getMessageTokenEstimate(message);
             }

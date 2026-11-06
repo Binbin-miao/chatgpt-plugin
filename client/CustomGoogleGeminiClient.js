@@ -259,12 +259,21 @@ export class CustomGoogleGeminiClient extends GoogleGeminiClient {
       // 而 generateContent 每次请求都必须自带完整上下文，不回填的话模型拿到工具结果后就看不出图。
       // 首段文本以历史为准（syncInnerOs 可能刚写入全局提示），其余 parts 用本轮原始内容。
       contents: history.map(({ id, role, parts }) => {
-        if (!turnParts || id !== turnParts.id) return { role, parts }
-        const restored = _.cloneDeep(turnParts.parts)
-        if (restored[0]?.text !== undefined && typeof parts?.[0]?.text === 'string') {
-          restored[0].text = parts[0].text
+        let turnPartList = parts
+        if (turnParts && id === turnParts.id) {
+          const restored = _.cloneDeep(turnParts.parts)
+          if (restored[0]?.text !== undefined && typeof parts?.[0]?.text === 'string') {
+            restored[0].text = parts[0].text
+          }
+          turnPartList = restored
         }
-        return { role, parts: restored }
+        // 本轮群聊环境只进请求：Gemini 要求 user/model 交替，只能作为本轮 user 的第一个
+        // part 前置；写进落库消息会被下一轮当历史重放，所以在请求副本上拼。
+        // 工具回填轮的 parts 必须是 functionResponse，混入文本会被判为非法参数，跳过。
+        if (opt.turnContext && id === idThis && !opt.functionResponse?.length) {
+          turnPartList = [{ text: opt.turnContext }, ...turnPartList]
+        }
+        return { role, parts: turnPartList }
       }),
       safetySettings: [
         { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.OFF },

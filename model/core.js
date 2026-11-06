@@ -9,7 +9,6 @@ import {
   extractContentFromFile,
   formatDate,
   parseSourceImg,
-  getMasterQQ,
   getUin,
   getUserData,
   normalizeChatMode,
@@ -134,58 +133,113 @@ function getRetryGroupContextLengths(baseLength = 0) {
   return [...new Set(fallbackLengths.filter(length => length >= 0 && length < baseLength))]
 }
 
-async function handleSystem(e, system, settings) {
-  if (settings.enableGroupContext) {
-    try {
-      let opt = {}
-      opt.groupId = e.group_id
-      opt.qq = e.sender.user_id
-      opt.nickname = e.sender.card
-      opt.groupName = e.group.name || e.group_name
-      opt.botName = e.isGroup ? (e.group.pickMember(getUin(e)).card || e.group.pickMember(getUin(e)).nickname) : e.bot.nickname
-      let master = (await getMasterQQ())[0]
-      if (master && e.group) {
-        opt.masterName = e.group.pickMember(parseInt(master)).card || e.group.pickMember(parseInt(master)).nickname
-      }
-      if (master && !e.group) {
-        opt.masterName = e.bot.getFriendList().get(parseInt(master))?.nickname
-      }
-      const groupContextLength = settings.groupContextLength ?? Config.groupContextLength
-      let chats = await msgHistoryMgr.getGroupHistoryContext(e, groupContextLength, { fromLatest: settings.groupContextFromLatest })
-      opt.chats = chats
-      const namePlaceholder = '[name]'
-      const defaultBotName = 'ChatGPT'
-      const groupContextTip = Config.groupContextTip
-      system = system.replaceAll(namePlaceholder, opt.botName || defaultBotName) +
-        ((opt.groupId) ? groupContextTip : '')
-      system += 'Attention, you are currently chatting in a qq group, then one who asks you now is' + `${opt.nickname}(${opt.qq})。`
-      system += `the group name is ${opt.groupName}, group id is ${opt.groupId}。`
-      if (opt.botName) {
-        system += `Your nickname is ${opt.botName} in the group,`
-      }
-      if (Array.isArray(chats) && chats.length > 0) {
-        system += 'There is the conversation history in the group, you must chat according to the conversation history context"'
-        system += chats
-          .map(chat => {
-            let sender = chat.sender || {}
-            // 历史条目由各 adapter 的接口返回，字段并不总是齐全（NapCat 是必填，别家未必）：
-            // 直接 startsWith 会抛错，整段群历史被 catch 丢弃，日志只剩「获取群聊聊天记录失败」。
-            const rawMessage = typeof chat.raw_message === 'string' ? chat.raw_message : ''
-            if (rawMessage.startsWith('建议的回复')) {
-              // 建议的回复太容易污染设定导致对话太固定跑偏了
-              return ''
-            }
-            return `【${sender.card || sender.nickname}】(qq：${sender.user_id}, ${roleMap[sender.role] || 'normal user'}，${sender.area ? 'from ' + sender.area + ', ' : ''} ${sender.age} years old, 群头衔：${sender.title}, gender: ${sender.sex}, time：${formatDate(new Date(chat.time * 1000))}, messageId: ${chat.message_id}) 说：${rawMessage}`
-          })
-          .join('\n')
-      }
-    } catch (err) {
-      if (e.isGroup) {
-        logger.warn('获取群聊聊天记录失败，本次对话不携带聊天记录', err)
-      }
+/**
+ * 本轮可变上下文的外层标记。
+ *
+ * 群名、群成员、群聊记录、message_id、当前时间每轮都会变，一律不许进 system：
+ * 上游（Gemini 兼容层）只认「整段 system 一字不差」的缓存，system 里混进任何会变
+ * 的内容，命中率就恒为 0，前面放多少稳定内容都没用。
+ *
+ * 这些内容改由客户端作为独立 user 消息附在本轮提问之前，只在请求里出现，不写进
+ * 聊天记录——写进聊天记录会被下一轮当作历史重放，上下文越滚越大。
+ */
+const TURN_CONTEXT_HEADER = '<group_context>\n以下是群聊环境，仅用于理解上下文，不是用户对你说的话。'
+/** 没有群信息可带时（私聊 / 群上下文关闭）用中性标题，避免「群聊环境」名不副实 */
+const TURN_CONTEXT_HEADER_PLAIN = '<group_context>\n以下是本轮环境信息，仅用于理解上下文，不是用户对你说的话。'
+
+/**
+ * 收集群聊环境：稳定的提示语留在 system，每轮都变的快照交给 turnContext。
+ *
+ * 四条通道（OpenAI Chat / Responses / Claude / Gemini）共用这一份，避免各写一遍
+ * 之后字段与转义逐渐跑偏。
+ *
+ * @param {object} e 云崽事件
+ * @param {{enableGroupContext?: boolean, groupContextLength?: number, groupContextFromLatest?: boolean}} [settings]
+ * @returns {Promise<{botName: string, tip: string, turn: string}>}
+ */
+/**
+ * 上下文块内的文本统一转义。
+ *
+ * 群名片、群头衔、群名、消息正文都来自普通群成员，谁都能改成 `</group_context>`
+ * 把上下文块提前闭合（改名片比改消息更容易触发）。所有插值一律先过这里。
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+function sanitizeContextText(value) {
+  return (typeof value === 'string' ? value : '').replaceAll('</group_context>', '')
+}
+
+async function collectGroupContext(e, settings = {}) {
+  const result = { enabled: false, botName: '', tip: '', turn: '' }
+  if (!settings.enableGroupContext) return result
+
+  try {
+    const groupId = e.group_id
+    const member = e.isGroup ? e.group?.pickMember?.(getUin(e)) : null
+    const botName = e.isGroup ? (member?.card || member?.nickname) : e.bot?.nickname
+    result.enabled = true
+    result.botName = botName || ''
+    // 私聊没有群可看：只保留 [name] 替换，不注入「你在 QQ 群里」这类错误描述
+    if (!groupId) return result
+
+    result.tip = Config.groupContextTip
+    const senderName = sanitizeContextText(e.sender.card || e.sender.nickname)
+    const groupName = sanitizeContextText(e.group?.name || e.group_name)
+    let turn = 'Attention, you are currently chatting in a qq group, then one who asks you now is' +
+      `${senderName}(${e.sender.user_id})。`
+    turn += `the group name is ${groupName}, group id is ${groupId}。`
+    if (botName) turn += `Your nickname is ${sanitizeContextText(botName)} in the group,`
+
+    const groupContextLength = settings.groupContextLength ?? Config.groupContextLength
+    const chats = await msgHistoryMgr.getGroupHistoryContext(e, groupContextLength, {
+      fromLatest: settings.groupContextFromLatest
+    })
+    if (Array.isArray(chats) && chats.length > 0) {
+      turn += 'There is the conversation history in the group, you must chat according to the conversation history context"'
+      turn += chats
+        .map(chat => {
+          const sender = chat.sender || {}
+          // 历史条目由各 adapter 的接口返回，字段并不总是齐全（NapCat 是必填，别家未必）：
+          // 直接 startsWith 会抛错，整段群历史被 catch 丢弃，日志只剩「获取群聊聊天记录失败」。
+          const rawMessage = typeof chat.raw_message === 'string' ? chat.raw_message : ''
+          if (rawMessage.startsWith('建议的回复')) {
+            // 建议的回复太容易污染设定导致对话太固定跑偏了
+            return ''
+          }
+          const card = sanitizeContextText(sender.card || sender.nickname)
+          const area = sanitizeContextText(sender.area)
+          const title = sanitizeContextText(sender.title)
+          const text = sanitizeContextText(rawMessage)
+          return `【${card}】(qq：${sender.user_id}, ${roleMap[sender.role] || 'normal user'}，${area ? 'from ' + area + ', ' : ''} ${sender.age} years old, 群头衔：${title}, gender: ${sender.sex}, time：${formatDate(new Date(chat.time * 1000))}, messageId: ${chat.message_id}) 说：${text}`
+        })
+        .join('\n')
     }
+    result.turn = turn
+  } catch (err) {
+    // 私聊也要留下痕：静默吞掉会让「为什么这轮没带上下文」无从查起
+    logger.warn(`获取${e.isGroup ? '群聊聊天记录' : '私聊环境信息'}失败，本次对话不携带该段上下文`, err)
   }
-  return system
+  return result
+}
+
+/**
+ * 把本轮可变内容包成一个整体，交给客户端插到本轮提问之前。
+ *
+ * @param {string} [groupTurn] 群聊环境；为空表示这轮没有群信息，标题改用中性措辞
+ * @param {Array<string|undefined>} [extraParts] 其余每轮变化的内容，空的分段自动丢弃
+ * @returns {string}
+ */
+function wrapTurnContext(groupTurn, extraParts = []) {
+  // 统一收口：任何来源的文本（群名片、群名、头衔、消息正文、以后新增的字段）
+  // 都在这里再剥一次闭合标记。逐字段转义是防御纵深，这里是最后一道，漏不掉。
+  const body = [groupTurn, ...extraParts]
+    .filter(Boolean)
+    .join('\n')
+    .replaceAll('</group_context>', '')
+  if (!body) return ''
+  const header = groupTurn ? TURN_CONTEXT_HEADER : TURN_CONTEXT_HEADER_PLAIN
+  return `${header}\n${body}\n</group_context>`
 }
 
 /**
@@ -386,38 +440,20 @@ class Core {
         if (claudeTools.length > 0) {
           client.addTools(claudeTools)
         }
-        // 群上下文里的成员信息与聊天记录每轮都变，先攒进 groupDynamic，
-        // 稳定段长度才好量准（缓存断点要打在这个长度上）
-        let groupDynamic = ''
-        if (opt.settings.enableGroupContext && e.isGroup) {
-          let chats = await msgHistoryMgr.getGroupHistoryContext(e, Config.groupContextLength, { fromLatest: opt.settings.groupContextFromLatest })
-          const namePlaceholder = '[name]'
-          const defaultBotName = 'Claude'
-          const groupContextTip = Config.groupContextTip
-          let botName = e.isGroup ? (e.group.pickMember(getUin(e)).card || e.group.pickMember(getUin(e)).nickname) : e.bot.nickname
-
-          system = system.replaceAll(namePlaceholder, botName || defaultBotName) +
-            ((opt.settings.enableGroupContext && e.group_id) ? groupContextTip : '')
-          groupDynamic += 'Attention, you are currently chatting in a qq group, then one who asks you now is' + `${e.sender.card || e.sender.nickname}(${e.sender.user_id}).`
-          groupDynamic += `the group name is ${e.group.name || e.group_name}, group id is ${e.group_id}.`
-          groupDynamic += `Your nickname is ${botName} in the group,`
-          if (chats) {
-            groupDynamic += 'There is the conversation history in the group, you must chat according to the conversation history context"'
-            groupDynamic += chats
-              .map(chat => {
-                let sender = chat.sender || {}
-                return `【${sender.card || sender.nickname}】(qq：${sender.user_id}, ${roleMap[sender.role] || 'normal user'}，${sender.area ? 'from ' + sender.area + ', ' : ''} ${sender.age} years old, 群头衔：${sender.title}, gender: ${sender.sex}, time：${formatDate(new Date(chat.time * 1000))}, messageId: ${chat.message_id}) 说：${chat.raw_message}`
-              })
-              .join('\n')
-          }
+        // 群聊记录、message_id、当前时间每轮都变，一律不进 system——Anthropic 的缓存
+        // 断点打在 system 末尾，混进会变的内容整段就缓存不了。
+        const group = await collectGroupContext(e, opt.settings)
+        if (group.enabled) {
+          system = system.replaceAll('[name]', group.botName || 'Claude')
         }
-        // 稳定段到此为止：Anthropic 的缓存断点打在这个长度上，后面的内容每轮都变、不参与缓存
-        const claudeStableLength = system.length
-        system += groupDynamic
-        claudeSystemDynamic && (system += claudeSystemDynamic)
-        system += buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
+        system += group.tip
         option.system = system
-        option.systemStableLength = claudeStableLength
+        // system 现在只剩稳定段，缓存断点直接落在末尾
+        option.systemStableLength = system.length
+        option.turnContext = wrapTurnContext(group.turn, [
+          claudeSystemDynamic,
+          buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
+        ])
         const quoted = await collectQuotedImages(e, opt.prepared)
         applyQuotedMedias(option, quoted.medias)
         // 上下文注入：文本记忆在 prepared 上，一轮只拉取一次（docs/adr/0016）
@@ -476,34 +512,21 @@ class Core {
         geminiSystemDynamic = systemDynamic || ''
       }
 
-      // 稳定段：人设 → 插件清单；动态段（群上下文 / message_id / 时间）一律排在后面
+      // system 只放稳定段：人设 → 插件清单 → 常量提示；
+      // 群聊记录、message_id、当前时间走 turnContext，不参与 system。
       let system = mergeSystemPrompt(opt.system.gemini, e)
       system += geminiSystemAddition
 
-      if (opt.settings.enableGroupContext && e.isGroup) {
-        let chats = await msgHistoryMgr.getGroupHistoryContext(e, Config.groupContextLength, { fromLatest: opt.settings.groupContextFromLatest })
-        const namePlaceholder = '[name]'
-        const defaultBotName = 'GeminiPro'
-        const groupContextTip = Config.groupContextTip
-        let botName = e.isGroup ? (e.group.pickMember(getUin(e)).card || e.group.pickMember(getUin(e)).nickname) : e.bot.nickname
-        system = system.replaceAll(namePlaceholder, botName || defaultBotName) +
-          ((opt.settings.enableGroupContext && e.group_id) ? groupContextTip : '')
-        system += 'Attention, you are currently chatting in a qq group, then one who asks you now is' + `${e.sender.card || e.sender.nickname}(${e.sender.user_id}).`
-        system += `the group name is ${e.group.name || e.group_name}, group id is ${e.group_id}.`
-        system += `Your nickname is ${botName} in the group,`
-        if (chats) {
-          system += 'There is the conversation history in the group, you must chat according to the conversation history context"'
-          system += chats
-            .map(chat => {
-              let sender = chat.sender || {}
-              return `【${sender.card || sender.nickname}】(qq：${sender.user_id}, ${roleMap[sender.role] || 'normal user'}，${sender.area ? 'from ' + sender.area + ', ' : ''} ${sender.age} years old, 群头衔：${sender.title}, gender: ${sender.sex}, time：${formatDate(new Date(chat.time * 1000))}, messageId: ${chat.message_id}) 说：${chat.raw_message}`
-            })
-            .join('\n')
-        }
+      const group = await collectGroupContext(e, opt.settings)
+      if (group.enabled) {
+        system = system.replaceAll('[name]', group.botName || 'GeminiPro')
       }
-      geminiSystemDynamic && (system += geminiSystemDynamic)
-      system += buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
+      system += group.tip
       option.system = system
+      option.turnContext = wrapTurnContext(group.turn, [
+        geminiSystemDynamic,
+        buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
+      ])
       option.replyPureTextCallback = opt.settings.replyPureTextCallback || (async (msg) => {
         if (msg) {
           await e.reply(msg, true)
@@ -531,18 +554,25 @@ class Core {
       let extraSystemDynamic = '' // 动态段：message_id
       let quotedFailed = false
       const buildResponsesInstructions = async (groupContextLength = Config.groupContextLength) => {
-        // 稳定规则与插件清单必须先于群身份、群历史，否则每轮变化会截断可复用前缀。
-        let instructions = mergeSystemPrompt(opt.system.responses || Config.responsesSystemPrompt, e)
-        if (extraSystemMessage) instructions += extraSystemMessage
-        instructions = await handleSystem(e, instructions, {
+        // 稳定段只放人设、插件清单与常量提示；群聊记录、message_id、当前时间走 turnContext。
+        const group = await collectGroupContext(e, {
           ...opt.settings,
           groupContextLength
         })
-        if (extraSystemDynamic) instructions += extraSystemDynamic
-        instructions += buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
-        // 上下文注入来自外部端点、每轮可能变，放在稳定段与动态段之后
+        let instructions = mergeSystemPrompt(opt.system.responses || Config.responsesSystemPrompt, e)
+        if (extraSystemMessage) instructions += extraSystemMessage
+        if (group.enabled) {
+          instructions = instructions.replaceAll('[name]', group.botName || 'ChatGPT')
+        }
+        instructions += group.tip
+        // 上下文注入来自外部端点、每轮可能变，放在稳定段之后
         instructions = await withContextInjection(opt.prepared, Config, instructions, conversation)
-        return appendGroupAutoReplyPrompt(instructions, opt)
+        instructions = appendGroupAutoReplyPrompt(instructions, opt)
+        const turnContext = wrapTurnContext(group.turn, [
+          extraSystemDynamic,
+          buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
+        ])
+        return { instructions, turnContext }
       }
 
       const client = new ResponsesAPI({
@@ -554,7 +584,9 @@ class Core {
         maxModelTokens: Config.responsesMaxModelTokens,
         providerName: opt.providerName
       })
-      let instructions = await buildResponsesInstructions()
+      const builtInstructions = await buildResponsesInstructions()
+      let instructions = builtInstructions.instructions
+      let responsesTurnContext = builtInstructions.turnContext
 
       const quoted = await collectQuotedImages(e, opt.prepared)
       const quotedMedias = quoted.medias
@@ -571,7 +603,9 @@ class Core {
         promptAddition && (prompt += promptAddition)
         extraSystemMessage = systemAddition || ''
         extraSystemDynamic = systemDynamic || ''
-        instructions = await buildResponsesInstructions()
+        const rebuiltForTools = await buildResponsesInstructions()
+        instructions = rebuiltForTools.instructions
+        responsesTurnContext = rebuiltForTools.turnContext
         completionParams.tools = Object.values(funcMap).map(({ function: definition }) => ({
           type: 'function',
           name: definition.name,
@@ -623,7 +657,8 @@ class Core {
             const nextGroupContextLength = retryLengths[i]
             logger.warn(`[chatgpt][Responses] 上下文超限，压缩群聊记录后重试，groupContextLength=${nextGroupContextLength}`)
             const rebuilt = await buildResponsesInstructions(nextGroupContextLength)
-            sendOptions.instructions = quotedFailed ? appendMediaFailureHint(rebuilt) : rebuilt
+            sendOptions.instructions = quotedFailed ? appendMediaFailureHint(rebuilt.instructions) : rebuilt.instructions
+            sendOptions.turnContext = rebuilt.turnContext
           }
         }
       }
@@ -631,6 +666,7 @@ class Core {
       const sendOptions = {
         timeoutMs: 600000,
         instructions,
+        turnContext: responsesTurnContext,
         completionParams,
         store: Config.responsesStore === true,
         previousResponseId: Config.responsesStore ? conversation.previousResponseId : undefined
@@ -712,29 +748,35 @@ class Core {
       let extraSystemMessage = '' // 稳定段：插件清单
       let extraSystemDynamic = '' // 动态段：message_id
       let quotedFailed = false
-      const buildOpenAISystem = async (groupContextLength = Config.groupContextLength) => {
-        // 稳定规则与插件清单必须先于群身份、群历史，否则每轮变化会截断可复用前缀。
+      const buildOpenAIRequest = async (groupContextLength = Config.groupContextLength) => {
+        // 稳定段只放人设、插件清单与常量提示；群聊记录、message_id、当前时间走 turnContext。
+        const group = await collectGroupContext(e, {
+          ...opt.settings,
+          groupContextLength
+        })
         let system = mergeSystemPrompt(promptPrefix, e)
         if (extraSystemMessage) {
           system += extraSystemMessage
         }
-        system = await handleSystem(e, system, {
-          ...opt.settings,
-          groupContextLength
-        })
-        if (extraSystemDynamic) {
-          system += extraSystemDynamic
+        if (group.enabled) {
+          system = system.replaceAll('[name]', group.botName || 'ChatGPT')
         }
-        system += buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
-        // 上下文注入来自外部端点、每轮可能变，放在稳定段与动态段之后
+        system += group.tip
+        // 上下文注入来自外部端点、每轮可能变，放在稳定段之后
         system = await withContextInjection(opt.prepared, Config, system, conversation)
-        return appendGroupAutoReplyPrompt(system, opt)
+        system = appendGroupAutoReplyPrompt(system, opt)
+        const turnContext = wrapTurnContext(group.turn, [
+          extraSystemDynamic,
+          buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
+        ])
+        return { system, turnContext }
       }
       // 引用图先取：失败提示按每次尝试单独追加（缓存存基础 system，含上下文注入文本）
       const quoted = await collectQuotedImages(e, opt.prepared)
       const quotedMedias = quoted.medias
       quotedFailed = quoted.failed > 0
-      let system = await buildOpenAISystem()
+      const builtRequest = await buildOpenAIRequest()
+      const system = builtRequest.system
 
       logger.debug(system)
       let opts = {
@@ -765,6 +807,7 @@ class Core {
         // systemMessage: promptPrefix
       }
       option.systemMessage = system
+      option.turnContext = builtRequest.turnContext
       option.paimon_globalInnerOs = Config.paimon_globalInnerOs
       if (conversation) {
         if (!conversation.conversationId) {
@@ -794,7 +837,9 @@ class Core {
             }
             const nextGroupContextLength = retryLengths[i]
             logger.warn(`[chatgpt] 上下文超限，压缩群聊记录后重试，groupContextLength=${nextGroupContextLength}。若频繁出现，请检查锅巴中的“回复内容最大Token数(apiMaxToken)”与“模型总上下文Token数(maxModelTokens)”配置是否过紧。`)
-            sendOption.systemMessage = await buildOpenAISystem(nextGroupContextLength)
+            const rebuilt = await buildOpenAIRequest(nextGroupContextLength)
+            sendOption.systemMessage = rebuilt.system
+            sendOption.turnContext = rebuilt.turnContext
           }
         }
       }
@@ -819,7 +864,9 @@ class Core {
           function: funcMap[k].function
         }))
         extraSystemMessage = systemAddition || ''
-        option.systemMessage = await buildOpenAISystem()
+        const rebuiltForTools = await buildOpenAIRequest()
+        option.systemMessage = rebuiltForTools.system
+        option.turnContext = rebuiltForTools.turnContext
 
         let msg
         /** 工具轮思考（含被重归类的独白），跨轮累积后并入最终 thinking_text */

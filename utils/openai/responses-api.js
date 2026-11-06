@@ -9,6 +9,62 @@ import { pickCacheUsage } from './cacheUsage.js'
 /** 已经打过「上游没给缓存字段」日志的 provider。客户端是每条消息新建的，标志不能挂在实例上 */
 const usageShapeLogged = new Set()
 
+/**
+ * 把本轮群聊环境插到本轮提问之前（只进请求，调用方落库的聊天记录不受影响）。
+ *
+ * system/instructions 一旦混进每轮都变的群聊记录，上游就完全不认缓存；反过来把它
+ * 放进请求里的独立 user 项，instructions 才能稳定下来。
+ *
+ * @param {string | Array<object>} input Responses input（字符串或 item 列表）
+ * @param {string} [turnContext] 本轮群聊环境，空串/未提供时原样返回
+ * @returns {string | Array<object>}
+ */
+function appendTurnContext(input, turnContext) {
+  if (!turnContext) return input
+  const item = { role: 'user', content: turnContext }
+  if (typeof input === 'string') return [item, { role: 'user', content: input }]
+  if (!Array.isArray(input)) return input
+  const items = [...input]
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    if (items[i]?.role === 'user') {
+      items.splice(i, 0, item)
+      return items
+    }
+  }
+  // 工具回填轮的 input 只有 function_call_output，没有用户轮可挂；
+  // 硬塞到末尾会打乱工具链顺序，这里保持原样（与 Gemini 工具轮一致）。
+  return input
+}
+
+/**
+ * 增量续聊（store）模式下把上下文并进本轮 user 项，不新增条目。
+ *
+ * 该模式的 input 会被上游存进服务端会话：多塞一条 user 项等于每轮往会话历史里
+ * 留一份完整群记录，越聊越大；合并进本轮内容则与「用户这轮说了什么」同生命周期。
+ *
+ * @param {string | Array<object>} input
+ * @param {string} [turnContext]
+ * @returns {string | Array<object>}
+ */
+function mergeTurnContext(input, turnContext) {
+  if (!turnContext) return input
+  if (typeof input === 'string') return `${turnContext}\n\n${input}`
+  if (!Array.isArray(input)) return input
+  const items = [...input]
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    if (items[i]?.role !== 'user') continue
+    const content = items[i].content
+    items[i] = {
+      ...items[i],
+      content: typeof content === 'string'
+        ? `${turnContext}\n\n${content}`
+        : [{ type: 'input_text', text: turnContext }, ...(Array.isArray(content) ? content : [])]
+    }
+    return items
+  }
+  return input
+}
+
 export class ResponsesAPI {
   constructor (opts = {}) {
     const {
@@ -93,6 +149,7 @@ export class ResponsesAPI {
   async sendMessage (input, opts = {}) {
     const {
       instructions,
+      turnContext,
       completionParams = {},
       store = false,
       previousResponseId,
@@ -108,7 +165,7 @@ export class ResponsesAPI {
     const timeout = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : undefined
     const body = {
       ...requestParams,
-      input,
+      input: store ? mergeTurnContext(input, turnContext) : appendTurnContext(input, turnContext),
       instructions,
       store: Boolean(store),
       stream: false

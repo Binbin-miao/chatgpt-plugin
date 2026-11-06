@@ -646,3 +646,71 @@ test('Gemini 与 Claude 调用 McpTool 时不注入 sender/isAdmin/groupId，也
     { name: 'breath_search', arguments: { query: '柠檬塔', mode: 'manual' } }
   ])
 })
+
+// 群聊环境（群名/成员/聊天记录/message_id/时间）每轮都变，只能作为本轮请求里的
+// 一条 user 消息，system 必须保持稳定——上游只认「整段 system 一字不差」的缓存。
+const turnContextFixture = '<group_context>\n群聊环境\n</group_context>'
+
+const turnContextReplies = {
+  api: { choices: [{ message: { role: 'assistant', content: '回答' }, finish_reason: 'stop' }] },
+  responses: { id: 'r', output: [{ type: 'message', content: [{ type: 'output_text', text: '回答' }] }] },
+  claude: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: '回答' }] },
+  gemini: { candidates: [{ finishReason: 'STOP', content: { role: 'model', parts: [{ text: '回答' }] } }] }
+}
+
+test('四种协议都把本轮群聊环境放进请求，system 保持原样', async () => {
+  const bodies = {}
+  for (const type of ['api', 'responses', 'claude', 'gemini']) {
+    const client = createClient(type, async (url, options) => {
+      bodies[type] = JSON.parse(options.body)
+      return Response.json(turnContextReplies[type])
+    })
+    await client.sendMessage('问题', {
+      system: '稳定 system',
+      systemMessage: '稳定 system',
+      instructions: '稳定 system',
+      turnContext: turnContextFixture
+    })
+  }
+
+  // api：system 不动，群聊环境在提问之前，且只出现一次
+  assert.equal(bodies.api.messages[0].role, 'system')
+  assert.equal(bodies.api.messages[0].content, '稳定 system')
+  const apiContext = bodies.api.messages.findIndex(m => m.content === turnContextFixture)
+  const apiQuestion = bodies.api.messages.findIndex(m => m.content === '问题')
+  assert.ok(apiContext > 0 && apiContext < apiQuestion, 'api 群聊环境必须排在提问之前')
+  assert.equal(bodies.api.messages.filter(m => m.content === turnContextFixture).length, 1)
+
+  // responses：instructions 不动，input 里多一条 user 项
+  assert.equal(bodies.responses.instructions, '稳定 system')
+  assert.deepEqual(bodies.responses.input.map(item => item.content), [turnContextFixture, '问题'])
+
+  // claude：system 内容不动；上下文并入本轮 user，保持 user/assistant 交替
+  assert.equal(bodies.claude.system[0].text, '稳定 system')
+  assert.equal(bodies.claude.system.length, 1)
+  assert.deepEqual(bodies.claude.messages.map(m => m.role), ['user'])
+  assert.deepEqual(bodies.claude.messages[0].content.map(block => block.text), [turnContextFixture, '问题'])
+
+  // gemini：system_instruction 不动，群聊环境并入本轮 user 的第一个 part
+  assert.equal(bodies.gemini.system_instruction.parts[0].text, '稳定 system')
+  const geminiTurn = bodies.gemini.contents.at(-1)
+  assert.equal(geminiTurn.role, 'user')
+  assert.deepEqual(geminiTurn.parts.map(part => part.text), [turnContextFixture, '问题'])
+})
+
+test('api 的全局破限提示仍然落在用户提问上，不被群聊环境顶替', async () => {
+  let body
+  const client = createClient('api', async (url, options) => {
+    body = JSON.parse(options.body)
+    return Response.json(turnContextReplies.api)
+  })
+  await client.sendMessage('问题', {
+    systemMessage: '稳定 system',
+    turnContext: turnContextFixture,
+    paimon_globalInnerOs: '破限词'
+  })
+  const context = body.messages.find(m => m.content === turnContextFixture)
+  const question = body.messages.at(-1)
+  assert.doesNotMatch(context.content, /破限词/)
+  assert.equal(question.content, '问题\n\n[os]\n破限词\n[/os]\n')
+})
