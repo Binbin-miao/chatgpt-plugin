@@ -4,6 +4,7 @@
  * Chat Completions message protocol used by chatgpt-api.js.
  */
 import { fetchWithConnectionRetry } from '../network-retry.js'
+import { pickCacheUsage } from './cacheUsage.js'
 
 export class ResponsesAPI {
   constructor (opts = {}) {
@@ -146,13 +147,9 @@ export class ResponsesAPI {
       const usage = response.usage || {}
       const inputTokens = usage.input_tokens ?? usage.prompt_tokens
       const outputTokens = usage.output_tokens ?? usage.completion_tokens
-      const reportedCacheReadTokens = usage.cache_read_input_tokens
-        ?? usage.prompt_tokens_details?.cached_tokens
-        ?? usage.input_tokens_details?.cached_tokens
+      // 字段映射统一走 pickCacheUsage：OpenAI / Anthropic / DeepSeek / 中转的写法都要认
+      const { read: reportedCacheReadTokens, write: reportedCacheWriteTokens } = pickCacheUsage(usage)
       const cacheReadTokens = reportedCacheReadTokens ?? 0
-      const reportedCacheWriteTokens = usage.cache_creation_input_tokens
-        ?? usage.prompt_tokens_details?.cache_write_tokens
-        ?? usage.input_tokens_details?.cache_write_tokens
       const cacheWriteTokens = reportedCacheWriteTokens ?? 0
       const reportedReasoningTokens = usage.output_tokens_details?.reasoning_tokens
         ?? usage.completion_tokens_details?.reasoning_tokens
@@ -175,6 +172,11 @@ export class ResponsesAPI {
         const cacheWriteInfo = reportedCacheWriteTokens == null
           ? ''
           : ` | 缓存写入(${cacheWriteTokens})`
+        // 首次没有缓存字段时打出 usage 键名，用于分辨真 0 / 假 0
+        if (reportedCacheReadTokens == null && !this._usageShapeLogged) {
+          this._usageShapeLogged = true
+          logger.info(`[Chatgpt][Responses] 本次响应没有缓存字段；上游 usage 键：${Object.keys(usage).join(', ') || '(空)'}`)
+        }
         const reasoningInfo = reportedReasoningTokens == null
           ? ''
           : ` | 推理Token(${reasoningTokens})`

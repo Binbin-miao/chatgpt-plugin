@@ -188,8 +188,13 @@ async function handleSystem(e, system, settings) {
   return system
 }
 
-/** 合并插件用系统提示词 */
-function mergeSystemPrompt(systemPrompt, e, opt = {}) {
+/**
+ * 合并插件用系统提示词——**只合并稳定段**。
+ *
+ * 这里的追加项在同一会话里内容不变，是 prompt 缓存唯一能命中的那一段。当前时间与对话
+ * 时间线每轮都变，必须走 `buildDynamicSystemSuffix()` 并排在所有稳定内容之后。
+ */
+function mergeSystemPrompt(systemPrompt, e) {
   // 呆毛版 在 prompt 中替换文本使用 e.sender 信息
   if (Config.isReplacePromptForSenderMsg) {
     systemPrompt = replacePromptForSenderMsg(e, systemPrompt);
@@ -206,19 +211,31 @@ function mergeSystemPrompt(systemPrompt, e, opt = {}) {
   if (Config.enableChatSuno) {
     systemPrompt += '如果我要求你生成音乐或写歌，你需要回复适合Suno生成音乐的信息。请使用Verse、Chorus、Bridge、Outro和End等关键字对歌词进行分段，如[Verse 1]。音乐信息需要使用markdown包裹的JSON格式回复给我，结构为```json{"option": "Suno", "tags": "style", "title": "title of the song", "lyrics": "lyrics"}```。'
   }
-  // 感知现实时间
-  if (Config.getCurrentTime) {
-    function buildConversationTimeline(reply_Timestamps) {
-      if (!reply_Timestamps?.length) return ''
-      return '\nConversation timeline:\n' + reply_Timestamps.map((ts, i) =>
-        `- ${formatDate(new Date(ts))}`
-      ).join('\n')
-    }
-
-    systemPrompt += `\nCurrent time: ${formatDate(new Date())}.`
-    systemPrompt += buildConversationTimeline(opt.replyTimestamps)
-  }
   return systemPrompt
+}
+
+/**
+ * 动态段：当前时间与对话时间线。
+ *
+ * 这两样每轮都变，只能追加在所有稳定内容之后。原实现把它们并进 `mergeSystemPrompt()`，
+ * 而调用方随后才拼插件清单——清单被挡在时间戳之后，永远进不了缓存前缀。按真实地图实测：
+ * 稳定前缀只剩 basePrompt 的 17 tokens，远低于 OpenAI 的 1024 门槛，缓存命中因此恒为 0；
+ * 把动态段挪到末尾后稳定前缀可达 1890 tokens。
+ *
+ * @param {object} [opt]
+ * @param {number[]} [opt.replyTimestamps] 本轮引用到的时间戳
+ * @returns {string}
+ */
+function buildDynamicSystemSuffix (opt = {}) {
+  if (!Config.getCurrentTime) return ''
+  let suffix = `\nCurrent time: ${formatDate(new Date())}.`
+  const timestamps = Array.isArray(opt.replyTimestamps) ? opt.replyTimestamps : []
+  if (timestamps.length) {
+    suffix += '\nConversation timeline:\n' + timestamps
+      .map(ts => `- ${formatDate(new Date(ts))}`)
+      .join('\n')
+  }
+  return suffix
 }
 
 /**
@@ -330,8 +347,10 @@ class Core {
           // temperature: Config.claudeApiTemperature || 0.5
         })
         let promptForClaude = prompt
-        let system = opt.system.claude || ''
-        system = mergeSystemPrompt(system, e, { replyTimestamps: conversation.replyTimestamps })
+        // 稳定段在前，动态段（群上下文 / message_id / 时间）统一排到最后，
+        // 否则每轮都变的内容会把后面的稳定内容挡在缓存前缀之外。
+        let system = mergeSystemPrompt(opt.system.claude || '', e)
+        let claudeSystemDynamic = ''
         let option = {
           stream: false,
           parentMessageId: conversation.parentMessageId,
@@ -344,11 +363,13 @@ class Core {
           const {
             funcMap,
             promptAddition,
-            systemAddition
+            systemAddition,
+            systemDynamic
           } = await collectTools(e)
           claudeTools = Object.keys(funcMap).map(k => funcMap[k].tool)
           promptAddition && (promptForClaude += promptAddition)
           systemAddition && (system += systemAddition)
+          claudeSystemDynamic = systemDynamic || ''
 
           const forceToolByKeyword = Config.enableForceToolKeywords !== false &&
             Config.geminiForceToolKeywords?.find(k => promptForClaude?.includes(k) || e.msg?.includes(k))
@@ -365,6 +386,9 @@ class Core {
         if (claudeTools.length > 0) {
           client.addTools(claudeTools)
         }
+        // 群上下文里的成员信息与聊天记录每轮都变，先攒进 groupDynamic，
+        // 稳定段长度才好量准（缓存断点要打在这个长度上）
+        let groupDynamic = ''
         if (opt.settings.enableGroupContext && e.isGroup) {
           let chats = await msgHistoryMgr.getGroupHistoryContext(e, Config.groupContextLength, { fromLatest: opt.settings.groupContextFromLatest })
           const namePlaceholder = '[name]'
@@ -374,12 +398,12 @@ class Core {
 
           system = system.replaceAll(namePlaceholder, botName || defaultBotName) +
             ((opt.settings.enableGroupContext && e.group_id) ? groupContextTip : '')
-          system += 'Attention, you are currently chatting in a qq group, then one who asks you now is' + `${e.sender.card || e.sender.nickname}(${e.sender.user_id}).`
-          system += `the group name is ${e.group.name || e.group_name}, group id is ${e.group_id}.`
-          system += `Your nickname is ${botName} in the group,`
+          groupDynamic += 'Attention, you are currently chatting in a qq group, then one who asks you now is' + `${e.sender.card || e.sender.nickname}(${e.sender.user_id}).`
+          groupDynamic += `the group name is ${e.group.name || e.group_name}, group id is ${e.group_id}.`
+          groupDynamic += `Your nickname is ${botName} in the group,`
           if (chats) {
-            system += 'There is the conversation history in the group, you must chat according to the conversation history context"'
-            system += chats
+            groupDynamic += 'There is the conversation history in the group, you must chat according to the conversation history context"'
+            groupDynamic += chats
               .map(chat => {
                 let sender = chat.sender || {}
                 return `【${sender.card || sender.nickname}】(qq：${sender.user_id}, ${roleMap[sender.role] || 'normal user'}，${sender.area ? 'from ' + sender.area + ', ' : ''} ${sender.age} years old, 群头衔：${sender.title}, gender: ${sender.sex}, time：${formatDate(new Date(chat.time * 1000))}, messageId: ${chat.message_id}) 说：${chat.raw_message}`
@@ -387,7 +411,13 @@ class Core {
               .join('\n')
           }
         }
+        // 稳定段到此为止：Anthropic 的缓存断点打在这个长度上，后面的内容每轮都变、不参与缓存
+        const claudeStableLength = system.length
+        system += groupDynamic
+        claudeSystemDynamic && (system += claudeSystemDynamic)
+        system += buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
         option.system = system
+        option.systemStableLength = claudeStableLength
         const quoted = await collectQuotedImages(e, opt.prepared)
         applyQuotedMedias(option, quoted.medias)
         // 上下文注入：文本记忆在 prepared 上，一轮只拉取一次（docs/adr/0016）
@@ -433,18 +463,22 @@ class Core {
        * 先接住，等下面 system 拼完再追加——与 OpenAI / Claude 两支口径一致。
        */
       let geminiSystemAddition = ''
+      let geminiSystemDynamic = ''
       if (opt.enableSmart) {
         const {
           funcMap,
-          systemAddition
+          systemAddition,
+          systemDynamic
         } = await collectTools(e)
         let tools = Object.keys(funcMap).map(k => funcMap[k].tool)
         client.addTools(tools)
         geminiSystemAddition = systemAddition || ''
+        geminiSystemDynamic = systemDynamic || ''
       }
-      let system = opt.system.gemini
 
-      system = mergeSystemPrompt(system, e, { replyTimestamps: conversation.replyTimestamps })
+      // 稳定段：人设 → 插件清单；动态段（群上下文 / message_id / 时间）一律排在后面
+      let system = mergeSystemPrompt(opt.system.gemini, e)
+      system += geminiSystemAddition
 
       if (opt.settings.enableGroupContext && e.isGroup) {
         let chats = await msgHistoryMgr.getGroupHistoryContext(e, Config.groupContextLength, { fromLatest: opt.settings.groupContextFromLatest })
@@ -467,7 +501,8 @@ class Core {
             .join('\n')
         }
       }
-      system += geminiSystemAddition
+      geminiSystemDynamic && (system += geminiSystemDynamic)
+      system += buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
       option.system = system
       option.replyPureTextCallback = opt.settings.replyPureTextCallback || (async (msg) => {
         if (msg) {
@@ -492,15 +527,20 @@ class Core {
       if (Config.responsesReasoningEffort) completionParams.reasoning_effort = Config.responsesReasoningEffort
       if (typeof Config.responsesTemperature === 'number') completionParams.temperature = Config.responsesTemperature
 
-      let extraSystemMessage = ''
+      let extraSystemMessage = '' // 稳定段：插件清单
+      let extraSystemDynamic = '' // 动态段：message_id
       let quotedFailed = false
       const buildResponsesInstructions = async (groupContextLength = Config.groupContextLength) => {
         let instructions = await handleSystem(e, opt.system.responses || Config.responsesSystemPrompt, {
           ...opt.settings,
           groupContextLength
         })
-        instructions = mergeSystemPrompt(instructions, e, { replyTimestamps: conversation.replyTimestamps })
+        // 顺序：人设 → 插件清单（稳定）→ message_id → 时间（动态）
+        instructions = mergeSystemPrompt(instructions, e)
         if (extraSystemMessage) instructions += extraSystemMessage
+        if (extraSystemDynamic) instructions += extraSystemDynamic
+        instructions += buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
+        // 上下文注入来自外部端点、每轮可能变，放在稳定段与动态段之后
         instructions = await withContextInjection(opt.prepared, Config, instructions, conversation)
         return appendGroupAutoReplyPrompt(instructions, opt)
       }
@@ -526,10 +566,11 @@ class Core {
       if (opt.enableSmart) {
         isAdmin = ['admin', 'owner'].includes(e.sender.role)
         sender = e.sender.user_id
-        const { funcMap: collectedFuncMap, promptAddition, systemAddition } = await collectTools(e)
+        const { funcMap: collectedFuncMap, promptAddition, systemAddition, systemDynamic } = await collectTools(e)
         funcMap = collectedFuncMap
         promptAddition && (prompt += promptAddition)
         extraSystemMessage = systemAddition || ''
+        extraSystemDynamic = systemDynamic || ''
         instructions = await buildResponsesInstructions()
         completionParams.tools = Object.values(funcMap).map(({ function: definition }) => ({
           type: 'function',
@@ -668,17 +709,24 @@ class Core {
         Current date: ${currentDate}`
       // let maxModelTokens = getMaxModelTokens(completionParams.model)
       // let system = promptPrefix
-      let extraSystemMessage = ''
+      let extraSystemMessage = '' // 稳定段：插件清单
+      let extraSystemDynamic = '' // 动态段：message_id
       let quotedFailed = false
       const buildOpenAISystem = async (groupContextLength = Config.groupContextLength) => {
         let system = await handleSystem(e, promptPrefix, {
           ...opt.settings,
           groupContextLength
         })
-        system = mergeSystemPrompt(system, e, { replyTimestamps: conversation.replyTimestamps })
+        // 顺序：人设 → 插件清单（稳定）→ message_id → 时间（动态）
+        system = mergeSystemPrompt(system, e)
         if (extraSystemMessage) {
           system += extraSystemMessage
         }
+        if (extraSystemDynamic) {
+          system += extraSystemDynamic
+        }
+        system += buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
+        // 上下文注入来自外部端点、每轮可能变，放在稳定段与动态段之后
         system = await withContextInjection(opt.prepared, Config, system, conversation)
         return appendGroupAutoReplyPrompt(system, opt)
       }
@@ -757,13 +805,15 @@ class Core {
         const {
           funcMap,
           promptAddition,
-          systemAddition
+          systemAddition,
+          systemDynamic
         } = await collectTools(e)
         if (!option.completionParams) {
           option.completionParams = {}
         }
         promptAddition && (prompt += promptAddition)
         systemAddition && (option.systemMessage += systemAddition)
+        extraSystemDynamic = systemDynamic || ''
         option.completionParams.tools = Object.keys(funcMap).map(k => ({
           type: "function",
           function: funcMap[k].function
@@ -1205,7 +1255,8 @@ async function collectTools(e) {
     }
   }
 
-  let systemAddition = ''
+  let systemAddition = '' // 稳定段：插件清单，同一份地图下内容不变
+  let systemDynamic = '' // 动态段：每条消息都变的 message_id，只能排在稳定段之后
   if (e.isGroup) {
     let botInfo = await e.bot?.pickMember?.(e.group_id, getUin(e)) || await e.bot?.getGroupMemberInfo?.(e.group_id, getUin(e))
     if (['admin', 'owner'].includes(botInfo.role)) {
@@ -1225,9 +1276,9 @@ async function collectTools(e) {
       // 用于撤回和加精的id
       if (e.source?.seq) {
         let source = (await e.group.getChatHistory(e.source?.seq, 1)).pop()
-        systemAddition += `\nthe last message is replying to ${source.message_id}"\n`
+        systemDynamic += `\nthe last message is replying to ${source.message_id}"\n`
       } else {
-        systemAddition += `\nthe last message id is ${e.message_id}. `
+        systemDynamic += `\nthe last message id is ${e.message_id}. `
       }
     }
   }
@@ -1273,6 +1324,7 @@ async function collectTools(e) {
   return {
     funcMap: buildFuncMap(tools),
     systemAddition,
+    systemDynamic,
     promptAddition
   }
 }

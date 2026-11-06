@@ -9,6 +9,7 @@ import globalFetch from 'node-fetch';
 import { fetchSSE } from './fetch-sse.js';
 import { syncInnerOs } from '../innerOs.js';
 import { fetchWithConnectionRetry } from '../network-retry.js';
+import { pickCacheUsage } from './cacheUsage.js';
 const CHATGPT_MODEL = 'gpt-4o-mini';
 const USER_LABEL_DEFAULT = 'User';
 const ASSISTANT_LABEL_DEFAULT = 'ChatGPT';
@@ -527,13 +528,9 @@ export class ChatGPTAPI {
             const outTokens = usage.completion_tokens || 0;
             const totalTokenCount = usage.total_tokens || (apiPromptTokens + outTokens);
             const usageDetails = usage;
-            const reportedCacheReadTokens = usageDetails.cache_read_input_tokens
-                ?? usageDetails.prompt_tokens_details?.cached_tokens
-                ?? usageDetails.input_tokens_details?.cached_tokens;
+            // 字段映射统一走 pickCacheUsage：OpenAI / Anthropic / DeepSeek / 中转的写法都要认
+            const { read: reportedCacheReadTokens, write: reportedCacheWriteTokens } = pickCacheUsage(usageDetails);
             const cacheReadTokens = reportedCacheReadTokens ?? 0;
-            const reportedCacheWriteTokens = usageDetails.cache_creation_input_tokens
-                ?? usageDetails.prompt_tokens_details?.cache_write_tokens
-                ?? usageDetails.input_tokens_details?.cache_write_tokens;
             const cacheWriteTokens = reportedCacheWriteTokens ?? 0;
             const reportedReasoningTokens = usageDetails.completion_tokens_details?.reasoning_tokens
                 ?? usageDetails.output_tokens_details?.reasoning_tokens
@@ -553,6 +550,12 @@ export class ChatGPTAPI {
             const cacheWriteInfo = reportedCacheWriteTokens == null
                 ? ''
                 : ` | 缓存写入(${cacheWriteTokens})`;
+            // 首次遇到「上游没给缓存字段」时，把 usage 的键名打出来：能一眼分辨是上游根本
+            // 不给（真 0），还是字段名不认（假 0）。只打一次，避免每条消息刷屏。
+            if (reportedCacheReadTokens == null && !this._usageShapeLogged) {
+                this._usageShapeLogged = true;
+                logger.info(`[Chatgpt][API] 本次响应没有缓存字段；上游 usage 键：${Object.keys(usageDetails || {}).join(', ') || '(空)'}。若上游其实命中了缓存，请按该键名补映射。`);
+            }
             const reasoningInfo = reportedReasoningTokens == null
                 ? ''
                 : ` | 推理Token(${reasoningTokens})`;
