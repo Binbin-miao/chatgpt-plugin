@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { runProviderFallback, createAttemptHistory } from '../utils/providerFallback.js'
+import { runProviderFallback, createAttemptHistory, trimConversation } from '../utils/providerFallback.js'
 
 const main = { id: 'main' }, backup = { id: 'backup' }
 test('主失败重试一次再备用，下一轮重新优先主；独立任务只调用一次', async () => {
@@ -44,4 +44,41 @@ test('空回复可回退，全失败只尝试三次；历史缓冲与输入隔�
   await first.upsertMessage({ id: first.parentMessageId, text: '失败尝试' })
   assert.deepEqual((await second.getMessageById(second.parentMessageId)).parts, [{ text: '答案' }])
   assert.equal(messages[1].content, '答案')
+})
+
+const trimCfg = { chatgptBlockCount: 500, maxModelTokens: 600000, apiMaxToken: 65536 }
+const pairs = n => Array.from({ length: n }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: 'x' }))
+
+test('历史裁剪：未超上界不裁，超过才一次裁到 70% 且保持偶数', () => {
+  assert.equal(trimConversation(pairs(400), trimCfg).length, 400)
+  assert.equal(trimConversation(pairs(500), trimCfg).length, 500)
+  const cut = trimConversation(pairs(501), trimCfg)
+  assert.equal(cut.length, 350, '500 × 0.7 = 350')
+  assert.equal(cut.length % 2, 0)
+})
+
+test('历史裁剪后能稳定累积很多轮才再次触发', () => {
+  let history = []
+  let cuts = 0
+  for (let turn = 0; turn < 600; turn++) {
+    const before = history.length
+    history = trimConversation(history.concat(pairs(2)), trimCfg)
+    if (history.length < before) cuts++
+    assert.ok(history.length <= 500, '任何时候都不得超过上界')
+  }
+  // 逐轮裁剪会是 600 次；批量裁剪应该只有个位数
+  assert.ok(cuts <= 12, `裁剪次数应远小于轮数，实际 ${cuts}`)
+})
+
+test('条数上限为奇数或极小值时仍安全，且结果为偶数', () => {
+  for (const count of [1, 2, 3, 5, 7, 199]) {
+    const out = trimConversation(pairs(40), { ...trimCfg, chatgptBlockCount: count })
+    assert.ok(out.length <= Math.max(2, count), `count=${count} 超出上界`)
+    assert.equal(out.length % 2, 0, `count=${count} 裁出了奇数条`)
+  }
+})
+
+test('0 表示不按条数裁，交给 token 预算', () => {
+  const out = trimConversation(pairs(600), { ...trimCfg, chatgptBlockCount: 0 })
+  assert.equal(out.length, 600)
 })

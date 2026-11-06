@@ -293,7 +293,7 @@ test('备用成功写入主会话，下轮携带正文仍选主模型；连接�
 })
 
 for (const type of ['api', 'responses', 'claude', 'gemini']) {
-test(`${type} 不续接升级前历史，成功问答按 3600 秒和 50 条写入新会话`, async t => {
+test(`${type} 不续接升级前历史，成功问答按 3600 秒和 50 条写入新会话，超界一次裁到 70%`, async t => {
   const { resolveProvider, providerConversationKey } = await import('../utils/providers.js')
   const { connectionVersion, MODEL_FIELDS, KEY_FIELDS } = await import('../utils/providerProfiles.js')
   const previous = { ...Config }
@@ -320,9 +320,10 @@ test(`${type} 不续接升级前历史，成功问答按 3600 秒和 50 条写�
   const row = resolveProvider()
   const key = providerConversationKey(row, '123')
   let turn = 0
+  let expected = 0 // 已落库的历史条数：涨满 50 后一次裁到 34（50×0.7 向下取偶）
   scriptedResponse = async (prompt, conversation, id) => {
     assert.equal(id, row.id)
-    assert.equal(conversation.messages.filter(m => ['user', 'assistant'].includes(m.role)).length, Math.min(turn * 2, 50))
+    assert.equal(conversation.messages.filter(m => ['user', 'assistant'].includes(m.role)).length, expected)
     if (turn === 0) assert.equal(conversation.parentMessageId, undefined)
     else assert.equal(conversation.messages.at(-1).content, `回答${turn - 1}`)
     return { text: `回答${turn}`, id: `reply-${turn}`, actualProviderId: row.id, actualProviderVersion: connectionVersion(row) }
@@ -330,13 +331,16 @@ test(`${type} 不续接升级前历史，成功问答按 3600 秒和 50 条写�
   for (; turn < 27; turn++) {
     e.msg = `问题${turn}`
     await chat.abstractChat(e, e.msg, undefined, false, { automatic: true })
+    expected = expected + 2 > 50 ? 34 : expected + 2
   }
   assert.equal(reads.includes(oldKey), false)
   assert.equal(writes.length, 27)
   assert.ok(writes.every(write => write.key === key && write.options.EX === 3600))
   const messages = JSON.parse(saved.get(key)).messages
-  assert.equal(messages.length, 50)
-  assert.equal(messages[0].content, '问题2')
+  assert.equal(messages.length, expected)
+  assert.equal(messages.length, 36)
+  // 54 条里保留最后 36 条，起点是第 9 轮提问
+  assert.equal(messages[0].content, '问题9')
   assert.equal(messages.at(-1).content, '回答26')
 })
 }
