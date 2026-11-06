@@ -11,6 +11,8 @@ import { syncInnerOs } from '../innerOs.js';
 import { fetchWithConnectionRetry } from '../network-retry.js';
 import { pickCacheUsage } from './cacheUsage.js';
 const CHATGPT_MODEL = 'gpt-4o-mini';
+/** 已经打过「上游没给缓存字段」日志的 provider。客户端是每条消息新建的，标志不能挂在实例上 */
+const usageShapeLogged = new Set();
 const USER_LABEL_DEFAULT = 'User';
 const ASSISTANT_LABEL_DEFAULT = 'ChatGPT';
 const TOOL_LABEL_DEFAULT = 'Tool';
@@ -551,9 +553,10 @@ export class ChatGPTAPI {
                 ? ''
                 : ` | 缓存写入(${cacheWriteTokens})`;
             // 首次遇到「上游没给缓存字段」时，把 usage 的键名打出来：能一眼分辨是上游根本
-            // 不给（真 0），还是字段名不认（假 0）。只打一次，避免每条消息刷屏。
-            if (reportedCacheReadTokens == null && !this._usageShapeLogged) {
-                this._usageShapeLogged = true;
+            // 不给（真 0），还是字段名不认（假 0）。按 provider 只打一次，避免每条消息刷屏。
+            const shapeKey = this._providerName || 'default';
+            if (reportedCacheReadTokens == null && !usageShapeLogged.has(shapeKey)) {
+                usageShapeLogged.add(shapeKey);
                 logger.info(`[Chatgpt][API] 本次响应没有缓存字段；上游 usage 键：${Object.keys(usageDetails || {}).join(', ') || '(空)'}。若上游其实命中了缓存，请按该键名补映射。`);
             }
             const reasoningInfo = reportedReasoningTokens == null
