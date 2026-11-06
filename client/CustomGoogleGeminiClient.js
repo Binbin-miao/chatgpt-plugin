@@ -559,14 +559,6 @@ export class CustomGoogleGeminiClient extends GoogleGeminiClient {
         responseOpt.toolMode = 'NONE'
       }
 
-      // 添加明确的系统指示
-      const toolResultPrefix = "以下是工具调用的结果，请直接回答用户，不要再次调用工具：\n\n";
-      if (responseOpt.system) {
-        responseOpt.system = toolResultPrefix + responseOpt.system;
-      } else {
-        responseOpt.system = toolResultPrefix;
-      }
-
       // 递归直到返回text
       // 先把这轮的消息存下来
       await this.upsertMessage(getMessageForSave(thisMessage))

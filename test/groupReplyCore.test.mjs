@@ -6,10 +6,24 @@ import { createToolForwardMock } from './fixtures/toolForwardMock.mjs'
 // 隔离工具、框架和 provider 边界；实际执行 Core 的各 provider 请求组装与 SubLLM 调用。
 // 按 import 列表提供未使用工具的桩，避免导入整个宿主；这里不是源码断言。
 const source = fs.readFileSync(new URL('../model/core.js', import.meta.url), 'utf8')
+let allowToolCollection = false
 for (const [, name, path] of source.matchAll(/import \{ (\w+) \} from '(\.\.\/utils\/(?:tools|anythingllm)\/[^']+)'/g)) {
   if (name === 'mergeTrustedToolArgs') continue
-  mock.module(path, { namedExports: { [name]: class { constructor() { throw new Error(`不应收集工具 ${name}`) } } } })
+  mock.module(path, { namedExports: { [name]: class {
+    constructor() {
+      if (!allowToolCollection) throw new Error(`不应收集工具 ${name}`)
+      this.name = name
+    }
+    function() { return { name: this.name, description: '测试工具', parameters: { type: 'object', properties: {} } } }
+    func() { throw new Error('本测试不应执行工具') }
+  } } })
 }
+const stableToolAddon = '\n# 测试工具清单\n固定能力说明：查询插件指令。\n'
+mock.module('../utils/capability/map.js', { namedExports: {
+  loadEntries: () => ({ entries: [{ pluginKey: 'fixture' }] }),
+  buildPromptAddon: () => stableToolAddon,
+  readMapState: () => ({ missing: [] })
+} })
 mock.module('../utils/common.js', { namedExports: {
   extractContentFromFile() {}, formatDate: () => '现在', parseSourceImg() {}, getMasterQQ: async () => [],
   getUin: e => e.self_id, getUserData: async () => ({}), normalizeChatMode: mode => mode
@@ -220,6 +234,112 @@ for (const provider of ['api', 'responses']) {
     }
     assert.equal(selected.message_id, 'selected-message')
     assert.equal(selected.seq, 101)
+  })
+}
+
+function enableCacheFixture(t) {
+  const raw = Config.getConfig()
+  const settings = { enableCommandMapSync: true, enableCommandMapDelegate: false, getCurrentTime: true, isProcessCQAtCode: true, isReplacePromptForSenderMsg: false, enableDefaultMessageTriggerTool: false }
+  const previous = Object.fromEntries(Object.keys(settings).map(key => [key, raw[key]]))
+  Object.assign(raw, settings)
+  allowToolCollection = true
+  t.after(() => {
+    Object.assign(raw, previous)
+    allowToolCollection = false
+    remainingContextFailures = 0
+  })
+}
+
+for (const provider of ['api', 'responses']) {
+  test(`${provider} 工具清单与插件规则在群身份、历史和消息 ID 变化时仍保留相同前缀`, async t => {
+    enableCacheFixture(t)
+    const { selected, latest } = groupHistoryFixture()
+    selected.bot = { pickMember: () => ({ role: 'admin' }) }
+    let stablePrefix
+    for (const turn of ['第一轮', '第二轮']) {
+      selected.message_id = `${turn}-message`
+      selected.sender = { ...selected.sender, card: `${turn}发言者` }
+      latest[0].raw_message = `${turn}历史内容`
+      await core.sendMessage(selected.raw_message, { replyTimestamps: [1] }, provider, selected, {
+        enableSmart: true, system: { [provider]: '固定人设 [name]' },
+        settings: { enableGroupContext: true, groupContextFromLatest: true }
+      })
+      const request = requests.at(-1)
+      const system = systemOf(request)
+      const groupStart = system.indexOf('Attention, you are currently chatting in a qq group')
+      const addonStart = system.indexOf(stableToolAddon)
+      assert.ok(addonStart >= 0 && addonStart < groupStart, '工具清单必须排在群动态之前')
+      const rulesStart = system.indexOf('如果你想要At某个用户')
+      assert.ok(rulesStart >= 0 && rulesStart < addonStart, '插件规则必须先于工具清单')
+      const prefix = system.slice(0, groupStart)
+      assert.match(prefix, /固定人设 派蒙/)
+      assert.ok(prefix.includes(Config.groupContextTip))
+      assert.equal(system.split(stableToolAddon).length - 1, 1)
+      if (stablePrefix !== undefined) assert.equal(prefix, stablePrefix)
+      stablePrefix = prefix
+      assert.ok(system.includes(`${turn}发言者(123)`))
+      for (const chat of latest) {
+        assert.ok(system.includes(`messageId: ${chat.message_id}`))
+        assert.ok(system.includes(chat.raw_message))
+      }
+      const messageIdStart = system.indexOf(`the last message id is ${turn}-message`)
+      assert.ok(messageIdStart > system.lastIndexOf('messageId: latest-'))
+      assert.ok(system.indexOf('Current time:') > messageIdStart)
+      assert.ok(system.indexOf('Conversation timeline:') > messageIdStart)
+      assert.ok(request.options.completionParams.tools.some(tool => tool.type === 'function'))
+    }
+  })
+
+  test(`${provider} 工具开启时压缩重试只缩短群历史，稳定前缀和动态尾部仍完整`, async t => {
+    enableCacheFixture(t)
+    const { selected, historyCalls } = groupHistoryFixture()
+    selected.bot = { pickMember: () => ({ role: 'admin' }) }
+    const before = requests.length
+    remainingContextFailures = 4
+    const result = await core.sendMessage(selected.raw_message, { replyTimestamps: [1] }, provider, selected, {
+      enableSmart: true, groupAutoReply: true, system: { [provider]: '固定人设 [name]' },
+      settings: { enableGroupContext: true, groupContextFromLatest: true }
+    })
+    assert.equal(result.text, '正常回复')
+    const attempts = requests.slice(before)
+    assert.equal(attempts.length, 5)
+    assert.deepEqual(historyCalls, [20, 20, 15, 10, 5].map(count => ({ seq: 0, count })))
+    let stablePrefix
+    for (const [index, request] of attempts.entries()) {
+      const system = systemOf(request)
+      const groupStart = system.indexOf('Attention, you are currently chatting in a qq group')
+      const prefix = system.slice(0, groupStart)
+      assert.ok(prefix.includes(stableToolAddon), '压缩重试的稳定前缀不能丢失工具清单')
+      assert.match(prefix, /固定人设 派蒙/)
+      if (stablePrefix !== undefined) assert.equal(prefix, stablePrefix)
+      stablePrefix = prefix
+      const count = [20, 15, 10, 5, 0][index]
+      assert.equal((system.match(/messageId: latest-\d+/g) || []).length, count)
+      if (count) assert.match(system, /打游戏突然没声音了，但是麦克风还能用/)
+      else assert.doesNotMatch(system, /conversation history in the group/)
+      assert.ok(system.includes('the last message id is selected-message'))
+      assert.ok(system.indexOf('Current time:') > system.indexOf('the last message id is'))
+      assert.match(system, /Conversation timeline:/)
+      assert.ok(system.endsWith(groupAutoReplyPrompt))
+      assert.equal(system.split(stableToolAddon).length - 1, 1)
+    }
+    assert.equal(selected.message_id, 'selected-message')
+    assert.equal(selected.seq, 101)
+  })
+
+  test(`${provider} 引用消息 ID 留在工具清单之后且群上下文关闭时不替换人设占位符`, async t => {
+    enableCacheFixture(t)
+    const { selected } = groupHistoryFixture()
+    selected.bot = { pickMember: () => ({ role: 'admin' }) }
+    selected.source = { seq: 202 }
+    await core.sendMessage(selected.raw_message, {}, provider, selected, {
+      enableSmart: true, system: { [provider]: '固定人设 [name]' }, settings: { enableGroupContext: false }
+    })
+    const system = systemOf(requests.at(-1))
+    assert.match(system, /固定人设 \[name\]/)
+    assert.ok(system.indexOf('the last message is replying to old-0') > system.indexOf(stableToolAddon))
+    assert.ok(system.indexOf('Current time:') > system.indexOf('the last message is replying to'))
+    assert.doesNotMatch(system, /conversation history in the group|the last message id is/)
   })
 }
 

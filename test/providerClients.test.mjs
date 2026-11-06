@@ -120,6 +120,61 @@ test('Gemini 工具回填保持完整历史链，不截断之前的用户上下�
   assert.ok((await history.getMessageById(history.parentMessageId)).parentMessageId)
 })
 
+for (const { label, ...systemOptions } of [
+  { label: '非空', system: '保持原始系统前缀\n按工具结果回答。' },
+  { label: '空', system: '' },
+  { label: '未提供' }
+]) {
+  test(`Gemini 连续工具回填保持${label} system、完整历史和原始结果，上限 NONE 优先于 ANY`, async () => {
+    const messages = [{ role: 'user', content: '我喜欢蓝色' }, { role: 'assistant', content: '记住了' }]
+    const history = createAttemptHistory('gemini', messages)
+    const requests = []
+    const called = []
+    const toolResults = [
+      { name: 'searchImage', content: '蓝色图片查询完成' },
+      { name: 'searchMusic', content: { tracks: ['蓝色乐曲'], count: 1 } }
+    ]
+    const functionCalls = toolResults.map(({ name }, index) => ({ name, args: {}, thoughtSignature: `signature-${index}` }))
+    const client = new CustomGoogleGeminiClient({
+      key: 'fixture-key', model: 'fixture-model', config: { ...Config, llm_maxToolRounds: 1 }, ...history,
+      e: { user_id: '123', sender: { user_id: '123', role: 'member' }, reply: async () => {} },
+      fetch: async (url, options) => {
+        const functionCall = functionCalls[requests.length]
+        requests.push(JSON.parse(options.body))
+        const parts = functionCall ? [{ functionCall }] : [{ text: '已找到蓝色图片和乐曲' }]
+        return Response.json({ candidates: [{ finishReason: 'STOP', content: { role: 'model', parts } }] })
+      }
+    })
+    client.addTools(toolResults.map(({ name, content }) => ({
+      name,
+      function: () => ({ name, description: '查询', parameters: { type: 'object', properties: {} } }),
+      func: async () => { called.push(name); return content }
+    })))
+    const result = await client.sendMessage('查询图片和乐曲', { parentMessageId: history.parentMessageId, ...systemOptions })
+    assert.equal(result.text, '已找到蓝色图片和乐曲')
+    assert.deepEqual(called, toolResults.map(({ name }) => name))
+    assert.equal(requests.length, 3)
+    assert.deepEqual(requests.map(request => request.toolConfig.functionCallingConfig.mode), ['AUTO', 'ANY', 'NONE'])
+    const expectedContents = [
+      ...messages.map(({ role, content }) => ({ role: role === 'assistant' ? 'model' : 'user', parts: [{ text: content }] })),
+      { role: 'user', parts: [{ text: '查询图片和乐曲' }] }
+    ]
+    for (const [index, request] of requests.entries()) {
+      if (index > 0) {
+        const { name, content } = toolResults[index - 1]
+        const functionCall = functionCalls[index - 1]
+        expectedContents.push(
+          { role: 'model', parts: [{ functionCall }] },
+          { role: 'user', parts: [{ functionResponse: { name, response: { name, content }, thoughtSignature: functionCall.thoughtSignature } }] }
+        )
+      }
+      assert.deepEqual(request.contents, expectedContents, `第 ${index + 1} 轮只能追加原始工具协议消息`)
+      assert.deepEqual(request.system_instruction, systemOptions.system ? { parts: [{ text: systemOptions.system }] } : undefined)
+      assert.equal(Object.hasOwn(request, 'system_instruction'), Boolean(systemOptions.system))
+    }
+  })
+}
+
 /** 沿 parentMessageId 走完存储链，用于断言「落库内容里没有 base64」 */
 async function collectStoredChain(history, startId) {
   const chain = []
