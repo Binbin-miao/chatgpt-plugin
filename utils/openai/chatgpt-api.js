@@ -10,7 +10,7 @@ import { fetchSSE } from './fetch-sse.js';
 import { syncInnerOs } from '../innerOs.js';
 import { fetchWithConnectionRetry } from '../network-retry.js';
 import { pickCacheUsage } from './cacheUsage.js';
-import { CUT_RATIO, getHistoryAnchor, setHistoryAnchor } from '../historyWindow.js';
+import { CUT_RATIO, cutKeepCount, getHistoryAnchor, setHistoryAnchor } from '../historyWindow.js';
 const CHATGPT_MODEL = 'gpt-4o-mini';
 /** 已经打过「上游没给缓存字段」日志的 provider。客户端是每条消息新建的，标志不能挂在实例上 */
 const usageShapeLogged = new Set();
@@ -779,17 +779,17 @@ export class ChatGPTAPI {
             nextHistoryIds = [parentMessage.id, ...nextHistoryIds];
             nextHistoryMessagesCount += 1;
         } while (true);
-        // 窗口锚点：按预算回溯得到的「最近 N 条」每轮只挤掉一两条，会让请求前缀整体
-        // 错位、缓存整段失效。改成「头固定、尾部增长」：锚点还在窗口内就从锚点保留；
-        // 锚点滑出去（或首次超预算）时一次性切掉一大段，之后又能稳定很多轮。
+        // 窗口锚点：按预算/条数回溯得到的「最近 N 条」每轮只挤掉一两条，会让请求前缀
+        // 整体错位、缓存整段失效。改成「头固定、尾部增长」：锚点还在窗口内就从锚点保留；
+        // 锚点滑出去（或首次触顶）时一次性切掉一大段，之后又能稳定很多轮。
         //
-        // 只处理 budget 路径：那是框架自己算出来的边界，切多少由我们决定。
-        // block_count 是用户在锅巴里显式写的「最多保留多少条」，必须精确遵守，
-        // 不能自作主张再砍 30%。
+        // 条数上限（锅巴里显式设置）同样走这条路：它定义的是「窗口最多多少条」，
+        // 而不是「每轮精确保留多少条」——后者等价于每轮滑一格，缓存无法命中。
+        const windowBounded = stopReason === 'budget' || stopReason === 'block_count_reached';
         const windowKey = opts.conversationId;
         let windowCut = false;
         let windowStart = 0;
-        if (stopReason === 'budget' &&
+        if (windowBounded &&
             windowKey &&
             keptHistoryMessagesCount > 0 &&
             keptHistoryIds.length === keptHistoryMessagesCount) {
@@ -799,7 +799,11 @@ export class ChatGPTAPI {
                 windowStart = anchorIndex;
             }
             else {
-                const cutTo = keptHistoryMessagesCount - Math.max(1, Math.floor(keptHistoryMessagesCount * CUT_RATIO));
+                // 条数上限按 N 的 70% 切；预算路径按实际装下的条数切。切割后条数取偶。
+                const maxKeep = stopReason === 'block_count_reached'
+                    ? Math.max(2, this._chatgptBlockCount || keptHistoryMessagesCount)
+                    : keptHistoryMessagesCount;
+                const cutTo = keptHistoryMessagesCount - Math.min(maxKeep, cutKeepCount(maxKeep, CUT_RATIO));
                 if (cutTo > 0) {
                     windowStart = cutTo;
                     setHistoryAnchor(windowKey, keptHistoryIds[cutTo]);

@@ -19,6 +19,32 @@ export const MAX_HISTORY_MESSAGES = 600
 /** 切割后保留的比例：切得越狠，下次切割间隔越久 */
 export const CUT_RATIO = 0.7
 
+/**
+ * 把「本次要保留的条数」对齐成偶数。
+ *
+ * Gemini 的 contents 必须 user/model 交替，奇数条会从错误的角色开始；两条消息
+ * 一组也正好是「一问一答」。只在切割时对齐——未切割的轮次必须保持字节不动，
+ * 否则等于每轮又改一次前缀。
+ *
+ * @param {number} value
+ * @returns {number}
+ */
+export function evenFloor(value) {
+  const n = Math.floor(Number(value) || 0)
+  return n - (n % 2)
+}
+
+/**
+ * 切割后应该保留多少条（偶数、至少 2 条）。
+ *
+ * @param {number} maxKeep 窗口上限
+ * @param {number} [ratio]
+ * @returns {number}
+ */
+export function cutKeepCount(maxKeep, ratio = CUT_RATIO) {
+  return Math.max(2, evenFloor(Math.floor(Number(maxKeep) * ratio)))
+}
+
 /** 内存里最多记多少个会话的锚点，超出按插入顺序淘汰最旧的 */
 const MAX_TRACKED_CONVERSATIONS = 500
 
@@ -86,8 +112,8 @@ export function planHistoryWindow(messages, key, opt = {}) {
   // 锚点内的窗口还在上限之内：头不动，尾部照常增长
   if (total - start <= maxKeep) return { start, cut: false, anchorId: anchorId ?? null }
 
-  const target = Math.max(1, Math.floor(maxKeep * ratio))
-  let next = total - target
+  // 切割：一次切到 70%，并保证保留条数是偶数
+  let next = total - cutKeepCount(maxKeep, ratio)
   if (next <= start) next = start + 1
   if (next >= total) next = total - 1
   const newAnchor = list[next]?.id ?? null

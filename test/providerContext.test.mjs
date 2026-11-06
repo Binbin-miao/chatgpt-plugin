@@ -48,7 +48,7 @@ globalThis.redis = { get: async () => null }
 const { Config, providerDefaults } = await import('../utils/config.js')
 Object.assign(Config.getConfig(), {
   smartMode: true, debug: false, enableGroupContext: false, enableMcp: false, enableDefaultMessageTriggerTool: false,
-  chatgptBlockCount: 50, llm_maxToolRounds: 3, enableForceToolKeywords: false,
+  chatgptBlockCount: 200, llm_maxToolRounds: 3, enableForceToolKeywords: false,
   modelProviders: Object.fromEntries(Object.entries(providerDefaults).map(([type, fields]) => [type, [{
     ...fields, id: type, name: type, claudeApiKey: 'fixture-key', geminiKey: 'fixture-key', apiKey: 'fixture-key', responsesApiKey: 'fixture-key',
     apiStream: false, model: 'gpt-4o-mini', geminiEnableGoogleSearch: false, geminiEnableCodeExecution: false
