@@ -88,9 +88,7 @@ test('空历史与自定义参数', () => {
   const history = makeHistory(100)
   const plan = planHistoryWindow(history, 'conv-g', { maxKeep: 50, ratio: 0.5 })
   assert.equal(plan.cut, true)
-  // 50 × 0.5 = 25，向下取偶 → 24
-  assert.equal(plan.start, 100 - 24)
-  assert.equal((100 - plan.start) % 2, 0, '切割后保留条数必须是偶数')
+  assert.equal(plan.start, 100 - 25)
 })
 
 test('长期增长中切割次数很少（这才是相对滑动窗口的收益）', () => {
@@ -110,18 +108,6 @@ test('长期增长中切割次数很少（这才是相对滑动窗口的收益�
   assert.ok(stableTurns > totalTurns * 0.95, `绝大多数轮次前缀应保持不动，实际 ${stableTurns}`)
 })
 
-test('任何上限下切割出来的保留条数都是偶数', () => {
-  clearHistoryWindows()
-  for (const maxKeep of [50, 199, 200, 300, 401, 500, 600, 801]) {
-    const total = maxKeep * 2 + 3
-    const history = makeHistory(total, `k${maxKeep}`)
-    const plan = planHistoryWindow(history, `conv-even-${maxKeep}`, { maxKeep })
-    assert.equal(plan.cut, true, `maxKeep=${maxKeep} 应触发切割`)
-    assert.equal((total - plan.start) % 2, 0, `maxKeep=${maxKeep} 切出了奇数条`)
-    assert.ok(total - plan.start <= maxKeep, `maxKeep=${maxKeep} 超出上限`)
-  }
-})
-
 const read = file => fs.readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')
 
 test('四个通道都接了同一套窗口逻辑，不会漏掉某一条', () => {
@@ -131,8 +117,8 @@ test('四个通道都接了同一套窗口逻辑，不会漏掉某一条', () =>
   assert.match(read('model/core.js'), /planHistoryWindow/, 'Responses 无状态路径未接入')
 })
 
-test('条数上限也走锚点窗口，切割条数取偶', () => {
+test('显式设置的条数上限不被批量切块改写', () => {
   const source = read('utils/openai/chatgpt-api.js')
-  assert.match(source, /stopReason === 'block_count_reached'/, '条数上限必须参与窗口计算')
-  assert.match(source, /cutKeepCount\(/, '切割条数必须走偶数取整')
+  assert.match(source, /if \(stopReason === 'budget' &&/, '只有预算路径才允许批量切块')
+  assert.doesNotMatch(source, /=== 'block_count_reached'/, '条数上限必须精确遵守，不能参与批量切块')
 })
