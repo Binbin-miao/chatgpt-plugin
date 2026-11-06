@@ -10,6 +10,7 @@ import { fetchSSE } from './fetch-sse.js';
 import { syncInnerOs } from '../innerOs.js';
 import { fetchWithConnectionRetry } from '../network-retry.js';
 import { pickCacheUsage } from './cacheUsage.js';
+import { CUT_RATIO, getHistoryAnchor, setHistoryAnchor } from '../historyWindow.js';
 const CHATGPT_MODEL = 'gpt-4o-mini';
 /** 已经打过「上游没给缓存字段」日志的 provider。客户端是每条消息新建的，标志不能挂在实例上 */
 const usageShapeLogged = new Set();
@@ -324,7 +325,7 @@ export class ChatGPTAPI {
           upsert: m => this._upsertMessage(m),
         })
         if (trimInfo.trimmed) {
-            logger.info(`[chatgpt] history trimmed: current=${trimInfo.currentTurnMessages}, keptHistory=${trimInfo.keptHistoryMessages}, attemptedHistory=${trimInfo.attemptedHistoryMessages}, droppedHistory=${trimInfo.droppedHistoryMessages}, keptToolChains=${trimInfo.keptToolChainCount}, budget=${trimInfo.promptBudget}, finalTokens=${numTokens}, reason=${trimInfo.stopReason}。若这类日志频繁出现，请检查锅巴中的“回复内容最大Token数(apiMaxToken)”与“模型总上下文Token数(maxModelTokens)”配置是否过紧。`);
+            logger.info(`[chatgpt] history trimmed: current=${trimInfo.currentTurnMessages}, keptHistory=${trimInfo.keptHistoryMessages}, attemptedHistory=${trimInfo.attemptedHistoryMessages}, droppedHistory=${trimInfo.droppedHistoryMessages}, keptToolChains=${trimInfo.keptToolChainCount}, budget=${trimInfo.promptBudget}, finalTokens=${numTokens}, reason=${trimInfo.stopReason}${trimInfo.windowCut ? `, windowCut=true(从第 ${trimInfo.windowStart} 条起保留)` : ''}。若这类日志频繁出现，请检查锅巴中的“回复内容最大Token数(apiMaxToken)”与“模型总上下文Token数(maxModelTokens)”配置是否过紧。`);
         }
         // 本轮群聊环境放在 innerOs 之后插入：innerOs 找的是「首条 user 消息」，
         // 先插会让全局破限提示落进群聊记录块里，而不是落进用户这句提问。
@@ -690,6 +691,9 @@ export class ChatGPTAPI {
         let nextToolChainCount = 0;
         let keptHistoryMessagesCount = 0;
         let keptToolChainCount = 0;
+        // 与历史消息一一对应的 id：窗口锚点要靠它记住「这一轮从哪条开始保留」
+        let nextHistoryIds = [];
+        let keptHistoryIds = [];
         let stopReason = 'complete';
         let functionToken = 0;
         // 本轮群聊环境不在 messages 里，但仍占上下文预算：漏算会让压缩判断失灵，
@@ -708,6 +712,7 @@ export class ChatGPTAPI {
                 numTokens = nextNumTokensEstimate;
                 keptHistoryMessagesCount = nextHistoryMessagesCount;
                 keptToolChainCount = nextToolChainCount;
+                keptHistoryIds = nextHistoryIds.slice();
             }
             if (!isValidPrompt) {
                 stopReason = 'budget';
@@ -752,6 +757,7 @@ export class ChatGPTAPI {
                 ]);
                 nextHistoryMessagesCount += 1 + toolRequestMessages.length;
                 nextToolChainCount += 1;
+                nextHistoryIds = [cursor?.id, ...toolHistoryMessages.map(message => message.id)].concat(nextHistoryIds);
                 continue;
             }
             // 工具轮：本轮用户消息的图片落库时被 _stripImages 换成了 [图片]，
@@ -770,8 +776,45 @@ export class ChatGPTAPI {
                 parentRequestMessage,
                 ...nextMessages.slice(systemMessageOffset)
             ]);
+            nextHistoryIds = [parentMessage.id, ...nextHistoryIds];
             nextHistoryMessagesCount += 1;
         } while (true);
+        // 窗口锚点：按预算回溯得到的「最近 N 条」每轮只挤掉一两条，会让请求前缀整体
+        // 错位、缓存整段失效。改成「头固定、尾部增长」：锚点还在窗口内就从锚点保留；
+        // 锚点滑出去（或首次超预算）时一次性切掉一大段，之后又能稳定很多轮。
+        //
+        // 只处理 budget 路径：那是框架自己算出来的边界，切多少由我们决定。
+        // block_count 是用户在锅巴里显式写的「最多保留多少条」，必须精确遵守，
+        // 不能自作主张再砍 30%。
+        const windowKey = opts.conversationId;
+        let windowCut = false;
+        let windowStart = 0;
+        if (stopReason === 'budget' &&
+            windowKey &&
+            keptHistoryMessagesCount > 0 &&
+            keptHistoryIds.length === keptHistoryMessagesCount) {
+            const anchorId = getHistoryAnchor(windowKey);
+            const anchorIndex = anchorId ? keptHistoryIds.indexOf(anchorId) : -1;
+            if (anchorIndex >= 0) {
+                windowStart = anchorIndex;
+            }
+            else {
+                const cutTo = keptHistoryMessagesCount - Math.max(1, Math.floor(keptHistoryMessagesCount * CUT_RATIO));
+                if (cutTo > 0) {
+                    windowStart = cutTo;
+                    setHistoryAnchor(windowKey, keptHistoryIds[cutTo]);
+                    windowCut = true;
+                }
+            }
+        }
+        if (windowStart > 0) {
+            const historyStart = systemMessageOffset;
+            const historyEnd = systemMessageOffset + keptHistoryMessagesCount;
+            messages = messages.slice(0, historyStart)
+                .concat(messages.slice(historyStart + windowStart, historyEnd))
+                .concat(messages.slice(historyEnd));
+            keptHistoryMessagesCount -= windowStart;
+        }
         const maxTokens = Math.max(1, this._maxResponseTokens);
         const attemptedHistoryMessages = nextHistoryMessagesCount;
         const droppedHistoryMessages = Math.max(0, attemptedHistoryMessages - keptHistoryMessagesCount);
@@ -786,6 +829,8 @@ export class ChatGPTAPI {
                 keptHistoryMessages: keptHistoryMessagesCount,
                 droppedHistoryMessages,
                 keptToolChainCount,
+                windowCut,
+                windowStart,
                 trimmed: droppedHistoryMessages > 0,
                 stopReason
             }

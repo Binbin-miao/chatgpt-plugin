@@ -8,6 +8,7 @@ import { sendToolCallForwardMsg, sendToolRoundTextForwardMsg } from '../utils/to
 import { normalizeModelText } from '../utils/thinking.js'
 import { fetchWithConnectionRetry } from '../utils/network-retry.js'
 import { redactArgsForLog } from '../utils/toolArgRedaction.js'
+import { MAX_HISTORY_MESSAGES, planHistoryWindow } from '../utils/historyWindow.js'
 import { buildClaudeImageBlocks, pickMediaList } from '../utils/visionPayload.js'
 
 const BASEURL = 'https://api.anthropic.com'
@@ -300,6 +301,11 @@ export class ClaudeAPIClient extends BaseClient {
       parentMessageId: opt.parentMessageId || undefined
     }
     history.push(_.cloneDeep(thisMessage))
+    // 历史窗口：Claude 原先不设任何上限（会话保留 30 天，早晚会撑爆上下文，
+    // 而且每轮多带的历史都按全价计费）。用锚点窗口：头固定、尾部增长，
+    // 涨过上限再一次性切掉一大段——切割只发生一次，不会每轮破坏缓存。
+    const windowPlan = planHistoryWindow(history, opt.conversationId, { maxKeep: MAX_HISTORY_MESSAGES })
+    if (windowPlan.start > 0) history = history.slice(windowPlan.start)
     // 本轮群聊环境只进请求：记下当前轮在 history 里的位置，组包时插在它前面；
     // 落库的仍是原始 thisMessage，上下文不会被下一轮当历史重放。
     const turnMessageIndex = history.length - 1
