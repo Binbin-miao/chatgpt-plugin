@@ -68,9 +68,24 @@ const responses = {
   gemini: (text, tool) => ({ candidates: [{ finishReason: 'STOP', content: { role: 'model', parts: tool ? [{ functionCall: { name: 'lookup', args: {} }, thoughtSignature: 'opaque' }] : [{ text }] } }] })
 }
 function requestMessages(type, body) {
-  if (type === 'gemini') return body.contents
-  if (type === 'responses') return body.input
-  return body.messages.filter(m => m.role !== 'system')
+  // 本轮群聊环境是请求级内容（system 保持稳定），不属于会话历史。
+  // 注入位置本身由 providerClients.test.mjs 的专项用例覆盖，这里先剥掉再断言历史。
+  const stripLeadingContext = blocks => {
+    const list = Array.isArray(blocks) ? blocks : [blocks]
+    const isContext = typeof list[0]?.text === 'string' && list[0].text.startsWith('<group_context>')
+    return isContext ? list.slice(1) : blocks
+  }
+  const isContextItem = item => typeof item.content === 'string' && item.content.startsWith('<group_context>')
+
+  if (type === 'gemini') {
+    return body.contents.map(item => ({ ...item, parts: stripLeadingContext(item.parts || []) }))
+  }
+  if (type === 'claude') {
+    return body.messages.filter(m => m.role !== 'system')
+      .map(item => ({ ...item, content: stripLeadingContext(item.content) }))
+  }
+  const items = type === 'responses' ? body.input : body.messages.filter(m => m.role !== 'system')
+  return items.filter(item => !isContextItem(item))
 }
 function textOf(message) {
   if (message.parts) return message.parts.map(p => p.text || '').join('')
@@ -145,7 +160,10 @@ test('Responses 官网续聊只发送增量，工具回填使用本轮 ID；账�
     respond = (body, n) => responses.responses('回答', n === 1)
     const conversation = { messages, previousResponseId: 'previous-turn', actualProviderId: row.id, actualProviderVersion: connectionVersion({ ...row, type: 'responses' }) }
     await core.sendMessage('继续', conversation, row.id, event, { enableSmart: true })
-    assert.equal(requests[0].input, '继续')
+    // 增量轮仍然是单条 input（字符串），上下文并进本轮内容，不新增会话项
+    assert.equal(typeof requests[0].input, 'string')
+    assert.match(requests[0].input, /^<group_context>/)
+    assert.ok(requests[0].input.endsWith('继续'))
     assert.equal(requests[0].previous_response_id, 'previous-turn')
     assert.equal(requests[1].previous_response_id, 'response-tool')
     assert.deepEqual(requests[1].input, [{ type: 'function_call_output', call_id: call.id, output: '查询完成' }])

@@ -300,6 +300,9 @@ export class ClaudeAPIClient extends BaseClient {
       parentMessageId: opt.parentMessageId || undefined
     }
     history.push(_.cloneDeep(thisMessage))
+    // 本轮群聊环境只进请求：记下当前轮在 history 里的位置，组包时插在它前面；
+    // 落库的仍是原始 thisMessage，上下文不会被下一轮当历史重放。
+    const turnMessageIndex = history.length - 1
 
     let pendingUserMessage = thisMessage
     let toolRoundCount = 0
@@ -310,6 +313,19 @@ export class ClaudeAPIClient extends BaseClient {
 
     while (true) {
       const messages = history.map(h => { return { role: h.role, content: h.content } })
+      if (opt.turnContext) {
+        // Anthropic 要求 user/assistant 交替：插一条独立 user 会变成连续两条 user，
+        // 部分中转直接 400。并进本轮 user 的第一个 text block，只改请求副本，
+        // 落库的 history 仍是原始 thisMessage。
+        const turnMessage = messages[turnMessageIndex]
+        const turnBlocks = Array.isArray(turnMessage.content)
+          ? turnMessage.content
+          : [{ type: 'text', text: turnMessage.text || '' }]
+        messages[turnMessageIndex] = {
+          role: 'user',
+          content: [{ type: 'text', text: opt.turnContext }, ...turnBlocks]
+        }
+      }
       const response = await this._createMessage(messages, opt, toolMode)
       if (response.content?.some(item => item.type === 'server_tool_use' || item.type?.endsWith('_tool_result'))) this.onToolStart()
       const idModel = crypto.randomUUID()
