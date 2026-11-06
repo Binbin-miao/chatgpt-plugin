@@ -139,8 +139,30 @@ export class ClaudeAPIClient extends BaseClient {
      * @see https://docs.anthropic.com/claude/reference/messages_post
      */
     let body = {}
-    if (opt.system) {
+    if (Array.isArray(opt.system)) {
       body.system = opt.system
+    } else if (opt.system) {
+      // Anthropic 的 prompt caching 必须显式声明断点：不声明，`cache_read_input_tokens`
+      // 永远为空，日志里的「缓存命中」恒为 0。
+      //
+      // 断点必须落在**稳定段末尾**：本插件的 system 后面还挂着当前时间、message_id 这类
+      // 每轮都变的内容，照 AstrBot 那样直接打在整段末尾会永远对不上。core.js 用
+      // `systemStableLength` 告诉我们稳定段到哪为止，这里据此切成两块；没传时退化为
+      // 单块并把断点打在末尾（与 AstrBot 的 `_apply_explicit_prompt_cache_breakpoints` 一致）。
+      // 低于模型最小可缓存长度时 Anthropic 会直接忽略，不产生额外费用，无需预判长度。
+      const text = String(opt.system)
+      const stableLength = Number.isInteger(opt.systemStableLength)
+        ? Math.max(0, Math.min(opt.systemStableLength, text.length))
+        : text.length
+      if (stableLength === 0) {
+        body.system = [{ type: 'text', text, cache_control: { type: 'ephemeral' } }]
+      } else {
+        body.system = [
+          { type: 'text', text: text.slice(0, stableLength), cache_control: { type: 'ephemeral' } }
+        ]
+        const dynamicPart = text.slice(stableLength)
+        if (dynamicPart) body.system.push({ type: 'text', text: dynamicPart })
+      }
     }
     body = Object.assign(body, {
       model: opt.model || this.model || 'claude-3-opus-20240229',
