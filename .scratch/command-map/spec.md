@@ -77,6 +77,8 @@
 - 只到「插件 + 一句话 + 条数」这一级，单条细节由查询工具按需取；固定成本跟插件数量走，不跟指令总数走。
 - 没有可用地图时注入空串（静默降级，不是错误）。
 - 代执行关闭时，提示词里要说明「只能告诉用户写法，不能替他执行」。
+- 缓存布局：插件摘要与固定工具说明先于身份、群历史、`message_id` 和时间；API / Responses 先 `mergeSystemPrompt(base)` 加 `extraSystemMessage`，再由 `handleSystem()` 追加群上下文，最后追加 `extraSystemDynamic` 与时间。群历史保留，不改 role 会话架构；API 人设附近每日变化的日期暂不调整。
+- Gemini 工具返回由 `functionResponse` 续接，不在递归请求的 system 前插临时说明，原 `NONE` 工具轮次上限保留。缓存取决于实际上游、稳定前缀与窗口，以 usage 验证；不保证命中、省钱或输出质量提升。实现与部署状态见 [ADR-0017](../../docs/adr/0017-prompt-cache-layout.md)。
 
 ### 配置
 
@@ -105,6 +107,8 @@
 - 云端无 version 时不得每轮重拉（旧实现踩过）。
 - 索引把 A 的地图指到 B 的 key 时必须拒收。
 - 默认索引地址被改错时，测试要能红（用真实默认值做断言，而不是测试里另写一份常量）。
+- 缓存前缀：`test/groupReplyCore.test.mjs` 执行真实请求组装，检查 API / Responses 的稳定 addon 先于身份与群历史、不同历史保留共享前缀，并覆盖 0 条历史与压缩重试；`test/promptCacheOrder.test.mjs` 的字符串守卫只作辅助，不充当行为证明。
+- Gemini 工具递归：`test/providerClients.test.mjs` 的真实客户端请求中，非空、空及未提供 system 均不被临时说明改写，工具返回仍由 `functionResponse` 传递，保留 `NONE` 上限。实际缓存命中须部署后看上游 usage，不能由本地回归推定。
 
 ## Out of Scope
 

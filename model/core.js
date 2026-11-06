@@ -531,13 +531,13 @@ class Core {
       let extraSystemDynamic = '' // 动态段：message_id
       let quotedFailed = false
       const buildResponsesInstructions = async (groupContextLength = Config.groupContextLength) => {
-        let instructions = await handleSystem(e, opt.system.responses || Config.responsesSystemPrompt, {
+        // 稳定规则与插件清单必须先于群身份、群历史，否则每轮变化会截断可复用前缀。
+        let instructions = mergeSystemPrompt(opt.system.responses || Config.responsesSystemPrompt, e)
+        if (extraSystemMessage) instructions += extraSystemMessage
+        instructions = await handleSystem(e, instructions, {
           ...opt.settings,
           groupContextLength
         })
-        // 顺序：人设 → 插件清单（稳定）→ message_id → 时间（动态）
-        instructions = mergeSystemPrompt(instructions, e)
-        if (extraSystemMessage) instructions += extraSystemMessage
         if (extraSystemDynamic) instructions += extraSystemDynamic
         instructions += buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
         // 上下文注入来自外部端点、每轮可能变，放在稳定段与动态段之后
@@ -713,15 +713,15 @@ class Core {
       let extraSystemDynamic = '' // 动态段：message_id
       let quotedFailed = false
       const buildOpenAISystem = async (groupContextLength = Config.groupContextLength) => {
-        let system = await handleSystem(e, promptPrefix, {
-          ...opt.settings,
-          groupContextLength
-        })
-        // 顺序：人设 → 插件清单（稳定）→ message_id → 时间（动态）
-        system = mergeSystemPrompt(system, e)
+        // 稳定规则与插件清单必须先于群身份、群历史，否则每轮变化会截断可复用前缀。
+        let system = mergeSystemPrompt(promptPrefix, e)
         if (extraSystemMessage) {
           system += extraSystemMessage
         }
+        system = await handleSystem(e, system, {
+          ...opt.settings,
+          groupContextLength
+        })
         if (extraSystemDynamic) {
           system += extraSystemDynamic
         }
