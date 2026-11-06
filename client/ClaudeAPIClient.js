@@ -364,15 +364,20 @@ export class ClaudeAPIClient extends BaseClient {
             resultContent = `Function ${name} not found.`
             logger.warn(resultContent)
           } else {
-            const execArgs = Object.assign({}, args, {
-              isAdmin: ['admin', 'owner'].includes(this.e?.sender?.role) || (this.e?.group?.is_admin && this.e?.isMaster),
-              sender: this.e?.sender?.user_id,
-              mode: 'claude'
-            })
-            if (!execArgs.groupId) {
-              const defaultGroupId = this.e?.group_id || this.e?.sender?.user_id
-              if (defaultGroupId) {
-                execArgs.groupId = `${defaultGroupId}`
+            let execArgs
+            if (chosenTool.isMcpTool) {
+              execArgs = Object.assign({}, args)
+            } else {
+              execArgs = Object.assign({}, args, {
+                isAdmin: ['admin', 'owner'].includes(this.e?.sender?.role) || (this.e?.group?.is_admin && this.e?.isMaster),
+                sender: this.e?.sender?.user_id,
+                mode: 'claude'
+              })
+              if (!execArgs.groupId) {
+                const defaultGroupId = this.e?.group_id || this.e?.sender?.user_id
+                if (defaultGroupId) {
+                  execArgs.groupId = `${defaultGroupId}`
+                }
               }
             }
             resultContent = await chosenTool.func(execArgs, this.e)

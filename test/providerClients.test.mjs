@@ -18,6 +18,7 @@ const { ChatGPTAPI } = await import('../utils/openai/chatgpt-api.js')
 const { ResponsesAPI } = await import('../utils/openai/responses-api.js')
 const { ClaudeAPIClient } = await import('../client/ClaudeAPIClient.js')
 const { CustomGoogleGeminiClient } = await import('../client/CustomGoogleGeminiClient.js')
+const { McpTool } = await import('../utils/tools/McpTool.js')
 
 const refusals = {
   api: { id: 'a', choices: [{ message: { role: 'assistant', refusal: '拒绝回答' }, finish_reason: 'stop' }] },
@@ -497,4 +498,96 @@ test('api 与 gemini 提供商报错也只抛错，不写入消息历史', async
     )
     assert.deepEqual(upserts, [], `${type} 失败轮不得写入任何消息`)
   }
+})
+
+test('Gemini 与 Claude 调用 McpTool 时不注入 sender/isAdmin/groupId，也不用 mode 覆盖业务参数', async () => {
+  const mcpCalls = []
+  const mcpClient = {
+    async callTool(req) {
+      mcpCalls.push(req)
+      return { content: [{ type: 'text', text: '检索完成' }] }
+    }
+  }
+  const breathTool = new McpTool('ombre-brain', mcpClient, {
+    name: 'breath',
+    description: '无参浮现',
+    inputSchema: { type: 'object', properties: {} }
+  })
+  const searchTool = new McpTool('ombre-brain', mcpClient, {
+    name: 'breath_search',
+    description: '检索记忆',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string' },
+        mode: { type: 'string', default: 'manual' }
+      },
+      required: ['query']
+    }
+  })
+
+  // 1. Gemini 分支：同时覆盖零参 breath 与带同名 mode 参数的 breath_search
+  const geminiHistory = createAttemptHistory('gemini')
+  let geminiRound = 0
+  const gemini = new CustomGoogleGeminiClient({
+    key: 'fixture-key',
+    model: 'fixture-model',
+    config: Config,
+    ...geminiHistory,
+    e: { user_id: '4018425614', group_id: '90001', sender: { user_id: '4018425614', role: 'owner' }, reply: async () => {} },
+    fetch: async () => {
+      geminiRound++
+      const parts = geminiRound === 1
+        ? [
+            { functionCall: { name: 'breath', args: {} } },
+            { functionCall: { name: 'breath_search', args: { query: '约定', mode: 'automatic' } } }
+          ]
+        : [{ text: 'Gemini 完成' }]
+      return Response.json({ candidates: [{ finishReason: 'STOP', content: { role: 'model', parts } }] })
+    }
+  })
+  gemini.addTools([breathTool, searchTool])
+  const geminiRes = await gemini.sendMessage('看看记得什么', { parentMessageId: geminiHistory.parentMessageId })
+  assert.equal(geminiRes.text, 'Gemini 完成')
+  assert.deepEqual(mcpCalls, [
+    { name: 'breath', arguments: {} },
+    { name: 'breath_search', arguments: { query: '约定', mode: 'automatic' } }
+  ])
+
+  // 2. Claude 分支：不得把 mode='claude' 或 groupId/sender/isAdmin 混入 MCP 入参
+  mcpCalls.length = 0
+  const claudeHistory = createAttemptHistory('claude')
+  let claudeRound = 0
+  const claude = new ClaudeAPIClient({
+    key: 'fixture-key',
+    model: 'fixture-model',
+    config: Config,
+    ...claudeHistory,
+    e: { user_id: '4018425614', group_id: '90001', sender: { user_id: '4018425614', role: 'admin' }, reply: async () => {} },
+    fetch: async () => {
+      claudeRound++
+      const body = claudeRound === 1
+        ? {
+            role: 'assistant',
+            stop_reason: 'tool_use',
+            content: [
+              { type: 'tool_use', id: 'tu_1', name: 'breath', input: {} },
+              { type: 'tool_use', id: 'tu_2', name: 'breath_search', input: { query: '柠檬塔', mode: 'manual' } }
+            ]
+          }
+        : {
+            role: 'assistant',
+            stop_reason: 'end_turn',
+            content: [{ type: 'text', text: 'Claude 完成' }]
+          }
+      return Response.json(body)
+    }
+  })
+  claude.addTools([breathTool, searchTool])
+  const claudeRes = await claude.sendMessage('查一下柠檬塔', { parentMessageId: claudeHistory.parentMessageId })
+  assert.equal(claudeRes.text, 'Claude 完成')
+  assert.deepEqual(mcpCalls, [
+    { name: 'breath', arguments: {} },
+    { name: 'breath_search', arguments: { query: '柠檬塔', mode: 'manual' } }
+  ])
 })

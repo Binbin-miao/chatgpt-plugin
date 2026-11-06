@@ -854,22 +854,28 @@ class Core {
               logger.info(`[Chatgpt][API][工具调用][${name}]: ${JSON.stringify(args)}`)
               const toolArgsForForward = redactArgsForLog(name, args)
 
-              if (!args.groupId) {
-                args.groupId = e.group_id + '' || e.sender.user_id + ''
-              }
-              try {
-                parseInt(args.groupId)
-              } catch (err) {
-                args.groupId = e.group_id + '' || e.sender.user_id + ''
-              }
-
               let functionResult = ''
               try {
-                if (funcMap[name.trim()]) {
-                  functionResult = await funcMap[name.trim()].exec.bind(this)(mergeTrustedToolArgs(args, {
-                    isAdmin,
-                    sender
-                  }), e)
+                const entry = funcMap[name.trim()]
+                if (entry) {
+                  let execArgs
+                  if (entry.tool?.isMcpTool) {
+                    execArgs = Object.assign({}, args)
+                  } else {
+                    if (!args.groupId) {
+                      args.groupId = e.group_id + '' || e.sender.user_id + ''
+                    }
+                    try {
+                      parseInt(args.groupId)
+                    } catch (err) {
+                      args.groupId = e.group_id + '' || e.sender.user_id + ''
+                    }
+                    execArgs = mergeTrustedToolArgs(args, {
+                      isAdmin,
+                      sender
+                    })
+                  }
+                  functionResult = await entry.exec.bind(this)(execArgs, e)
                   logger.info(`[Chatgpt][API][工具返回][${name}]: ${JSON.stringify(functionResult)}`)
                 } else {
                   functionResult = `Function ${name} not found.`
@@ -992,17 +998,23 @@ async function executeResponsesToolCalls(core, e, toolCalls, funcMap, isAdmin, s
 
     logger.info(`[Chatgpt][Responses][工具调用][${name}]: ${JSON.stringify(args)}`)
     const toolArgsForForward = redactArgsForLog(name, args)
-    if (!args.groupId) args.groupId = e.group_id + '' || e.sender.user_id + ''
-    try {
-      parseInt(args.groupId)
-    } catch {
-      args.groupId = e.group_id + '' || e.sender.user_id + ''
-    }
-
     let functionResult = ''
     try {
-      if (funcMap[name.trim()]) {
-        functionResult = await funcMap[name.trim()].exec.bind(core)(mergeTrustedToolArgs(args, { isAdmin, sender }), e)
+      const entry = funcMap[name.trim()]
+      if (entry) {
+        let execArgs
+        if (entry.tool?.isMcpTool) {
+          execArgs = Object.assign({}, args)
+        } else {
+          if (!args.groupId) args.groupId = e.group_id + '' || e.sender.user_id + ''
+          try {
+            parseInt(args.groupId)
+          } catch {
+            args.groupId = e.group_id + '' || e.sender.user_id + ''
+          }
+          execArgs = mergeTrustedToolArgs(args, { isAdmin, sender })
+        }
+        functionResult = await entry.exec.bind(core)(execArgs, e)
         logger.info(`[Chatgpt][Responses][工具返回][${name}]: ${JSON.stringify(functionResult)}`)
       } else {
         functionResult = `Function ${name} not found.`

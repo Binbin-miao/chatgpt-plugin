@@ -6,13 +6,21 @@
  *     include 白名单、exclude 黑名单、并存时先 include 后 exclude
  *  2. pickLoadableMcpTools：无冲突全过、同名冲突拒后到者并明确列出归属、
  *     拒载只影响自己、已加载索引只读不被改动
+ *  3. McpTool.sanitizeArgs：不向远端 MCP 透传宿主注入键（sender/isAdmin/groupId/
+ *     mode），按远端 inputSchema 白名单清洗且不误伤业务同名字段；远端未声明
+ *     inputSchema 时回退为仅剥离注入键
  *
  * 运行：node --test test/mcpToolFilter.test.mjs
  */
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
 
+if (!globalThis.logger) {
+  globalThis.logger = { info() {}, warn() {}, error() {}, debug() {} }
+}
+
 import { filterMcpToolsByListRules, pickLoadableMcpTools } from '../utils/mcpToolFilter.js'
+import { McpTool } from '../utils/tools/McpTool.js'
 
 /** 造一个 listTools 形状的工具条目 */
 const tool = name => ({ name, description: `tool ${name}`, inputSchema: { type: 'object', properties: {} } })
@@ -110,5 +118,117 @@ describe('同名冲突检测（pickLoadableMcpTools，先连接者优先）', ()
     const remote = [tool('a')]
     // 索引缺省（首台 server 场景调用方可能传 undefined）视为空，无冲突
     assert.deepEqual(namesOf(pickLoadableMcpTools(remote, undefined).loadable), ['a'])
+  })
+})
+
+describe('McpTool 参数清洗（不向远端 MCP 透传宿主鉴权字段）', () => {
+  function makeMockClient() {
+    const calls = []
+    return {
+      calls,
+      async callTool(req) {
+        calls.push(req)
+        return { content: [{ type: 'text', text: 'ok' }] }
+      }
+    }
+  }
+
+  test('零参数 schema（如 Ombre-Brain breath）：剥离 sender/mode/isAdmin/groupId，转发空对象 {}', async () => {
+    const client = makeMockClient()
+    const breathTool = new McpTool('ombre-brain', client, {
+      name: 'breath',
+      description: '无参浮现',
+      inputSchema: { type: 'object', properties: {}, title: 'breathArguments' }
+    })
+    assert.equal(breathTool.isMcpTool, true)
+    const out = await breathTool.func({
+      sender: '4018425614_9F0132CB823E4AA3156E56F2937463C5',
+      mode: 'gemini',
+      isAdmin: false,
+      groupId: '20001'
+    })
+    assert.equal(out, 'ok')
+    assert.deepEqual(client.calls, [{ name: 'breath', arguments: {} }])
+  })
+
+  test('带声明字段的严格对象 schema：仅保留 properties 白名单且剔除宿主注入的 mode=gemini/claude', async () => {
+    const client = makeMockClient()
+    const searchTool = new McpTool('ombre-brain', client, {
+      name: 'breath_search',
+      description: '检索记忆',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string' },
+          mode: { type: 'string', default: 'manual' }
+        },
+        required: ['query']
+      }
+    })
+    // 兜底路径：即便上层误把宿主字段合并进 args，McpTool 仍剔除 sender/isAdmin/groupId 与插件注入的 mode='gemini'
+    await searchTool.func({
+      query: '柠檬塔',
+      sender: '10001',
+      isAdmin: true,
+      groupId: '20001',
+      mode: 'gemini',
+      undeclaredField: 123
+    })
+    assert.deepEqual(client.calls[0], {
+      name: 'breath_search',
+      arguments: { query: '柠檬塔' }
+    })
+
+    // 正常路径：模型显式传入合法业务 mode（如 automatic/manual）原样保留
+    await searchTool.func({ query: '约定', mode: 'automatic' })
+    assert.deepEqual(client.calls[1], {
+      name: 'breath_search',
+      arguments: { query: '约定', mode: 'automatic' }
+    })
+  })
+
+  test('开放 schema（additionalProperties: true）仍剥离未声明的 sender/isAdmin/groupId，保留其余动态字段', async () => {
+    const client = makeMockClient()
+    const dynamicTool = new McpTool('custom-mcp', client, {
+      name: 'dynamic_call',
+      description: '开放参数',
+      inputSchema: {
+        type: 'object',
+        properties: { action: { type: 'string' } },
+        additionalProperties: true
+      }
+    })
+    await dynamicTool.func({
+      action: 'ping',
+      extraPayload: { a: 1 },
+      sender: '10001',
+      isAdmin: false,
+      groupId: '20001'
+    })
+    assert.deepEqual(client.calls[0], {
+      name: 'dynamic_call',
+      arguments: { action: 'ping', extraPayload: { a: 1 } }
+    })
+  })
+
+  test('远端未声明 inputSchema：回退为仅剥离宿主注入键，业务参数保留', async () => {
+    const client = makeMockClient()
+    const legacyTool = new McpTool('legacy-srv', client, {
+      name: 'legacy_call',
+      description: '未声明 schema 的老工具'
+    })
+    assert.equal(legacyTool.isMcpTool, true)
+    await legacyTool.func({
+      city: '北京',
+      extra: { a: 1 },
+      sender: '10001',
+      isAdmin: false,
+      groupId: '20001',
+      mode: 'gemini'
+    })
+    assert.deepEqual(client.calls[0], {
+      name: 'legacy_call',
+      arguments: { city: '北京', extra: { a: 1 } }
+    })
   })
 })
