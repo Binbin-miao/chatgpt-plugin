@@ -349,7 +349,9 @@ const defaultConfig = {
   ScheduleTask_CronMinInterval: 60,
   ScheduleTask_CronTasks: [],
   rateLimiting: 0,
-  chatgptBlockCount: 200,
+  // 默认取保守值：Claude / Gemini 通道没有 token 预算兜底，条数设太大时
+  // 长消息场景可能直接超出模型上下文。API 通道有 tokenizer 兜底，用户可自行调大。
+  chatgptBlockCount: 50,
   // prompt_cache_retention：交给支持的上游把前缀缓存保留更久（OpenAI 取值 in_memory / 24h）。
   // 默认 24h，避免「隔几分钟才有人说话」的群每次都重新写缓存；填 "" 可关闭。
   promptCacheRetention: '24h',
