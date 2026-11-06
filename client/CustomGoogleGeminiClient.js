@@ -9,6 +9,7 @@ import { syncInnerOs } from '../utils/innerOs.js';
 import { fetchWithConnectionRetry } from '../utils/network-retry.js'
 import { redactArgsForLog } from '../utils/toolArgRedaction.js'
 import { buildGeminiInlineParts, pickMediaList } from '../utils/visionPayload.js'
+import { MAX_HISTORY_MESSAGES, planHistoryWindow } from '../utils/historyWindow.js'
 
 const BASEURL = 'https://generativelanguage.googleapis.com'
 
@@ -238,8 +239,14 @@ export class CustomGoogleGeminiClient extends GoogleGeminiClient {
       }
     }
     history.push(_.cloneDeep(thisMessage))
-    const maxHistoryWithCurrentMessage = maxHistory > 0 ? maxHistory + 1 : 0
-    const normalizedHistory = normalizeGeminiHistory(history, maxHistoryWithCurrentMessage)
+    // 历史窗口：用户显式设了条数上限时按条数精确裁（老行为）；没设（0）时用锚点窗口，
+    // 让「头固定、尾部增长」，避免每轮前滑一格把整段缓存冲掉。
+    let maxHistoryForThisTurn = maxHistory > 0 ? maxHistory + 1 : 0
+    if (!maxHistory) {
+      const windowPlan = planHistoryWindow(history, opt.conversationId, { maxKeep: MAX_HISTORY_MESSAGES })
+      if (windowPlan.start > 0) maxHistoryForThisTurn = history.length - windowPlan.start
+    }
+    const normalizedHistory = normalizeGeminiHistory(history, maxHistoryForThisTurn)
     history = normalizedHistory.history
     if (this.debug && normalizedHistory.changed) {
       logger.info(`[Chatgpt][Gemini] cleaned invalid function-call history: ${JSON.stringify(normalizedHistory.stats)}`)

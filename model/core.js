@@ -22,6 +22,7 @@ import { mergeTrustedToolArgs } from '../utils/tools/AbstractTool.js'
 import { ClaudeAPIClient } from '../client/ClaudeAPIClient.js'
 import { getMessageById, upsertMessage } from '../utils/history.js'
 import { withContextInjection } from '../utils/contextInjection.js'
+import { MAX_HISTORY_MESSAGES, planHistoryWindow } from '../utils/historyWindow.js'
 import { v4 as uuid } from 'uuid'
 import fetch from 'node-fetch'
 import { CustomGoogleGeminiClient } from '../client/CustomGoogleGeminiClient.js'
@@ -635,7 +636,13 @@ class Core {
         ? buildResponsesInput(prompt || '请描述这张图片', quotedMedias)
         : prompt
       const currentInput = Array.isArray(initialInput) ? initialInput : [{ role: 'user', content: initialInput }]
-      if (!Config.responsesStore || !conversation.previousResponseId) initialInput = [...(conversation.messages || []).filter(m => ['user', 'assistant'].includes(m.role)), ...currentInput]
+      // 无状态路径（未开 store，或本会话还没有 previousResponseId）才在本地拼历史；
+      // store 续聊时历史在上游，本地发多少都不影响前缀，窗口自然不适用。
+      if (!Config.responsesStore || !conversation.previousResponseId) {
+        const localHistory = (conversation.messages || []).filter(m => ['user', 'assistant'].includes(m.role))
+        const windowPlan = planHistoryWindow(localHistory, conversation.conversationId, { maxKeep: MAX_HISTORY_MESSAGES })
+        initialInput = [...localHistory.slice(windowPlan.start), ...currentInput]
+      }
       instructions = resolveTurnSystem(opt.prepared, instructions, quotedFailed)
       const statelessToolInput = Array.isArray(initialInput)
         ? [...initialInput]
