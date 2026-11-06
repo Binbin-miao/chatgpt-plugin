@@ -239,13 +239,12 @@ export class CustomGoogleGeminiClient extends GoogleGeminiClient {
       }
     }
     history.push(_.cloneDeep(thisMessage))
-    // 历史窗口：用户显式设了条数上限时按条数精确裁（老行为）；没设（0）时用锚点窗口，
-    // 让「头固定、尾部增长」，避免每轮前滑一格把整段缓存冲掉。
-    let maxHistoryForThisTurn = maxHistory > 0 ? maxHistory + 1 : 0
-    if (!maxHistory) {
-      const windowPlan = planHistoryWindow(history, opt.conversationId, { maxKeep: MAX_HISTORY_MESSAGES })
-      if (windowPlan.start > 0) maxHistoryForThisTurn = history.length - windowPlan.start
-    }
+    // 历史窗口：条数上限定义的是「窗口最多多少条」，不是每轮精确保留多少条——
+    // 后者每轮前滑一格，会把整段缓存冲掉。统一走锚点窗口，未设上限时用默认 600 条。
+    // 条数上限按「历史条数」计，history 里已经含本轮这条，所以上限要 +1
+    const maxKeepForTurn = maxHistory > 0 ? maxHistory + 1 : MAX_HISTORY_MESSAGES
+    const windowPlan = planHistoryWindow(history, opt.conversationId, { maxKeep: maxKeepForTurn })
+    const maxHistoryForThisTurn = windowPlan.start > 0 ? history.length - windowPlan.start : 0
     const normalizedHistory = normalizeGeminiHistory(history, maxHistoryForThisTurn)
     history = normalizedHistory.history
     if (this.debug && normalizedHistory.changed) {
