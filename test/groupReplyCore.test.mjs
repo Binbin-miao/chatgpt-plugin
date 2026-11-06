@@ -163,6 +163,47 @@ test('最新群记录为空或条数为零时，不把被引用的旧消息补�
   assert.equal(selected.message_id, 'selected-message')
 })
 
+test('群聊合成事件没有消息标识时，仍能读取群历史且不把提醒当历史条目', async () => {
+  const { latest } = groupHistoryFixture()
+  // 定时提醒 / 戳一戳这类合成事件不是群里的真实消息：没有 message_id、seq、raw_message。
+  // 历史接口返回的消息这些字段是齐的（NapCat 必填），缺字段的只有我们拼的 e，
+  // 所以它既不能当翻页起点，也不能作为历史条目渲染——曾经 raw_message.startsWith
+  // 直接抛错，整段群历史被 catch 丢弃，日志只剩「获取群聊聊天记录失败」。
+  const reminder = {
+    isGroup: true, group_id: '100', self_id: '999', user_id: '123',
+    sender: { user_id: '123', role: 'member', nickname: '定时任务' },
+    message: [], reply() {},
+    group: {
+      group_id: '100', name: '测试群', pickMember: () => ({ card: '派蒙' }),
+      async getChatHistory(seq, count) {
+        return seq === 0 ? latest.slice(-count) : []
+      }
+    }
+  }
+  await core.sendMessage('叮！您设定的定时提醒：', {}, 'api', reminder, {
+    enableSmart: false, settings: { enableGroupContext: true }
+  })
+  const system = requests.at(-1).options.systemMessage
+  assert.match(system, /蓝牙耳机/)
+  assert.match(system, /打游戏突然没声音了，但是麦克风还能用/)
+  assert.doesNotMatch(system, /说：undefined/)
+  assert.doesNotMatch(system, /messageId: undefined/)
+})
+
+test('没有消息标识的合成事件不进入群历史', async () => {
+  const { selected, latest, historyCalls } = groupHistoryFixture()
+  const synthetic = { ...selected, message_id: undefined, seq: undefined, time: undefined, raw_message: undefined }
+
+  const chats = await msgHistoryMgr.getGroupHistoryContext(synthetic, 20)
+
+  // 没有 seq 就走最新一页（message_seq 传 0），并取满整个窗口
+  assert.deepEqual(historyCalls, [{ seq: 0, count: 20 }])
+  assert.equal(chats.length, latest.length)
+  assert.ok(!chats.includes(synthetic))
+  assert.ok(chats.every(chat => typeof chat.raw_message === 'string'))
+  assert.deepEqual(await msgHistoryMgr.getGroupHistoryContext({ ...synthetic, group: undefined }, 20), [])
+})
+
 for (const provider of ['api', 'responses']) {
   test(`${provider} 上下文超限重试仍读取最新记录并保留引用身份`, async t => {
     const { selected, historyCalls } = groupHistoryFixture()

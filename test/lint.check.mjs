@@ -25,6 +25,10 @@
  * 7. `model/core.js` 里不得出现 `tools.push(new XxxTool(...))`：工具注册统一走 `optionalTools`
  *    的 `{ condition, ToolClass }`。AGENTS.md「工具注册由配置开关控制」原本只写在文档里，于是
  *    「常驻注册」照样能写进代码、三道静态门禁全绿，只有人工评审才抓得到（本轮实证）。
+ * 8. 代码注释与 `.scratch`、`docs` 的 markdown、根指南文件里的仓库内路径引用（`docs/`、
+ *    `.scratch/` 开头）必须真实存在——文档改名/删除后残留的旧路径会误导按指针找材料的窗口；
+ *    `docs/adr/<编号>` 编号简称按数字前缀匹配对应文件（如 `docs/adr/0016`）。「路径存在但
+ *    内容是否支撑断言」是章节级判断，机械查不了，留在评审（AGENTS.md「逐个打开核对」规则）。
  */
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
@@ -41,8 +45,52 @@ const NO_CONSOLE_LOG_DIRS = ['client/', 'model/']
 const JSDOC_SAME_LINE_RE = /\*\/[ \t]+(?:const|let|var|function|async[ \t]+function|export|class)\b/
 const CAMEL_LOG_PREFIX_RE = /\blogger\.(?:info|warn|error|mark|debug|blue|cyan|red)\(\s*['"`]\[([a-z][A-Za-z0-9]*)\]/
 const CONSOLE_LOG_RE = /\bconsole\.log\(/
+// 规则 7：根锚定的仓库内路径引用（`docs/…`、`.scratch/…`）。相对路径（`../adr/…`）不查，
+// 锚定基会随文件位置漂移；只查「从仓库根写」的形态，也是本仓注释与 spec 的主流写法。
+// 注意 `\.` 后面的 scratch 不能再带反斜杠——`\s` 是空白类，会把整个分支打死（踩过）。
+const PATH_REF_RE = /(?<![/\w])((?:docs|\.scratch)\/[\w\u4e00-\u9fff./-]+)/g
+const PATH_REF_MD_DIRS = ['docs', '.scratch']
+const PATH_REF_ROOT_MDS = ['AGENTS.md', 'README.md', 'CLAUDE.md', 'GLOSSARY.md']
 
 const violations = []
+
+// 与 checkSyntax.mjs 同款：Windows 的 existsSync 不分大小写，按大小写严格比对
+const refDirCache = new Map()
+function refExistsExactCase(target) {
+  const dir = path.dirname(target)
+  if (!refDirCache.has(dir)) {
+    try {
+      refDirCache.set(dir, new Set(readdirSync(dir)))
+    } catch {
+      refDirCache.set(dir, null)
+    }
+  }
+  const names = refDirCache.get(dir)
+  return names ? names.has(path.basename(target)) : false
+}
+
+/** `docs/adr/0016` 这类无扩展名编号简称：docs/adr 下存在 `0016-` 开头的文件即有效 */
+function adrNumberRefExists(token) {
+  const match = /^docs\/adr\/(\d{4})$/.exec(token)
+  if (!match) return false
+  try {
+    return readdirSync(path.join(ROOT, 'docs', 'adr')).some(name => name.startsWith(`${match[1]}-`))
+  } catch {
+    return false
+  }
+}
+
+function checkPathRefs(relative, line, index) {
+  for (const match of line.matchAll(PATH_REF_RE)) {
+    // 句尾标点（英文句号）与结尾斜杠不属路径；token 本体按仓库根解析
+    const token = match[1].replace(/[./]+$/, '')
+    if (!token) continue
+    const target = path.resolve(ROOT, token)
+    if (!refExistsExactCase(target) && !adrNumberRefExists(token)) {
+      violations.push(`${relative}:${index + 1} 仓库内路径引用不存在: ${token}`)
+    }
+  }
+}
 
 function scanFile(file) {
   const text = readFileSync(file, 'utf8')
@@ -57,6 +105,11 @@ function scanFile(file) {
     const camelLog = CAMEL_LOG_PREFIX_RE.exec(line)
     if (camelLog && /[A-Z]/.test(camelLog[1])) {
       violations.push(`${relative}:${index + 1} 日志前缀 "${camelLog[1]}" 是 camelCase；改全小写或 "[ChatGPT][子模块]"`)
+    }
+    // 规则 7：注释行里的仓库内路径引用（代码本体与字符串不查，避免误伤合法数据）
+    const commentTrimmed = line.trim()
+    if (commentTrimmed.startsWith('//') || commentTrimmed.startsWith('/*') || commentTrimmed.startsWith('*')) {
+      checkPathRefs(relative, line, index)
     }
     if (!forbidConsoleLog) return
     const trimmed = line.trim()
@@ -91,6 +144,50 @@ for (const dir of SCAN_DIRS) {
 for (const file of SCAN_FILES) {
   try {
     if (statSync(path.join(ROOT, file)).isFile()) scanFile(path.join(ROOT, file))
+  } catch {
+    // 同上
+  }
+}
+
+// 规则 7 的 markdown 扫描面：docs/ 与 .scratch/ 下全部 .md 逐行查，根指南文件同查
+function walkMarkdown(dir) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      if (SKIP_DIRS.has(entry.name)) continue
+      walkMarkdown(path.join(dir, entry.name))
+      continue
+    }
+    if (!entry.isFile() || !entry.name.endsWith('.md')) continue
+    const file = path.join(dir, entry.name)
+    const text = readFileSync(file, 'utf8')
+    if (text.length > 512 * 1024) continue
+    const relative = path.relative(ROOT, file).split(path.sep).join('/')
+    text.split('\n').forEach((line, index) => {
+      if (line.includes('lint-ignore')) return
+      checkPathRefs(relative, line, index)
+    })
+  }
+}
+for (const dir of PATH_REF_MD_DIRS) {
+  const absolute = path.join(ROOT, dir)
+  try {
+    if (statSync(absolute).isDirectory()) walkMarkdown(absolute)
+  } catch {
+    // 目录不存在就跳过：分支裁剪后可能出现
+  }
+}
+for (const file of PATH_REF_ROOT_MDS) {
+  const absolute = path.join(ROOT, file)
+  try {
+    if (statSync(absolute).isFile()) {
+      const text = readFileSync(absolute, 'utf8')
+      if (text.length <= 512 * 1024) {
+        text.split('\n').forEach((line, index) => {
+          if (line.includes('lint-ignore')) return
+          checkPathRefs(file, line, index)
+        })
+      }
+    }
   } catch {
     // 同上
   }
@@ -185,4 +282,4 @@ if (violations.length) {
   for (const item of violations) console.error('  - ' + item)
   process.exit(1)
 }
-console.log('[ChatGPT] 风格检查通过：JSDoc 换行、日志前缀、console.log 边界、测试挂载、脚本路径、套件接线、调试残留、工具注册条件')
+console.log('[ChatGPT] 风格检查通过：JSDoc 换行、日志前缀、console.log 边界、路径引用存在性、测试挂载、脚本路径、套件接线、调试残留、工具注册条件')

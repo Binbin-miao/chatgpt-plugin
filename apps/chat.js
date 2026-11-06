@@ -975,7 +975,10 @@ export class chatgpt extends plugin {
     let conversation = {}
     const key = providerConversationKey(profile, e.isGroup && config.groupMerge ? e.group_id.toString() : e.sender.user_id)
     let ctime = new Date()
-    previousConversation = (key ? await redis.get(key) : null) || JSON.stringify({
+    // 「Redis 中无该会话」判定先例：作为会话首轮标志传下去，供 when:"session"
+    // 的上下文注入条目触发（docs/adr/0016）；#结束对话或过期后下一轮重新为真
+    const savedConversation = key ? await redis.get(key) : null
+    previousConversation = savedConversation || JSON.stringify({
       sender: e.sender,
       ctime,
       utime: ctime,
@@ -1001,7 +1004,8 @@ export class chatgpt extends plugin {
       invocationId: previousConversation.invocationId,
       conversationSignature: previousConversation.conversationSignature,
       bingToken: previousConversation.bingToken,
-      replyTimestamps: previousConversation.replyTimestamps || []
+      replyTimestamps: previousConversation.replyTimestamps || [],
+      isNewConversation: !savedConversation
     }
 
     let handler = this.e.runtime?.handler || {

@@ -134,4 +134,9 @@ describe('core.js 不得回退到不安全的合并顺序或执行超集', () =>
     const buildFuncMapCalls = source.match(/buildFuncMap\(/g) || []
     assert.equal(buildFuncMapCalls.length, 1, '只应存在一份工具查找表（广告集 = 执行集）')
   })
+
+  test('两个执行点均对 isMcpTool 分流，不把 groupId/isAdmin/sender 注入远端 MCP 工具', () => {
+    const mcpBranches = source.match(/entry\.tool\?\.isMcpTool/g) || []
+    assert.equal(mcpBranches.length, 2, `期望 Chat Completions 与 Responses 两处均对 isMcpTool 分流，实际 ${mcpBranches.length}`)
+  })
 })

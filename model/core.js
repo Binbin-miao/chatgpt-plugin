@@ -22,6 +22,7 @@ import { APTool } from '../utils/tools/APTool.js'
 import { mergeTrustedToolArgs } from '../utils/tools/AbstractTool.js'
 import { ClaudeAPIClient } from '../client/ClaudeAPIClient.js'
 import { getMessageById, upsertMessage } from '../utils/history.js'
+import { withContextInjection } from '../utils/contextInjection.js'
 import { v4 as uuid } from 'uuid'
 import fetch from 'node-fetch'
 import { CustomGoogleGeminiClient } from '../client/CustomGoogleGeminiClient.js'
@@ -167,12 +168,14 @@ async function handleSystem(e, system, settings) {
         system += chats
           .map(chat => {
             let sender = chat.sender || {}
-            // if (sender.user_id === e.bot.uin && chat.raw_message.startsWith('建议的回复')) {
-            if (chat.raw_message.startsWith('建议的回复')) {
+            // 历史条目由各 adapter 的接口返回，字段并不总是齐全（NapCat 是必填，别家未必）：
+            // 直接 startsWith 会抛错，整段群历史被 catch 丢弃，日志只剩「获取群聊聊天记录失败」。
+            const rawMessage = typeof chat.raw_message === 'string' ? chat.raw_message : ''
+            if (rawMessage.startsWith('建议的回复')) {
               // 建议的回复太容易污染设定导致对话太固定跑偏了
               return ''
             }
-            return `【${sender.card || sender.nickname}】(qq：${sender.user_id}, ${roleMap[sender.role] || 'normal user'}，${sender.area ? 'from ' + sender.area + ', ' : ''} ${sender.age} years old, 群头衔：${sender.title}, gender: ${sender.sex}, time：${formatDate(new Date(chat.time * 1000))}, messageId: ${chat.message_id}) 说：${chat.raw_message}`
+            return `【${sender.card || sender.nickname}】(qq：${sender.user_id}, ${roleMap[sender.role] || 'normal user'}，${sender.area ? 'from ' + sender.area + ', ' : ''} ${sender.age} years old, 群头衔：${sender.title}, gender: ${sender.sex}, time：${formatDate(new Date(chat.time * 1000))}, messageId: ${chat.message_id}) 说：${rawMessage}`
           })
           .join('\n')
       }
@@ -387,7 +390,9 @@ class Core {
         option.system = system
         const quoted = await collectQuotedImages(e, opt.prepared)
         applyQuotedMedias(option, quoted.medias)
-        // 缓存只存基础 system；提示按本次尝试单独追加（prepared 跨主备复用）
+        // 上下文注入：文本记忆在 prepared 上，一轮只拉取一次（docs/adr/0016）
+        option.system = await withContextInjection(opt.prepared, Config, option.system, conversation)
+        // 缓存存基础 system（含上下文注入文本）；提示按本次尝试单独追加（prepared 跨主备复用）
         option.system = appendGroupAutoReplyPrompt(resolveTurnSystem(opt.prepared, option.system, quoted.failed > 0), opt)
         return await client.sendMessage(promptForClaude, option)
       }
@@ -478,6 +483,7 @@ class Core {
       option.sf_markdownPic = Config.sf_markdownPic
       option.auto_makeForwardMsg = Config.auto_makeForwardMsg
 
+      option.system = await withContextInjection(opt.prepared, Config, option.system, conversation)
       option.system = appendGroupAutoReplyPrompt(resolveTurnSystem(opt.prepared, option.system, quotedFailed), opt)
       return await client.sendMessage(prompt, option)
     } else if (use === 'responses') { // OpenAI Responses API ##############################
@@ -495,6 +501,7 @@ class Core {
         })
         instructions = mergeSystemPrompt(instructions, e, { replyTimestamps: conversation.replyTimestamps })
         if (extraSystemMessage) instructions += extraSystemMessage
+        instructions = await withContextInjection(opt.prepared, Config, instructions, conversation)
         return appendGroupAutoReplyPrompt(instructions, opt)
       }
 
@@ -672,9 +679,10 @@ class Core {
         if (extraSystemMessage) {
           system += extraSystemMessage
         }
+        system = await withContextInjection(opt.prepared, Config, system, conversation)
         return appendGroupAutoReplyPrompt(system, opt)
       }
-      // 引用图先取：失败提示按每次尝试单独追加（缓存只存基础 system）
+      // 引用图先取：失败提示按每次尝试单独追加（缓存存基础 system，含上下文注入文本）
       const quoted = await collectQuotedImages(e, opt.prepared)
       const quotedMedias = quoted.medias
       quotedFailed = quoted.failed > 0
@@ -859,22 +867,28 @@ class Core {
               logger.info(`[Chatgpt][API][工具调用][${name}]: ${JSON.stringify(args)}`)
               const toolArgsForForward = redactArgsForLog(name, args)
 
-              if (!args.groupId) {
-                args.groupId = e.group_id + '' || e.sender.user_id + ''
-              }
-              try {
-                parseInt(args.groupId)
-              } catch (err) {
-                args.groupId = e.group_id + '' || e.sender.user_id + ''
-              }
-
               let functionResult = ''
               try {
-                if (funcMap[name.trim()]) {
-                  functionResult = await funcMap[name.trim()].exec.bind(this)(mergeTrustedToolArgs(args, {
-                    isAdmin,
-                    sender
-                  }), e)
+                const entry = funcMap[name.trim()]
+                if (entry) {
+                  let execArgs
+                  if (entry.tool?.isMcpTool) {
+                    execArgs = Object.assign({}, args)
+                  } else {
+                    if (!args.groupId) {
+                      args.groupId = e.group_id + '' || e.sender.user_id + ''
+                    }
+                    try {
+                      parseInt(args.groupId)
+                    } catch (err) {
+                      args.groupId = e.group_id + '' || e.sender.user_id + ''
+                    }
+                    execArgs = mergeTrustedToolArgs(args, {
+                      isAdmin,
+                      sender
+                    })
+                  }
+                  functionResult = await entry.exec.bind(this)(execArgs, e)
                   logger.info(`[Chatgpt][API][工具返回][${name}]: ${JSON.stringify(functionResult)}`)
                 } else {
                   functionResult = `Function ${name} not found.`
@@ -997,17 +1011,23 @@ async function executeResponsesToolCalls(core, e, toolCalls, funcMap, isAdmin, s
 
     logger.info(`[Chatgpt][Responses][工具调用][${name}]: ${JSON.stringify(args)}`)
     const toolArgsForForward = redactArgsForLog(name, args)
-    if (!args.groupId) args.groupId = e.group_id + '' || e.sender.user_id + ''
-    try {
-      parseInt(args.groupId)
-    } catch {
-      args.groupId = e.group_id + '' || e.sender.user_id + ''
-    }
-
     let functionResult = ''
     try {
-      if (funcMap[name.trim()]) {
-        functionResult = await funcMap[name.trim()].exec.bind(core)(mergeTrustedToolArgs(args, { isAdmin, sender }), e)
+      const entry = funcMap[name.trim()]
+      if (entry) {
+        let execArgs
+        if (entry.tool?.isMcpTool) {
+          execArgs = Object.assign({}, args)
+        } else {
+          if (!args.groupId) args.groupId = e.group_id + '' || e.sender.user_id + ''
+          try {
+            parseInt(args.groupId)
+          } catch {
+            args.groupId = e.group_id + '' || e.sender.user_id + ''
+          }
+          execArgs = mergeTrustedToolArgs(args, { isAdmin, sender })
+        }
+        functionResult = await entry.exec.bind(core)(execArgs, e)
         logger.info(`[Chatgpt][Responses][工具返回][${name}]: ${JSON.stringify(functionResult)}`)
       } else {
         functionResult = `Function ${name} not found.`

@@ -509,14 +509,19 @@ export class CustomGoogleGeminiClient extends GoogleGeminiClient {
         } else {
           // execute function
           try {
-            let isAdmin = ['admin', 'owner'].includes(this.e.sender.role) || (this.e.group?.is_admin && this.e.isMaster)
-            // let isOwner = ['owner'].includes(this.e.sender.role) || (this.e.group?.is_owner && this.e.isMaster)
-            let args = Object.assign({}, toolArgsForForward, {
-              isAdmin,
-              // isOwner,
-              sender: this.e.sender.user_id,
-              mode: 'gemini'
-            })
+            let args
+            if (chosenTool.isMcpTool) {
+              args = Object.assign({}, toolArgsForForward)
+            } else {
+              let isAdmin = ['admin', 'owner'].includes(this.e.sender.role) || (this.e.group?.is_admin && this.e.isMaster)
+              // let isOwner = ['owner'].includes(this.e.sender.role) || (this.e.group?.is_owner && this.e.isMaster)
+              args = Object.assign({}, toolArgsForForward, {
+                isAdmin,
+                // isOwner,
+                sender: this.e.sender.user_id,
+                mode: 'gemini'
+              })
+            }
             functionResponse.response.content = await chosenTool.func(args, this.e)
             logger.info(`[Chatgpt][Gemini][工具返回][${funcName}]: ${JSON.stringify(functionResponse.response.content)}`)
           } catch (err) {
