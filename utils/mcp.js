@@ -7,6 +7,8 @@ import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { Config } from './config.js'
 import { McpTool } from './tools/McpTool.js'
+import { buildMcpTransportOptions } from './mcpHeaders.js'
+import { filterMcpToolsByListRules, pickLoadableMcpTools } from './mcpToolFilter.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(__dirname, '..');
@@ -42,6 +44,9 @@ class McpManager {
       return
     }
 
+    // 工具名 → 已加载该工具的 server 名：同名冲突时先连接者保留原名，后连接者拒载
+    const loadedToolOwners = new Map()
+
     for (const [name, serverConfig] of Object.entries(servers)) {
       if (!serverConfig || typeof serverConfig !== 'object') {
         continue
@@ -75,14 +80,26 @@ class McpManager {
             continue
           }
           logger.info(`[Chatgpt][mcp] 服务器 [${name}] 使用 Streamable HTTP 协议，连接地址: ${serverConfig.url}`)
-          transport = new StreamableHTTPClientTransport(new URL(serverConfig.url))
+          // headers 鉴权（如 Bearer token）：未配置时为 undefined，与省略该参数等价，行为不变
+          const transportOptions = buildMcpTransportOptions(serverConfig.headers)
+          if (transportOptions) {
+            // 键名入日志便于排障（区分没读到 headers 还是凭证不对）；值可能含密钥，不打印
+            logger.info(`[Chatgpt][mcp] 服务器 [${name}] 已配置自定义请求头: ${Object.keys(transportOptions.requestInit.headers).join(', ')}`)
+          }
+          transport = new StreamableHTTPClientTransport(new URL(serverConfig.url), transportOptions)
         } else if (transportType === 'sse') {
           if (!serverConfig.url) {
             logger.warn(`[Chatgpt][mcp] 服务器 [${name}] SSE 配置无效，必须包含 url`)
             continue
           }
           logger.info(`[Chatgpt][mcp] 服务器 [${name}] 使用 SSE 协议，连接地址: ${serverConfig.url}`)
-          transport = new SSEClientTransport(new URL(serverConfig.url))
+          // headers 鉴权（如 Bearer token）：未配置时为 undefined，与省略该参数等价，行为不变
+          const transportOptions = buildMcpTransportOptions(serverConfig.headers)
+          if (transportOptions) {
+            // 键名入日志便于排障（区分没读到 headers 还是凭证不对）；值可能含密钥，不打印
+            logger.info(`[Chatgpt][mcp] 服务器 [${name}] 已配置自定义请求头: ${Object.keys(transportOptions.requestInit.headers).join(', ')}`)
+          }
+          transport = new SSEClientTransport(new URL(serverConfig.url), transportOptions)
         } else if (transportType === 'stdio') {
           if (!serverConfig.command) {
             logger.warn(`[Chatgpt][mcp] 服务器 [${name}] Stdio 配置无效，必须包含 command`)
@@ -124,10 +141,22 @@ class McpManager {
         const toolsResult = await client.listTools()
         let loadedCount = 0
         if (toolsResult && Array.isArray(toolsResult.tools)) {
-          for (const t of toolsResult.tools) {
+          // 先按条目 include/exclude 裁剪工具面，再做同名冲突检测：
+          // 被裁掉的工具不参与冲突判定，裁剪正是主人绕开冲突的手段
+          const filteredTools = filterMcpToolsByListRules(toolsResult.tools, serverConfig.include, serverConfig.exclude)
+          const { loadable, conflicts } = pickLoadableMcpTools(filteredTools, loadedToolOwners)
+          for (const conflict of conflicts) {
+            logger.warn(`[Chatgpt][mcp] 服务器 [${name}] 的工具 [${conflict.name}] 与已加载的服务器 [${conflict.existingServer}] 的同名工具冲突，拒绝加载该工具；可用条目的 include/exclude 裁剪工具面绕开`)
+          }
+          for (const t of loadable) {
             const mcpTool = new McpTool(name, client, t)
             this.tools.push(mcpTool)
+            loadedToolOwners.set(t.name, name)
             loadedCount++
+          }
+          const skippedCount = toolsResult.tools.length - loadedCount
+          if (skippedCount > 0) {
+            logger.info(`[Chatgpt][mcp] 服务器 [${name}] 按配置过滤或同名冲突拒载，跳过 ${skippedCount} 个工具`)
           }
         }
 

@@ -6,6 +6,7 @@ import { avatarOptions } from './utils/avatar/catalog.js'
 import { speakers, vits_emotion_map } from './utils/tts.js'
 import { supportConfigurations as azureRoleList } from './utils/tts/microsoft-azure.js'
 import { formatMcpServersForGuoba, stringifyMcpServersFromGuoba } from './utils/mcpServersGuoba.js'
+import { formatHookServersForGuoba, stringifyHookServersFromGuoba } from './utils/hookServersGuoba.js'
 import { RECALL_MODE_ALL } from './utils/memory/recallMode.js'
 import { MemoryStore } from './utils/memory/store.js'
 import { scheduleRawMigration } from './utils/memory/autoMigrate.js'
@@ -2081,6 +2082,119 @@ export function supportGuoba() {
                 componentProps: {
                   placeholder: 'NAMESPACE=default'
                 }
+              },
+              {
+                field: 'headers',
+                label: '请求头',
+                bottomHelpMessage: '若使用 http/sse 的自定义请求头（如鉴权），每行一个 KEY=value；value 中可以包含 =，支持 ${ENV_VAR} 引用环境变量（如密钥），明文直填同样有效；stdio 类型忽略；示例：Authorization=Bearer ${MCP_TOKEN}',
+                component: 'InputTextArea',
+                componentProps: {
+                  placeholder: 'Authorization=Bearer ${MCP_TOKEN}'
+                }
+              },
+              {
+                field: 'include',
+                label: '工具白名单',
+                bottomHelpMessage: '可选。只加载列出的工具名，每行一个；留空表示不限制；与黑名单并存时先按白名单过滤再按黑名单剔除；两个 server 提供同名工具时可用它裁剪其中一个的工具面',
+                component: 'InputTextArea',
+                componentProps: {
+                  placeholder: 'memory_search'
+                }
+              },
+              {
+                field: 'exclude',
+                label: '工具黑名单',
+                bottomHelpMessage: '可选。不加载列出的工具名，每行一个；留空表示不剔除；两个 server 提供同名工具时，先连接者保留，后连接者的重名工具会被拒绝加载，可用它绕开冲突',
+                component: 'InputTextArea',
+                componentProps: {
+                  placeholder: 'legacy_tool'
+                }
+              }
+            ]
+          },
+        },
+        {
+          field: 'enableHooks',
+          label: '启用上下文注入',
+          bottomHelpMessage: '每轮（或会话首轮）把 hookServers 各条目端点的响应追加进 system 提示末尾；服务失败只跳过该条目，不影响对话；修改后需重启生效',
+          component: 'Switch'
+        },
+        {
+          field: 'hookServers',
+          label: '上下文注入条目',
+          bottomHelpMessage: '配置注入条目列表：url 填完整端点地址（含路径），或填 server 引用 mcpServers 同名条目的地址；headers 支持密钥；修改后需要重启生效',
+          component: 'GSubForm',
+          componentProps: {
+            multiple: true,
+            schemas: [
+              {
+                field: 'enabled',
+                label: '启用',
+                defaultValue: true,
+                bottomHelpMessage: '关闭后跳过该条目，不删除配置',
+                component: 'Switch'
+              },
+              {
+                field: 'url',
+                label: 'URL',
+                bottomHelpMessage: '完整端点地址（含路径）；与 server 二选一，同时填写时 url 优先',
+                component: 'Input',
+                componentProps: {
+                  placeholder: 'http://127.0.0.1:18011/breath-hook'
+                }
+              },
+              {
+                field: 'server',
+                label: '引用 MCP 服务器',
+                bottomHelpMessage: '填 mcpServers 里的条目名，复用其 url（只取配置值，不要求该 server 已连接）；与 url 二选一',
+                component: 'Input',
+                componentProps: {
+                  placeholder: 'ombre_brain'
+                }
+              },
+              {
+                field: 'headers',
+                label: '请求头',
+                bottomHelpMessage: '每行一个 KEY=value，value 中可以包含 =；value 支持 ${ENV_VAR} 引用环境变量（如密钥），明文直填同样有效；示例：Authorization=Bearer ${OMBRE_TOKEN}',
+                component: 'InputTextArea',
+                componentProps: {
+                  placeholder: 'Authorization=Bearer ${OMBRE_TOKEN}'
+                }
+              },
+              {
+                field: 'timeout',
+                label: '超时（毫秒）',
+                defaultValue: 3000,
+                bottomHelpMessage: '拉取该条目的超时时间，默认 3000 毫秒；超时/失败只跳过本条目',
+                component: 'InputNumber',
+                componentProps: {
+                  min: 1,
+                  step: 100
+                }
+              },
+              {
+                field: 'maxChars',
+                label: '最大字符数',
+                defaultValue: 10000,
+                bottomHelpMessage: '注入文本超过该长度时硬截断并追加截断提示，默认 10000；带优先级的截断应由服务端做',
+                component: 'InputNumber',
+                componentProps: {
+                  min: 1,
+                  step: 1000
+                }
+              },
+              {
+                field: 'when',
+                label: '注入时机',
+                defaultValue: 'turn',
+                bottomHelpMessage: 'turn=每轮注入；session=仅会话首轮注入（以 Redis 会话为准：#结束对话 或会话过期后下一条消息重新触发；重启插件不重置首轮判定）',
+                component: 'Select',
+                componentProps: {
+                  options: [
+                    { label: '每轮（turn）', value: 'turn' },
+                    { label: '会话首轮（session）', value: 'session' }
+                  ]
+                }
               }
             ]
           },
@@ -2965,6 +3079,7 @@ export function supportGuoba() {
         configObj.initiativeChatGroups = normalizeGroupIds(Config.initiativeChatGroups).map(Number)
         configObj.avatarReply = normalizeAvatarReplyConfig(configObj.avatarReply)
         configObj.mcpServers = formatMcpServersForGuoba(configObj.mcpServers)
+        configObj.hookServers = formatHookServersForGuoba(configObj.hookServers)
 
         return configObj
       },
@@ -2990,6 +3105,13 @@ export function supportGuoba() {
                 value = stringifyMcpServersFromGuoba(value)
               } catch (err) {
                 return Result.error(`MCP 服务器配置保存失败: ${err.message}`)
+              }
+            }
+            if (keyPath === 'hookServers') {
+              try {
+                value = stringifyHookServersFromGuoba(value)
+              } catch (err) {
+                return Result.error(`上下文注入条目保存失败: ${err.message}`)
               }
             }
             // tags 下拉交回的就是数组，这里只做去空白与去重；空列表 = 不启用

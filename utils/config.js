@@ -395,6 +395,12 @@ const defaultConfig = {
   }
 }`, // 通用 MCP 服务器的配置列表，JSON 格式
 
+  // 上下文注入（Context Injection）：每轮/会话首轮把 hookServers 条目的响应追加进 system 末尾（docs/adr/0016）
+  enableHooks: false, // 是否启用上下文注入；条目列表见 hookServers，修改后需重启生效
+  hookServers: `{
+  "hookServers": []
+}`, // 上下文注入条目列表，JSON 格式；条目字段 enabled/url(或 server 引用)/headers/timeout/maxChars/when，面板可编辑
+
   // AnythingLLM 知识库配置
   anythingllm_enable: false, // 是否启用 AnythingLLM 知识库功能
   anythingllm_baseUrl: 'http://localhost:3001', // AnythingLLM 服务地址

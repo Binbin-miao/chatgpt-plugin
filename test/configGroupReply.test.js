@@ -63,6 +63,7 @@ test('锅巴群聊判断表格、内置提示词、数值边界与保存后重�
     assert.match(wait.label, /每隔多久判断是否回复/)
     assert.ok(!guoba.schemas.some(s => s.field === 'groupReply.debounceSeconds'))
     const tabs = guoba.schemas.filter(s => s.component === 'SOFT_GROUP_BEGIN').map(s => s.label)
+    // 上下文注入字段（enableHooks/hookServers）并入智能模式组、紧跟 MCP 配置，无独立分组
     assert.deepEqual(tabs.slice(tabs.indexOf('智能模式'), tabs.indexOf('小功能') + 1), ['智能模式', '主动触发', '小功能'])
     let tab
     for (const schema of guoba.schemas) {
