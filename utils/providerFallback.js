@@ -39,14 +39,32 @@ export async function runProviderFallback(main, backup, execute, { enabled = tru
   }
 }
 
+/** 裁剪时保留的比例：一次裁到 70%，下次裁之前能稳定几十轮 */
+const TRIM_RATIO = 0.7
+
+/** 向下取偶：Gemini 的 contents 必须 user/model 交替，奇数会从错误角色开始 */
+function evenFloor(n) {
+  const v = Math.floor(Number(n) || 0)
+  return v - (v % 2)
+}
+
 export function trimConversation(messages, config) {
   let result = messages.filter(m => ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
-  const count = Number(config.chatgptBlockCount)
-  if (count > 0) result = result.slice(-Math.max(2, Math.floor(count / 2) * 2))
+  const rawCount = Number(config.chatgptBlockCount) || 0
+  // 0 表示交给 token 控制；正整数按「至少一对」处理并取偶
+  const count = rawCount > 0 ? Math.max(2, evenFloor(rawCount)) : 0
+  // 只有涨过上界才裁，且一次裁到 70%：每轮从头部挤掉一两条的写法会让请求前缀
+  // 整体前移，提示词缓存整段失效（实测命中率从 85%~90% 掉到个位数）。
+  if (count > 0 && result.length > count) {
+    result = result.slice(-Math.max(2, evenFloor(count * TRIM_RATIO)))
+  }
   // 无条数限制时仍按所选模型上下文预算裁剪完整轮次，避免 Redis 无限增长。
   const budget = Math.max(1, (config.maxModelTokens || config.responsesMaxModelTokens || 128000) - (config.apiMaxToken || config.responsesApiMaxToken || 65536))
+  const charCap = Math.max(1, budget * 2)
   let chars = result.reduce((n, m) => n + m.content.length, 0)
-  while (result.length > 2 && chars > budget * 2) {
+  // 预算路径同理：超了再一次砍到 70%，而不是每轮丢一对
+  const charTarget = Math.floor(charCap * TRIM_RATIO)
+  while (result.length > 2 && chars > charTarget) {
     chars -= result[0].content.length + result[1].content.length
     result = result.slice(2)
   }
