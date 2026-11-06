@@ -350,6 +350,9 @@ const defaultConfig = {
   ScheduleTask_CronTasks: [],
   rateLimiting: 0,
   chatgptBlockCount: 50,
+  // prompt_cache_retention：交给支持的上游把前缀缓存保留更久（OpenAI 取值 in_memory / 24h）。
+  // 默认 24h，避免「隔几分钟才有人说话」的群每次都重新写缓存；填 "" 可关闭。
+  promptCacheRetention: '24h',
   reasoningEffort: "",
   geminiThinkingLevel: "",
   TTSAudio_Tool: false,

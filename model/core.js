@@ -791,6 +791,7 @@ class Core {
         maxModelTokens: Config.maxModelTokens,
         maxResponseTokens: Config.apiMaxToken,
         chatgptBlockCount: Config.chatgptBlockCount,
+        promptCacheRetention: Config.promptCacheRetention,
         providerName: opt.providerName,
       }
 
