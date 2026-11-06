@@ -714,3 +714,43 @@ test('api 的全局破限提示仍然落在用户提问上，不被群聊环境�
   assert.doesNotMatch(context.content, /破限词/)
   assert.equal(question.content, '问题\n\n[os]\n破限词\n[/os]\n')
 })
+
+test('OpenAI 兼容通道默认带 prompt_cache_retention，隔几分钟再说话也能复用前缀', async () => {
+  let body
+  const client = createClient('api', async (url, options) => {
+    body = JSON.parse(options.body)
+    return Response.json({ id: 'x', choices: [{ message: { role: 'assistant', content: '回答' }, finish_reason: 'stop' }] })
+  })
+  await client.sendMessage('问题', {})
+  assert.equal(body.prompt_cache_retention, '24h')
+})
+
+test('上游拒绝 prompt_cache_retention 时去掉参数重试，且同通道后续不再发送', async () => {
+  const bodies = []
+  const client = new ChatGPTAPI({
+    apiKey: 'fixture-key',
+    apiBaseUrl: 'https://retention-reject.example/v1',
+    providerName: 'reject',
+    completionParams: { model: 'gpt-4o-mini' },
+    ...createAttemptHistory('api'),
+    maxModelTokens: 8192,
+    maxResponseTokens: 1024,
+    fetch: async (url, options) => {
+      const body = JSON.parse(options.body)
+      bodies.push(body)
+      if (body.prompt_cache_retention) {
+        return new Response(JSON.stringify({ error: { message: 'Unsupported parameter: prompt_cache_retention' } }), { status: 400 })
+      }
+      return Response.json({ id: 'x', choices: [{ message: { role: 'assistant', content: '回答' }, finish_reason: 'stop' }] })
+    }
+  })
+  const first = await client.sendMessage('问题', {})
+  assert.equal(first.text, '回答')
+  assert.equal(bodies.length, 2, '第一次带参数被拒后应自动重试一次')
+  assert.equal(bodies[0].prompt_cache_retention, '24h')
+  assert.equal(bodies[1].prompt_cache_retention, undefined)
+
+  await client.sendMessage('再问', {})
+  assert.equal(bodies.length, 3, '同通道后续请求不应再白白失败一轮')
+  assert.equal(bodies[2].prompt_cache_retention, undefined)
+})

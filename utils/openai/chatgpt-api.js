@@ -13,6 +13,8 @@ import { pickCacheUsage } from './cacheUsage.js';
 const CHATGPT_MODEL = 'gpt-4o-mini';
 /** 已经打过「上游没给缓存字段」日志的 provider。客户端是每条消息新建的，标志不能挂在实例上 */
 const usageShapeLogged = new Set();
+/** 已经确认不接受 prompt_cache_retention 的上游（baseUrl|provider）。命中后不再发送，避免每次白跑一次失败 */
+const retentionUnsupported = new Set();
 const USER_LABEL_DEFAULT = 'User';
 const ASSISTANT_LABEL_DEFAULT = 'ChatGPT';
 const TOOL_LABEL_DEFAULT = 'Tool';
@@ -112,8 +114,9 @@ export class ChatGPTAPI {
      * @param fetch - Optional override for the `fetch` implementation to use. Defaults to the global `fetch` function.
      */
     constructor(opts) {
-        const { apiKey, apiOrg, apiBaseUrl = 'https://api.openai.com/v1', debug = false, providerName = '', messageStore, completionParams, systemMessage, maxModelTokens = 16000, maxResponseTokens = 8192, chatgptBlockCount = 0, getMessageById, upsertMessage, fetch = globalFetch } = opts;
+        const { apiKey, apiOrg, apiBaseUrl = 'https://api.openai.com/v1', debug = false, providerName = '', messageStore, completionParams, systemMessage, maxModelTokens = 16000, maxResponseTokens = 8192, chatgptBlockCount = 0, promptCacheRetention = '24h', getMessageById, upsertMessage, fetch = globalFetch } = opts;
         this._apiKey = apiKey;
+        this._promptCacheRetention = promptCacheRetention;
         this._apiOrg = apiOrg;
         this._apiBaseUrl = apiBaseUrl;
         this._providerName = providerName;
@@ -352,6 +355,12 @@ export class ChatGPTAPI {
                 messages,
                 stream
             };
+            // 缓存保留时长：默认 24h，让「隔几分钟才有人说话」的群也能复用前缀。
+            // 显式传 null / '' 可关闭；已被上游拒过的通道不再发送。
+            const retentionKey = `${this._apiBaseUrl}|${this._providerName || ''}`;
+            if (this._promptCacheRetention && body.prompt_cache_retention === undefined && !retentionUnsupported.has(retentionKey)) {
+                body.prompt_cache_retention = this._promptCacheRetention;
+            }
             if (stream) {
                 body.stream_options = { include_usage: true };
             }
@@ -378,11 +387,37 @@ export class ChatGPTAPI {
             if (this._debug) {
                 logger.info(`sendMessage (${numTokens} tokens)`, body);
             }
-            const fetchWithRetry = (requestUrl, requestOptions) => fetchWithConnectionRetry(this._fetch, requestUrl, requestOptions, {
+            const baseFetch = (requestUrl, requestOptions) => fetchWithConnectionRetry(this._fetch, requestUrl, requestOptions, {
                 onRetry: ({ error, retry, maxRetries, delayMs }) => {
                     logger.warn(`[Chatgpt][OpenAI] 连接失败 (${error.code || error.message})，${delayMs / 1000} 秒后进行第 ${retry}/${maxRetries} 次重试`);
                 }
             });
+            // 上游若把 prompt_cache_retention 当未知参数拒掉，去掉它重发一次并记住这个通道，
+            // 后续请求不再白白失败一轮（流式与非流式共用这条路径）。
+            // 注意：HTTP 400 是「正常返回」而非 throw，必须看 status 而不是 catch。
+            const fetchWithRetry = async (requestUrl, requestOptions) => {
+                if (!body.prompt_cache_retention) {
+                    return baseFetch(requestUrl, requestOptions);
+                }
+                const res = await baseFetch(requestUrl, requestOptions);
+                if (!(res.status >= 400 && res.status < 500)) {
+                    return res;
+                }
+                let detail = '';
+                try {
+                    detail = await res.clone().text();
+                }
+                catch {
+                    return res;
+                }
+                if (!/prompt_cache_retention/i.test(detail)) {
+                    return res;
+                }
+                retentionUnsupported.add(retentionKey);
+                logger.warn(`[Chatgpt][OpenAI] 上游不接受 prompt_cache_retention，本通道后续不再发送：${detail.slice(0, 160)}`);
+                delete body.prompt_cache_retention;
+                return baseFetch(requestUrl, { ...requestOptions, body: JSON.stringify(body) });
+            };
             if (stream) {
                 fetchSSE(url, {
                     method: 'POST',
