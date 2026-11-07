@@ -71,6 +71,11 @@ export function normalizeProviders(config, defaults) {
   }
   requireRef(config.defaultProviderId, '默认模型')
   requireRef(config.fallbackProviderId, '失败回退模型')
+  // 分流规则也引用提供商条目：删除被规则引用的条目时同一句校验会拦住（空 providerId 是未启用的槽位，
+  // requireRef 对空值直接放行），否则删完那一刻规则就指向空气，只能等运行期降级才会被发现
+  for (const [index, rule] of (config.sessionProviderRules || []).entries()) {
+    requireRef(rule?.providerId, `分流规则 ${index + 1} `)
+  }
   if (config.fallbackProviderId) {
     const main = findProvider(config, config.defaultProviderId)
     const backup = findProvider(config, config.fallbackProviderId)

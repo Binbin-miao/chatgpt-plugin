@@ -45,6 +45,7 @@ import { groupReply } from '../utils/groupReply.js'
 import { avatarReply } from '../utils/avatarReply.js'
 import { expandQuotedForwards } from '../utils/forwardMessage.js'
 import { isBotReplyAllowed } from '../utils/botReplyWhitelist.js'
+import { pickSessionProfile, sessionProfile, allowFallbackFor } from '../utils/sessionProvider.js'
 
 let version = Config.version
 let proxy = getProxy()
@@ -71,6 +72,47 @@ const FAILED_REPLY_RECALL_SECONDS = 60
  */
 function failedReplyRecallSeconds(config, e) {
   return config.is_recallMsg && e.isGroup ? FAILED_REPLY_RECALL_SECONDS : 0
+}
+
+/**
+ * 这条消息是否在呼叫 bot（第一人称呼叫）。
+ *
+ * 判定必须发生在运行期：框架只在插件加载时把 `reg` 编译成 RegExp 一次，早先直接拿
+ * `Config.tts_First_person` 当正则，名字在运行期被 `#gpt语音换源` 改掉之后规则仍锁着旧名字，
+ * 喊新名字不会有任何反应；名字里带 `(`、`[` 时还会在加载期抛错。现在规则退化成全量匹配，
+ * 由这里逐条消息比对配置里的当前名字。
+ *
+ * @param {object} e 消息事件
+ * @param {string} name 当前配置的第一人称名字
+ * @returns {boolean}
+ */
+export function isFirstPersonCall(e, name) {
+  const selfId = String(e?.self_id || e?.bot?.uin || '')
+  // @ 了就当作呼叫：框架不把 at 段写进 e.msg，只 @ 不打字时 e.msg 是空的，靠文字匹配永远不成立
+  if (e?.atme || e?.atBot || (selfId && String(e?.at || '') === selfId)) return true
+  const trimmed = String(name ?? '').trim()
+  // 名字为空时不做文字匹配：includes('') 恒真，会把所有消息都当成呼叫吃掉
+  if (!trimmed) return false
+  return String(e?.msg || '').includes(trimmed)
+}
+
+/** 分流规则的降级提示只打一次：配错之后该群的每条消息都会走到这里，逐条 warn 会把日志淹掉 */
+const warnedSessionRoutes = new Set()
+
+/**
+ * 查会话分流规则。命中且提供商可用时返回 { rule, slot, profile }，其余情况一律返回 null
+ * 让调用方回落全局默认——分流配错不能让整个对话挂掉，所以这里是唯一允许吞错的地方。
+ */
+function routeSessionProvider(e, source) {
+  try {
+    return pickSessionProfile(e, source, resolveProvider)
+  } catch (err) {
+    if (!warnedSessionRoutes.has(err.message)) {
+      warnedSessionRoutes.add(err.message)
+      logger.warn(`[chatgpt] 分流规则不可用，本次回落全局默认：${err.message}`)
+    }
+    return null
+  }
 }
 
 /**
@@ -116,13 +158,6 @@ export class chatgpt extends plugin {
           reg: toggleMode === 'at' ? '^[^#][sS]*' : '^#(图片)?chat(?!1|glm|gpt)[\\s\\S]*',
           /** 执行方法 */
           fnc: 'chatgpt',
-          log: false
-        },
-        {
-          /** 命令正则匹配 */
-          reg: Config.tts_First_person,
-          /** 执行方法 */
-          fnc: 'chatgpt_for_firstperson_call',
           log: false
         },
         {
@@ -172,6 +207,15 @@ export class chatgpt extends plugin {
           reg: '^#(chatgpt)?加入对话',
           fnc: 'joinConversation'
         },
+        {
+          /**
+           * 第一人称呼叫放在最后，并且用全量匹配：上面所有命令与 @ 入口先有机会接管消息，
+           * 只有没被处理的消息才轮到这里，再由 chatgpt_for_firstperson_call 在运行期比对名字。
+           */
+          reg: '^[\\s\\S]*$',
+          fnc: 'chatgpt_for_firstperson_call',
+          log: false
+        },
       ]
     })
     this.toggleMode = toggleMode
@@ -204,8 +248,9 @@ export class chatgpt extends plugin {
    */
   async getConversations(e) {
     // todo 根据use返回不同的对话列表
+    const profile = this.sessionProfileFor(e)
     let keys = []
-    for await (const key of redis.scanIterator({ MATCH: `CHATGPT:CONVERSATIONS_V2:${resolveProvider().id}:*` })) keys.push(key)
+    for await (const key of redis.scanIterator({ MATCH: `CHATGPT:CONVERSATIONS_V2:${profile.id}:*` })) keys.push(key)
     if (!keys || keys.length === 0) {
       await this.reply('当前没有人正在与机器人对话', true)
     } else {
@@ -236,6 +281,18 @@ export class chatgpt extends plugin {
     await manager.endAllConversations.bind(this)(e)
   }
 
+  /**
+   * 这个会话该用哪条提供商条目：命中分流用规则的，否则全局默认。
+   *
+   * 会话管理（`#结束对话`、`#清除最近N条`、`#对话列表`）必须和 `abstractChat` 用同一套判定算 key，
+   * 否则分流群里删的是全局默认那个不存在的 key——上下文实际没删，用户看到的是"没有记录"。
+   */
+  sessionProfileFor(e) {
+    const source = structuredClone(Config.getConfig())
+    const routed = routeSessionProvider(e, source)
+    return routed ? routed.profile : sessionProfile(e, source, resolveProvider)
+  }
+
   async getClearContextMode(e) {
     return Config.defaultProviderId
   }
@@ -245,7 +302,7 @@ export class chatgpt extends plugin {
   }
 
   getClearContextConversationKey(e, use) {
-    return providerConversationKey(resolveProvider(), this.getClearContextScope(e, use))
+    return providerConversationKey(this.sessionProfileFor(e), this.getClearContextScope(e, use))
   }
 
   getClearContextMessageSuffix(use) {
@@ -701,10 +758,11 @@ export class chatgpt extends plugin {
    * bot现在可以对「包含第一人称的句子」回复
    */
   async chatgpt_for_firstperson_call(e, { automatic = false } = {}) {
-    if (!automatic && !Config.chat_for_First_person) {
-      logger.info('[chatgpt] AI回应第一人称呼叫已关闭，不予理会')
-      return false
-    }
+    // 这条规则的 reg 是全量匹配，本函数于是成为每条消息都会走到的公共路径：
+    // 「没喊名字」与「功能已关闭」都先判掉。两者都不打日志——关掉第一人称后每条群消息
+    // 都会走到这里，逐条记一行只会把日志淹掉。
+    if (!automatic && !isFirstPersonCall(e, Config.tts_First_person)) return false
+    if (!automatic && !Config.chat_for_First_person) return false
     let msg = e.msg
     if (!msg || e.msg?.startsWith('#')) {
       logger.info('[chatgpt] 消息以#开头，，不予理会')
@@ -852,8 +910,19 @@ export class chatgpt extends plugin {
 
   async abstractChat(e, prompt, use, forcePictureMode = false, { automatic = false } = {}) {
     const providerSource = structuredClone(Config.getConfig())
-    let profile
-    try { profile = resolveProvider(providerSource.defaultProviderId, providerSource) } catch (err) { await this.reply(err.message, true); return false }
+    // 会话分流只影响正式对话：群聊自主回复的判断模型是独立配置（groupReply.provider），刻意不动。
+    // 分流层任何异常都只降级、不阻断——配错规则不能让这个群的对话直接挂掉。
+    const routed = routeSessionProvider(e, providerSource)
+    let profile = routed?.profile
+    /** 命中分流规则时，回退是否可用取决于规则提供商与全局备用是否同协议 */
+    let allowFallback = true
+    if (routed) {
+      allowFallback = allowFallbackFor(profile, providerSource, resolveProvider)
+      if (Config.debug) logger.mark(`[chatgpt] 会话分流命中规则 ${routed.slot}，使用 ${profile.name}`)
+    }
+    if (!profile) {
+      try { profile = resolveProvider(providerSource.defaultProviderId, providerSource) } catch (err) { await this.reply(err.message, true); return false }
+    }
     const config = providerConfig(profile, providerSource)
     const profileVersion = connectionVersion(profile)
     use = profile.type
@@ -1065,7 +1134,7 @@ export class chatgpt extends plugin {
       const options = automatic && e.isGroup
         ? { groupAutoReply: true, settings: { enableGroupContext: true } }
         : {}
-      let chatMessage = await Core.sendMessage.bind(this)(prompt, conversation, profile.id, e, { ...options, allowFallback: true, providerSource })
+      let chatMessage = await Core.sendMessage.bind(this)(prompt, conversation, profile.id, e, { ...options, allowFallback, providerSource })
       if (chatMessage?.noMsg) {
         return false
       }
