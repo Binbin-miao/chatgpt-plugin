@@ -154,7 +154,7 @@ const TURN_CONTEXT_HEADER_PLAIN = '<group_context>\n以下是本轮环境信息�
  * 之后字段与转义逐渐跑偏。
  *
  * @param {object} e 云崽事件
- * @param {{enableGroupContext?: boolean, groupContextLength?: number, groupContextFromLatest?: boolean}} [settings]
+ * @param {{enableGroupContext?: boolean, groupContextLength?: number}} [settings]
  * @returns {Promise<{botName: string, tip: string, turn: string}>}
  */
 /**
@@ -170,8 +170,24 @@ function sanitizeContextText(value) {
   return (typeof value === 'string' ? value : '').replaceAll('</group_context>', '')
 }
 
+// 群上下文快照：turnContext 里「群信息 + 群记录」约占八成 token，而它每轮都因群里
+// 新增消息而变化，缓存前缀在第一个群记录处就断（2026-11-07 实测同一人跨轮 0 命中）。
+// 按群缓存 5 分钟固定文本后，同群所有人的这段逐字一致，只有末尾「谁在问」一行不同。
+const GROUP_SNAPSHOT_TTL = 5 * 60 * 1000
+// 一条记录都没拉到（adapter 不支持拉历史、或偶发拉取失败）只缓存 30 秒：
+// 按 5 分钟缓存等于让一次失败把整群关进「无上下文」五分钟；完全不缓存又会让
+// 不支持历史的 adapter 每轮都白等一轮带随机休眠的重试。
+const GROUP_SNAPSHOT_EMPTY_TTL = 30 * 1000
+const GROUP_SNAPSHOT_LIMIT = 500
+const groupSnapshotCache = new Map()
+
+/** 仅测试用：清空群上下文快照，避免用例之间互相污染 */
+export function clearGroupSnapshotCache() {
+  groupSnapshotCache.clear()
+}
+
 async function collectGroupContext(e, settings = {}) {
-  const result = { enabled: false, botName: '', tip: '', turn: '' }
+  const result = { enabled: false, isGroup: false, botName: '', stableBotName: '', tip: '', turn: '' }
   if (!settings.enableGroupContext) return result
 
   try {
@@ -179,43 +195,91 @@ async function collectGroupContext(e, settings = {}) {
     const member = e.isGroup ? e.group?.pickMember?.(getUin(e)) : null
     const botName = e.isGroup ? (member?.card || member?.nickname) : e.bot?.nickname
     result.enabled = true
+    // 只有真的构建了群环境才算群聊：群上下文关闭时即便带着 group_id，
+    // 也没有群名群历史可讲，标题必须回落到中性措辞。
+    result.isGroup = Boolean(groupId)
     result.botName = botName || ''
-    // 私聊没有群可看：只保留 [name] 替换，不注入「你在 QQ 群里」这类错误描述
-    if (!groupId) return result
+    // 人设里的 [name] 只能用场景无关的机器人昵称：群名片（botName）在群聊和私聊是两个值，
+    // 拿它替换会让 system 结尾重新分叉，私聊↔群聊的缓存前缀又从第 0 字节断掉。
+    // 群名片的信息量由 turnContext 的「Your nickname is X in the group」承载，不丢。
+    result.stableBotName = e.bot?.nickname || ''
+    // 私聊没有群可看：不注入「你在 QQ 群里」这类错误描述，但必须说清「这是私聊」——
+    // 否则模型只能从「没有群名、没有群历史」反推，容易拿群聊口吻（At 人、说「群里」）答话。
+    // 这段进 turnContext 不进 system，私聊与群聊的 system 才能逐字一致、共享缓存前缀。
+    if (!groupId) {
+      const senderName = sanitizeContextText(e.sender?.card || e.sender?.nickname)
+      const senderId = e.sender?.user_id
+      result.turn = 'Attention, you are currently chatting in a private message (one-on-one), not a qq group.'
+      if (senderName || senderId) {
+        result.turn += ` The one who asks you now is ${senderName}(${senderId})。`
+      }
+      return result
+    }
 
     result.tip = Config.groupContextTip
     const senderName = sanitizeContextText(e.sender.card || e.sender.nickname)
     const groupName = sanitizeContextText(e.group?.name || e.group_name)
-    let turn = 'Attention, you are currently chatting in a qq group, then one who asks you now is' +
-      `${senderName}(${e.sender.user_id})。`
-    turn += `the group name is ${groupName}, group id is ${groupId}。`
-    if (botName) turn += `Your nickname is ${sanitizeContextText(botName)} in the group,`
-
     const groupContextLength = settings.groupContextLength ?? Config.groupContextLength
-    const chats = await msgHistoryMgr.getGroupHistoryContext(e, groupContextLength, {
-      fromLatest: settings.groupContextFromLatest
-    })
-    if (Array.isArray(chats) && chats.length > 0) {
-      turn += 'There is the conversation history in the group, you must chat according to the conversation history context"'
-      turn += chats
-        .map(chat => {
-          const sender = chat.sender || {}
-          // 历史条目由各 adapter 的接口返回，字段并不总是齐全（NapCat 是必填，别家未必）：
-          // 直接 startsWith 会抛错，整段群历史被 catch 丢弃，日志只剩「获取群聊聊天记录失败」。
-          const rawMessage = typeof chat.raw_message === 'string' ? chat.raw_message : ''
-          if (rawMessage.startsWith('建议的回复')) {
-            // 建议的回复太容易污染设定导致对话太固定跑偏了
-            return ''
+
+    // 公共段（群信息 + 群记录）走快照；提问者身份放到最末尾。
+    // 群里 A、B、C 交替提问时，公共段完全一致，前缀能一路吃到群记录末尾；
+    // 身份一旦排在前面，从第 300 个 token 就分叉，后面 14k 群记录全白搭。
+    //
+    // 窗口固定取「群内最新 N 条」。以本条消息为起点向前取的话，每个提问者的窗口都不一样
+    // （引用旧消息时更甚），快照按人分叉，等于没做快照。固定的代价是引用旧消息时模型看到
+    // 的是最新群记录而非旧消息之前的记录——记录只用来理解「群里在聊什么」，旧消息本身
+    // 仍在 prompt 里随引用带入，信息不缺。
+    const snapshotKey = `${e.self_id}:${groupId}:${groupContextLength}:${botName}:${groupName}`
+    const cachedSnapshot = groupSnapshotCache.get(snapshotKey)
+    let publicText
+    if (cachedSnapshot && Date.now() - cachedSnapshot.at < cachedSnapshot.ttl) {
+      publicText = cachedSnapshot.text
+    } else {
+      const chats = await msgHistoryMgr.getGroupHistoryContext(e, groupContextLength, { fromLatest: true })
+      publicText = `\nthe group name is ${groupName}, group id is ${groupId}。`
+      if (botName) publicText += `Your nickname is ${sanitizeContextText(botName)} in the group,`
+      if (Array.isArray(chats) && chats.length > 0) {
+        publicText += 'There is the conversation history in the group, you must chat according to the conversation history context"'
+        publicText += chats
+          .map(chat => {
+            const sender = chat.sender || {}
+            // 历史条目由各 adapter 的接口返回，字段并不总是齐全（NapCat 是必填，别家未必）：
+            // 直接 startsWith 会抛错，整段群历史被 catch 丢弃，日志只剩「获取群聊聊天记录失败」。
+            const rawMessage = typeof chat.raw_message === 'string' ? chat.raw_message : ''
+            if (rawMessage.startsWith('建议的回复')) {
+              // 建议的回复太容易污染设定导致对话太固定跑偏了
+              return ''
+            }
+            const card = sanitizeContextText(sender.card || sender.nickname)
+            const area = sanitizeContextText(sender.area)
+            const title = sanitizeContextText(sender.title)
+            const text = sanitizeContextText(rawMessage)
+            return `【${card}】(qq：${sender.user_id}, ${roleMap[sender.role] || 'normal user'}，${area ? 'from ' + area + ', ' : ''} ${sender.age} years old, 群头衔：${title}, gender: ${sender.sex}, time：${formatDate(new Date(chat.time * 1000))}, messageId: ${chat.message_id}) 说：${text}`
+          })
+          .join('\n')
+      }
+      groupSnapshotCache.set(snapshotKey, {
+        text: publicText,
+        at: Date.now(),
+        // 只有取满窗口才按 5 分钟缓存。不足额意味着翻页被截断、重试耗尽，或群里本来就没几条：
+        // 前两种是残缺上下文，顶着五分钟会把「少了一半的群记录」固化成常态。
+        ttl: chats?.length >= groupContextLength ? GROUP_SNAPSHOT_TTL : GROUP_SNAPSHOT_EMPTY_TTL
+      })
+      if (groupSnapshotCache.size > GROUP_SNAPSHOT_LIMIT) {
+        let oldestKey = null
+        let oldestAt = Infinity
+        for (const [key, entry] of groupSnapshotCache) {
+          if (entry.at < oldestAt) {
+            oldestAt = entry.at
+            oldestKey = key
           }
-          const card = sanitizeContextText(sender.card || sender.nickname)
-          const area = sanitizeContextText(sender.area)
-          const title = sanitizeContextText(sender.title)
-          const text = sanitizeContextText(rawMessage)
-          return `【${card}】(qq：${sender.user_id}, ${roleMap[sender.role] || 'normal user'}，${area ? 'from ' + area + ', ' : ''} ${sender.age} years old, 群头衔：${title}, gender: ${sender.sex}, time：${formatDate(new Date(chat.time * 1000))}, messageId: ${chat.message_id}) 说：${text}`
-        })
-        .join('\n')
+        }
+        if (oldestKey) groupSnapshotCache.delete(oldestKey)
+      }
     }
-    result.turn = turn
+
+    result.turn = `Attention, you are currently chatting in a qq group.${publicText}` +
+      `\nThe one who asks you now is ${senderName}(${e.sender.user_id})。`
   } catch (err) {
     // 私聊也要留下痕：静默吞掉会让「为什么这轮没带上下文」无从查起
     logger.warn(`获取${e.isGroup ? '群聊聊天记录' : '私聊环境信息'}失败，本次对话不携带该段上下文`, err)
@@ -226,20 +290,36 @@ async function collectGroupContext(e, settings = {}) {
 /**
  * 把本轮可变内容包成一个整体，交给客户端插到本轮提问之前。
  *
- * @param {string} [groupTurn] 群聊环境；为空表示这轮没有群信息，标题改用中性措辞
+ * @param {string} [body] 本轮环境正文（群聊：自检提示 + 群名群历史；私聊：身份与场景说明）
  * @param {Array<string|undefined>} [extraParts] 其余每轮变化的内容，空的分段自动丢弃
+ * @param {boolean} [isGroup] 决定外层标题措辞：群聊「群聊环境」，私聊用中性的「本轮环境信息」
  * @returns {string}
  */
-function wrapTurnContext(groupTurn, extraParts = []) {
+function wrapTurnContext(body, extraParts = [], isGroup = false) {
   // 统一收口：任何来源的文本（群名片、群名、头衔、消息正文、以后新增的字段）
   // 都在这里再剥一次闭合标记。逐字段转义是防御纵深，这里是最后一道，漏不掉。
-  const body = [groupTurn, ...extraParts]
+  const content = [body, ...extraParts]
     .filter(Boolean)
     .join('\n')
     .replaceAll('</group_context>', '')
-  if (!body) return ''
-  const header = groupTurn ? TURN_CONTEXT_HEADER : TURN_CONTEXT_HEADER_PLAIN
-  return `${header}\n${body}\n</group_context>`
+  if (!content) return ''
+  const header = isGroup ? TURN_CONTEXT_HEADER : TURN_CONTEXT_HEADER_PLAIN
+  return `${header}\n${content}\n</group_context>`
+}
+
+/**
+ * 拼出 turnContext 的正文：群聊自检提示在前、群环境在后；私聊只有身份说明。
+ *
+ * `group.tip` 是给「群聊记录」配的使用说明，曾经直接拼进 system——私聊拿不到它、
+ * 群聊有它，两种场景的 system 长度就差出约 290 token，而缓存只认逐字节相同的前缀，
+ * 于是私聊与群聊来回切换时命中恒为 0。挪到 turnContext 后 system 跨场景一致，
+ * 前缀能一路吃到历史末尾（2026-11-07 实测：63,495 的请求由 0 变为可命中约 51.7k）。
+ *
+ * @param {{tip?: string, turn?: string}} group collectGroupContext 的返回值
+ * @returns {string}
+ */
+function groupContextBody(group) {
+  return [group.tip, group.turn].filter(Boolean).join('\n')
 }
 
 /**
@@ -440,20 +520,19 @@ class Core {
         if (claudeTools.length > 0) {
           client.addTools(claudeTools)
         }
-        // 群聊记录、message_id、当前时间每轮都变，一律不进 system——Anthropic 的缓存
-        // 断点打在 system 末尾，混进会变的内容整段就缓存不了。
+        // 群聊记录、message_id、当前时间、群聊自检提示每轮/每场景都可能变，一律不进 system
+        // ——Anthropic 的缓存断点打在 system 末尾，混进会变的内容整段就缓存不了。
         const group = await collectGroupContext(e, opt.settings)
         if (group.enabled) {
-          system = system.replaceAll('[name]', group.botName || 'Claude')
+          system = system.replaceAll('[name]', group.stableBotName || 'Claude')
         }
-        system += group.tip
         option.system = system
         // system 现在只剩稳定段，缓存断点直接落在末尾
         option.systemStableLength = system.length
-        option.turnContext = wrapTurnContext(group.turn, [
+        option.turnContext = wrapTurnContext(groupContextBody(group), [
           claudeSystemDynamic,
           buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
-        ])
+        ], group.isGroup)
         const quoted = await collectQuotedImages(e, opt.prepared)
         applyQuotedMedias(option, quoted.medias)
         // 上下文注入：文本记忆在 prepared 上，一轮只拉取一次（docs/adr/0016）
@@ -519,14 +598,13 @@ class Core {
 
       const group = await collectGroupContext(e, opt.settings)
       if (group.enabled) {
-        system = system.replaceAll('[name]', group.botName || 'GeminiPro')
+        system = system.replaceAll('[name]', group.stableBotName || 'GeminiPro')
       }
-      system += group.tip
       option.system = system
-      option.turnContext = wrapTurnContext(group.turn, [
+      option.turnContext = wrapTurnContext(groupContextBody(group), [
         geminiSystemDynamic,
         buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
-      ])
+      ], group.isGroup)
       option.replyPureTextCallback = opt.settings.replyPureTextCallback || (async (msg) => {
         if (msg) {
           await e.reply(msg, true)
@@ -562,16 +640,15 @@ class Core {
         let instructions = mergeSystemPrompt(opt.system.responses || Config.responsesSystemPrompt, e)
         if (extraSystemMessage) instructions += extraSystemMessage
         if (group.enabled) {
-          instructions = instructions.replaceAll('[name]', group.botName || 'ChatGPT')
+          instructions = instructions.replaceAll('[name]', group.stableBotName || 'ChatGPT')
         }
-        instructions += group.tip
         // 上下文注入来自外部端点、每轮可能变，放在稳定段之后
         instructions = await withContextInjection(opt.prepared, Config, instructions, conversation)
         instructions = appendGroupAutoReplyPrompt(instructions, opt)
-        const turnContext = wrapTurnContext(group.turn, [
+        const turnContext = wrapTurnContext(groupContextBody(group), [
           extraSystemDynamic,
           buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
-        ])
+        ], group.isGroup)
         return { instructions, turnContext }
       }
 
@@ -759,16 +836,15 @@ class Core {
           system += extraSystemMessage
         }
         if (group.enabled) {
-          system = system.replaceAll('[name]', group.botName || 'ChatGPT')
+          system = system.replaceAll('[name]', group.stableBotName || 'ChatGPT')
         }
-        system += group.tip
         // 上下文注入来自外部端点、每轮可能变，放在稳定段之后
         system = await withContextInjection(opt.prepared, Config, system, conversation)
         system = appendGroupAutoReplyPrompt(system, opt)
-        const turnContext = wrapTurnContext(group.turn, [
+        const turnContext = wrapTurnContext(groupContextBody(group), [
           extraSystemDynamic,
           buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
-        ])
+        ], group.isGroup)
         return { system, turnContext }
       }
       // 引用图先取：失败提示按每次尝试单独追加（缓存存基础 system，含上下文注入文本）
@@ -1257,8 +1333,10 @@ async function collectTools(e) {
     { condition: Config.viewForwardMsgTool, ToolClass: ViewForwardMsgTool },
     { condition: Config.ScheduleTask_Tool, ToolClass: ScheduleTaskTool },
     { condition: Config.TTSAudio_Tool, ToolClass: TTSAudioTool },
-    /** 群公告是群内公开的只读信息：只要在群里就能用，与 Bot 是否管理员、提问者身份都无关，故不进 groupAdminToolMap */
-    { condition: Config.toolGroupAdminArr.includes('GroupNotice') && e?.isGroup, ToolClass: GetGroupNoticeTool },
+    /** 群公告是群内公开的只读信息：工具清单必须与场景无关，否则私聊↔群聊的缓存前缀
+     *  从 tools 处就分叉（tools 排在 system 之前）。私聊调用由 resolveGroupToolContext
+     *  返回「该工具只能在群聊中使用」，不会崩。 */
+    { condition: Config.toolGroupAdminArr.includes('GroupNotice'), ToolClass: GetGroupNoticeTool },
     { condition: Config.generateMathRender_ToolSwitch, ToolClass: GenerateMathRenderTool },
     { condition: Config.generateHtml_ToolSwitch, ToolClass: GenerateHtmlTool },
     { condition: Config.generateGraphCalculator_ToolSwitch, ToolClass: GenerateGraphCalculatorTool },

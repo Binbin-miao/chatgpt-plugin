@@ -9,22 +9,33 @@
 ```
 QQ 事件 e
    │
-   ├─ collectGroupContext(e, settings)            model/core.js:158
-   │     ├─ botName / tip（稳定：群聊提示语）
-   │     └─ turn（每轮变：提问者、群名群号、60 条群聊记录）
+   ├─ collectGroupContext(e, settings)            model/core.js:189
+   │     ├─ isGroup / botName（只用于 [name] 替换，不进 system）
+   │     ├─ tip（群聊自检提示，仅群聊有；私聊为空）
+   │     └─ turn（公共段按群缓存 5 分钟 + 末行提问者；私聊为场景说明）
    │
-   ├─ mergeSystemPrompt + 插件清单 + [name] 替换 + tip
+   ├─ mergeSystemPrompt + 插件清单 + [name] 替换
    │     └─ appendGroupAutoReplyPrompt / withContextInjection
-   │           └─ system  ← 只含稳定内容
+   │           └─ system  ← 只含稳定内容，私聊与群聊逐字相同
    │
-   └─ wrapTurnContext([turn, message_id, 当前时间/时间线])   model/core.js:210
+   └─ wrapTurnContext(groupContextBody(group), [...])   model/core.js:296
+         │   正文 = [tip, turn]，标题按 isGroup 选「群聊环境 / 本轮环境信息」
          └─ turnContext  ← 只进请求，不落库
                │
-               ├─ OpenAI Chat  chatgpt-api.js:74  insertTurnContext（innerOs 之后插入）
+               ├─ OpenAI Chat  chatgpt-api.js:78  insertTurnContext（innerOs 之后插入）
                ├─ Responses    responses-api.js:22 appendTurnContext（在 input 里插一项）
                ├─ Claude       ClaudeAPIClient.js:305（按 turnMessageIndex 插一条 user）
                └─ Gemini       CustomGoogleGeminiClient.js:273（并入本轮 user 的 parts[0]）
 ```
+
+> `group.tip` 曾经拼在 system 里（「稳定：群聊提示语」），导致群聊 system 比私聊多约 290 token。
+> 会话历史按 `sender.user_id` 存、私聊群聊共用，于是公共前缀在 system 末尾就断，缓存恒为 0。
+> 现已并入 turnContext，判标题用 `isGroup` 而不是 `e.group_id`（群上下文关闭时仍带 group_id）。
+
+`turn` 内部顺序固定为「公共段 + 末行提问者身份」：公共段（群名群号、记录、机器人群名片）按
+`${self_id}:${group_id}:${length}` 缓存 5 分钟，空快照只缓存 30 秒；记录窗口一律取群内最新
+N 条（`fromLatest: true`），普通回复与自主回复共用同一份。提问者一旦排在公共段之前，换个人
+就从第 300 个 token 分叉，后面十几 k 的群记录全部作废。详见 ADR-0017 决策 4。
 
 ## 2. 四条通道的插入位置
 
