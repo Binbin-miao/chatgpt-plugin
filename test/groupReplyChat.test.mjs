@@ -339,7 +339,8 @@ test(`${type} 不续接升级前历史，成功问答按 3600 秒和 50 条写�
   const messages = JSON.parse(saved.get(key)).messages
   assert.equal(messages.length, expected)
   assert.equal(messages.length, 36)
-  // 54 条里保留最后 36 条，起点是第 9 轮提问
+  // 第 26 轮（turn=25）累积到 52 条才越界（上界是 50），一次裁到 34；
+  // 第 27 轮再加 2 条，最终 36 条，起点是第 9 轮提问
   assert.equal(messages[0].content, '问题9')
   assert.equal(messages.at(-1).content, '回答26')
 })

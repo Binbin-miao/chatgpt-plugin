@@ -715,14 +715,45 @@ test('api 的全局破限提示仍然落在用户提问上，不被群聊环境�
   assert.equal(question.content, '问题\n\n[os]\n破限词\n[/os]\n')
 })
 
-test('OpenAI 兼容通道默认带 prompt_cache_retention，隔几分钟再说话也能复用前缀', async () => {
+test('OpenAI 兼容通道按配置带上 prompt_cache_retention，隔几分钟再说话也能复用前缀', async () => {
   let body
-  const client = createClient('api', async (url, options) => {
-    body = JSON.parse(options.body)
-    return Response.json({ id: 'x', choices: [{ message: { role: 'assistant', content: '回答' }, finish_reason: 'stop' }] })
+  // 默认值由配置层决定（core.js 读 Config.promptCacheRetention），客户端不再兜默认，
+  // 否则记忆抽取等子调用会绕过全局开关
+  const client = new ChatGPTAPI({
+    apiKey: 'fixture-key',
+    apiBaseUrl: 'https://retention-default.example/v1',
+    providerName: 'default-on',
+    promptCacheRetention: '24h',
+    completionParams: { model: 'gpt-4o-mini' },
+    ...createAttemptHistory('api'),
+    maxModelTokens: 8192,
+    maxResponseTokens: 1024,
+    fetch: async (url, options) => {
+      body = JSON.parse(options.body)
+      return Response.json({ id: 'x', choices: [{ message: { role: 'assistant', content: '回答' }, finish_reason: 'stop' }] })
+    }
   })
   await client.sendMessage('问题', {})
   assert.equal(body.prompt_cache_retention, '24h')
+})
+
+test('客户端不传 promptCacheRetention 时不发送该参数（子调用不绕过全局开关）', async () => {
+  let body
+  const client = new ChatGPTAPI({
+    apiKey: 'fixture-key',
+    apiBaseUrl: 'https://retention-absent.example/v1',
+    providerName: 'absent',
+    completionParams: { model: 'gpt-4o-mini' },
+    ...createAttemptHistory('api'),
+    maxModelTokens: 8192,
+    maxResponseTokens: 1024,
+    fetch: async (url, options) => {
+      body = JSON.parse(options.body)
+      return Response.json({ id: 'x', choices: [{ message: { role: 'assistant', content: '回答' }, finish_reason: 'stop' }] })
+    }
+  })
+  await client.sendMessage('问题', {})
+  assert.equal(body.prompt_cache_retention, undefined)
 })
 
 test('上游拒绝 prompt_cache_retention 时去掉参数重试，且同通道后续不再发送', async () => {
@@ -731,6 +762,7 @@ test('上游拒绝 prompt_cache_retention 时去掉参数重试，且同通道�
     apiKey: 'fixture-key',
     apiBaseUrl: 'https://retention-reject.example/v1',
     providerName: 'reject',
+    promptCacheRetention: '24h',
     completionParams: { model: 'gpt-4o-mini' },
     ...createAttemptHistory('api'),
     maxModelTokens: 8192,
@@ -753,4 +785,99 @@ test('上游拒绝 prompt_cache_retention 时去掉参数重试，且同通道�
   await client.sendMessage('再问', {})
   assert.equal(bodies.length, 3, '同通道后续请求不应再白白失败一轮')
   assert.equal(bodies[2].prompt_cache_retention, undefined)
+})
+
+test('上游只回 400 Invalid request 不点名参数时，也要去参重试而不是让整条通道失败', async () => {
+  const bodies = []
+  const client = new ChatGPTAPI({
+    apiKey: 'fixture-key',
+    apiBaseUrl: 'https://retention-opaque.example/v1',
+    providerName: 'opaque',
+    promptCacheRetention: '24h',
+    completionParams: { model: 'gpt-4o-mini' },
+    ...createAttemptHistory('api'),
+    maxModelTokens: 8192,
+    maxResponseTokens: 1024,
+    fetch: async (url, options) => {
+      const body = JSON.parse(options.body)
+      bodies.push(body)
+      if (body.prompt_cache_retention) {
+        // 常见网关：只回一句 Invalid request，不告诉你是哪个参数错了
+        return new Response(JSON.stringify({ error: { message: 'Invalid request' } }), { status: 400 })
+      }
+      return Response.json({ id: 'x', choices: [{ message: { role: 'assistant', content: '回答' }, finish_reason: 'stop' }] })
+    }
+  })
+  const result = await client.sendMessage('问题', {})
+  assert.equal(result.text, '回答', '不点名参数也必须能降级成功，否则整条通道每句话都失败')
+  assert.equal(bodies.length, 2)
+  assert.equal(bodies[1].prompt_cache_retention, undefined)
+})
+
+test('去掉参数仍然 4xx 时不记忆该通道，避免把无关报错误判成参数不支持', async () => {
+  const bodies = []
+  let calls = 0
+  const client = new ChatGPTAPI({
+    apiKey: 'fixture-key',
+    apiBaseUrl: 'https://retention-unrelated.example/v1',
+    providerName: 'unrelated',
+    promptCacheRetention: '24h',
+    completionParams: { model: 'gpt-4o-mini' },
+    ...createAttemptHistory('api'),
+    maxModelTokens: 8192,
+    maxResponseTokens: 1024,
+    fetch: async (url, options) => {
+      calls++
+      bodies.push(JSON.parse(options.body))
+      // 与 retention 无关：模型名不存在，去掉参数也一样失败
+      return new Response(JSON.stringify({ error: { message: 'The model does not exist' } }), { status: 400 })
+    }
+  })
+  await assert.rejects(() => client.sendMessage('问题', {}))
+  assert.equal(calls, 2, '确认不是参数问题就该放弃，不要反复试')
+  await assert.rejects(() => client.sendMessage('再问', {}))
+  // 第二轮同样先带参数、再降级：说明上一轮的 400 没有被记成「参数不支持」
+  const secondTurn = bodies.slice(2)
+  assert.equal(secondTurn.length, 2, '仍然应当先带参数试一次')
+  assert.equal(secondTurn[0].prompt_cache_retention, '24h', '无关的 400 不该被记成参数不支持')
+})
+
+test('429 限流不触发参数降级，避免白白多打一次', async () => {
+  const bodies = []
+  const client = new ChatGPTAPI({
+    apiKey: 'fixture-key',
+    apiBaseUrl: 'https://retention-429.example/v1',
+    providerName: 'rate',
+    promptCacheRetention: '24h',
+    completionParams: { model: 'gpt-4o-mini' },
+    ...createAttemptHistory('api'),
+    maxModelTokens: 8192,
+    maxResponseTokens: 1024,
+    fetch: async (url, options) => {
+      bodies.push(JSON.parse(options.body))
+      return new Response(JSON.stringify({ error: { message: 'rate limited' } }), { status: 429 })
+    }
+  })
+  await assert.rejects(() => client.sendMessage('问题', {}))
+  assert.equal(bodies.length, 1, '429 与参数无关，不应重发')
+})
+
+test('promptCacheRetention 传空串时不发送该参数（留出关闭开关）', async () => {
+  let body
+  const client = new ChatGPTAPI({
+    apiKey: 'fixture-key',
+    apiBaseUrl: 'https://retention-off.example/v1',
+    providerName: 'off',
+    promptCacheRetention: '',
+    completionParams: { model: 'gpt-4o-mini' },
+    ...createAttemptHistory('api'),
+    maxModelTokens: 8192,
+    maxResponseTokens: 1024,
+    fetch: async (url, options) => {
+      body = JSON.parse(options.body)
+      return Response.json({ id: 'x', choices: [{ message: { role: 'assistant', content: '回答' }, finish_reason: 'stop' }] })
+    }
+  })
+  await client.sendMessage('问题', {})
+  assert.equal(body.prompt_cache_retention, undefined)
 })

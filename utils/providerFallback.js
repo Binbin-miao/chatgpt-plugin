@@ -63,11 +63,14 @@ export function trimConversation(messages, config) {
   const budget = Math.max(1, (config.maxModelTokens || config.responsesMaxModelTokens || 128000) - (config.apiMaxToken || config.responsesApiMaxToken || 65536))
   const charCap = Math.max(1, budget * 2)
   let chars = result.reduce((n, m) => n + m.content.length, 0)
-  // 预算路径同理：超了再一次砍到 70%，而不是每轮丢一对
-  const charTarget = Math.floor(charCap * TRIM_RATIO)
-  while (result.length > 2 && chars > charTarget) {
-    chars -= result[0].content.length + result[1].content.length
-    result = result.slice(2)
+  // 与条数分支同构：涨过上界才裁，一次裁到 70%。触发线与目标线必须分开，
+  // 否则裁完刚好等于目标线，下一轮加一对又超，等于每轮丢一对——正是要消灭的滑窗。
+  if (chars > charCap) {
+    const charTarget = Math.floor(charCap * TRIM_RATIO)
+    while (result.length > 2 && chars > charTarget) {
+      chars -= result[0].content.length + result[1].content.length
+      result = result.slice(2)
+    }
   }
   return result
 }
