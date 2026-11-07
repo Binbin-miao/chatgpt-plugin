@@ -441,6 +441,9 @@ for (const field of Object.values(PROVIDER_FIELDS).flat()) delete defaultConfig[
 for (const field of ['gemini_fallbackModel', 'gemini_vqa_model', 'geminiSearchModel', 'geminiTemperature']) delete defaultConfig[field]
 Object.assign(defaultConfig, {
   providerConfigVersion: 1, modelProviders: emptyProviders(), defaultProviderId: '', fallbackProviderId: '',
+  // 会话分流：按群/私聊覆盖默认提供商。`providerId` 为空即停用本槽；
+  // 面板只可视化前 5 条，第 6 条起靠手改 config.json，面板保存时原样保留。
+  enableSessionProviderRule: false, sessionProviderRules: [],
   imageProviderId: '', videoProviderId: '', geminiSearchProviderId: '', translateSource: '',
   // 刻意与 providerConfigVersion 一起放在 legacyDefaults 快照之后：迁移判定要能区分
   // 「用户文件里没有这个键」（老配置，需要迁移）与「默认值」（新装实例，无需迁移）

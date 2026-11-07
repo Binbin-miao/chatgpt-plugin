@@ -3,8 +3,8 @@ import { Config } from '../utils/config.js'
 import { parseSourceImg } from '../utils/common.js'
 import { parseDrawCommand } from '../utils/imageDraw/args.js'
 import { buildAckText } from '../utils/imageDraw/ack.js'
-import { launchDraw, formatDrawDuration } from '../utils/imageDraw/index.js'
-import { getCooldown, getQuotaUsage, getCircuit, clearCircuit } from '../utils/imageDraw/quota.js'
+import { launchDraw } from '../utils/imageDraw/index.js'
+import { getQuotaUsage, clearCircuit } from '../utils/imageDraw/quota.js'
 import { logMark } from '../utils/imageDraw/log.js'
 
 /**
@@ -20,14 +20,13 @@ export class imageDraw extends plugin {
   constructor () {
     super({
       name: 'ChatGPT-Plugin 绘图',
-      dsc: '#绘图 文生图/图生图；#绘图头像 用自己头像；#绘图状态 看额度；#绘图解禁 解除熔断（主人）',
+      dsc: '#绘图 文生图/图生图；#绘图头像 用自己头像；#绘图解禁 解除熔断（主人）',
       event: 'message',
       priority: 500,
       rule: [
-        // 提示词前必须有空格：#绘图解禁 / #绘图状态 不能被当成「画一个叫解禁的东西」
+        // 提示词前必须有空格：#绘图解禁 不能被当成「画一个叫解禁的东西」
         { reg: '^#绘图(?:头像)?(?:\\s+[\\s\\S]*)?$', fnc: 'draw' },
-        { reg: '^#绘图解禁$', fnc: 'unlock', permission: 'master' },
-        { reg: '^#绘图状态$', fnc: 'status' }
+        { reg: '^#绘图解禁$', fnc: 'unlock', permission: 'master' }
       ]
     })
   }
@@ -90,25 +89,6 @@ export class imageDraw extends plugin {
     await clearCircuit()
     logMark(`主人 ${e.user_id} 手动解除熔断`)
     await e.reply('已解除绘图熔断，现在可以继续画了。', true)
-    return true
-  }
-
-  async status (e) {
-    if (!Config.imageDrawEnable) {
-      await e.reply('绘图还没启用，请主人到锅巴「绘图」里打开。', true)
-      return true
-    }
-    const limit = Number(Config.imageDrawDailyLimit) || 0
-    const circuit = await getCircuit()
-    const cooldown = await getCooldown({ userId: e.user_id, isMaster: e.isMaster })
-    const { used } = await getQuotaUsage({ userId: e.user_id, isMaster: e.isMaster })
-
-    const lines = []
-    lines.push(`绘图模型：${Config.imageDrawModel || '未填'}`)
-    lines.push(`每日额度：${e.isMaster ? '主人不限' : limit > 0 ? `已用 ${used}/${limit} 张` : '不限'}`)
-    if (cooldown > 0) lines.push(`冷却中：${formatDrawDuration(cooldown)}后可再画`)
-    if (circuit.open) lines.push(`接口熔断中：${formatDrawDuration(circuit.retryAfter)}后自动恢复（主人可用 #绘图解禁）`)
-    await e.reply(lines.join('\n'), true)
     return true
   }
 }

@@ -166,6 +166,8 @@ test('自主回复消耗共享限额并复查，直接呼叫超限后不转自�
   })
   Object.assign(Config, {
     rateLimiting: 1, blacklist: [], whitelist: [], chat_for_First_person: true,
+    // 第一人称呼叫改为运行期比对名字，这里必须写明名字，否则「名字呼叫」那条分支不会接管消息
+    tts_First_person: '派蒙',
     groupReply: { enabled: true, groups: [{ groupId: '100', switchOn: true }] }
   })
   let count = 0

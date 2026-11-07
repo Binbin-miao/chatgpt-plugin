@@ -1,6 +1,7 @@
 import { listProviders, providerLabel } from './utils/providerProfiles.js'
 import { Config, providerDefaults } from './utils/config.js'
 import { normalizeGroupReplyConfig } from './utils/groupReplyConfig.js'
+import { SESSION_RULE_SLOTS, normalizeSessionRules, mergePanelSlots, validateSessionRules, findInvalidPrivateUser } from './utils/sessionProvider.js'
 import { normalizeAvatarReplyConfig, AVATAR_SIZES, AVATAR_DURATIONS, AVATAR_FPS } from './utils/avatar/config.js'
 import { avatarOptions } from './utils/avatar/catalog.js'
 import { speakers, vits_emotion_map } from './utils/tts.js'
@@ -11,6 +12,9 @@ import { RECALL_MODE_ALL } from './utils/memory/recallMode.js'
 import { MemoryStore } from './utils/memory/store.js'
 import { scheduleRawMigration } from './utils/memory/autoMigrate.js'
 import lodash from "lodash";
+
+/** 面板扁平字段名 → 规则字段名（`sessionRule3Groups` → `groups`） */
+const SESSION_PANEL_FIELDS = { ProviderId: 'providerId', Model: 'model', Groups: 'groups', PrivateUsers: 'privateUsers' }
 
 /**
  * 面板重新勾选群时清掉历史 `closedAt`。
@@ -113,6 +117,63 @@ export function supportGuoba() {
   const providers = listProviders(Config.getConfig())
   const providerOptions = providers.map(row => ({ label: providerLabel(row), value: row.id }))
   const geminiProviderOptions = providers.filter(row => row.type === 'gemini').map(row => ({ label: providerLabel(row), value: row.id }))
+  /**
+   * 会话分流的槽位组件。**不能用 GSubForm**：锅巴的前端产物里子表单只渲染 `Divider` 与
+   * `InputPassword`，`Select` / `GSelectGroup` 会退化成空文本框，等于逼用户手抄 UUID。
+   * 主层级没有这个限制，所以做成扁平槽位。
+   */
+  const sessionProviderItems = [
+    {
+      label: '会话分流',
+      component: 'SOFT_GROUP_BEGIN'
+    },
+    {
+      label: '分流开关',
+      component: 'Divider'
+    },
+    {
+      field: 'enableSessionProviderRule',
+      label: '启用会话分流',
+      bottomHelpMessage: '开启后按下列规则分流：第一个命中的规则决定该群/私聊使用哪个模型提供商，未命中的会话走「对话 通用设置」里的默认提供商。群聊自主回复的判断模型不受影响，仍走它自己的配置。',
+      component: 'Switch'
+    },
+    ...Array.from({ length: SESSION_RULE_SLOTS }, (_, index) => index + 1).flatMap(slot => [
+      {
+        label: slot === 1 ? '规则 1（优先级最高）' : `规则 ${slot}`,
+        component: 'Divider'
+      },
+      {
+        field: `sessionRule${slot}ProviderId`,
+        label: '模型提供商',
+        bottomHelpMessage: '选「不启用」即停用本槽。同一个群填进多条规则时只有靠前的规则生效。',
+        component: 'Select',
+        componentProps: {
+          options: [{ label: '不启用', value: '' }, ...providerOptions]
+        }
+      },
+      {
+        field: `sessionRule${slot}Model`,
+        label: '模型名称',
+        bottomHelpMessage: '可留空：留空沿用提供商自带的模型。填了会覆盖该提供商的模型字段——模型名参与会话隔离，改动后该会话的历史会从零开始，接不上之前那段对话。',
+        component: 'Input'
+      },
+      {
+        field: `sessionRule${slot}Groups`,
+        label: '生效群聊',
+        bottomHelpMessage: '这些群使用本规则的提供商。',
+        component: 'GSelectGroup',
+        componentProps: {
+          placeholder: '点击选择要分流的群'
+        }
+      },
+      {
+        field: `sessionRule${slot}PrivateUsers`,
+        label: '生效私聊账号',
+        bottomHelpMessage: '填 QQ 号即可，多个用逗号分隔；其他适配器填完整 id（只允许字母、数字、下划线、@、点、短线）。',
+        component: 'Input'
+      }
+    ])
+  ]
   const result = {
     // 插件信息，将会显示在前端页面
     // 如果你的插件没有在插件库里，那么需要填上补充信息
@@ -895,6 +956,7 @@ export function supportGuoba() {
             step: 1
           }
         },
+        ...sessionProviderItems,
         {
           label: '语音',
           component: 'SOFT_GROUP_BEGIN'
@@ -3210,6 +3272,16 @@ export function supportGuoba() {
         configObj.avatarReply = normalizeAvatarReplyConfig(configObj.avatarReply)
         configObj.mcpServers = formatMcpServersForGuoba(configObj.mcpServers)
         configObj.hookServers = formatHookServersForGuoba(configObj.hookServers)
+        // 分流的 5 个槽位是扁平字段：GSubForm 渲染不了 Select / GSelectGroup，只能一格一字段。
+        // GSelectGroup 只认数字群号，字符串会让弹窗里的已选群勾不上（同 memoryGroupCapture 的先例）。
+        const sessionRules = normalizeSessionRules(Config.sessionProviderRules)
+        for (let slot = 1; slot <= SESSION_RULE_SLOTS; slot++) {
+          const rule = sessionRules[slot - 1] || {}
+          configObj[`sessionRule${slot}ProviderId`] = rule.providerId || ''
+          configObj[`sessionRule${slot}Model`] = rule.model || ''
+          configObj[`sessionRule${slot}Groups`] = (rule.groups || []).map(Number).filter(id => Number.isSafeInteger(id) && id > 0)
+          configObj[`sessionRule${slot}PrivateUsers`] = (rule.privateUsers || []).join(',')
+        }
 
         return configObj
       },
@@ -3218,6 +3290,8 @@ export function supportGuoba() {
         const candidate = lodash.cloneDeep(Config.getConfig())
         let groupTuning
         let reopenedGroups = []
+        /** 分流面板提交的槽位内容，循环结束后按槽位号重建规则数组 */
+        const sessionSlots = {}
         try {
           for (let [keyPath, value] of Object.entries(data)) {
             // 处理循环任务标签删除同步
@@ -3243,6 +3317,20 @@ export function supportGuoba() {
               } catch (err) {
                 return Result.error(`上下文注入条目保存失败: ${err.message}`)
               }
+            }
+            // 分流面板的 4 个字段是扁平槽位（`sessionRule2Groups` 这类），先攒起来，
+            // 循环结束后按槽位号重建规则数组——顺序不能交给提交顺序决定。
+            const sessionField = /^sessionRule(\d)(ProviderId|Model|Groups|PrivateUsers)$/.exec(keyPath)
+            if (sessionField) {
+              const slot = Number(sessionField[1])
+              if (slot < 1 || slot > SESSION_RULE_SLOTS) continue
+              const field = SESSION_PANEL_FIELDS[sessionField[2]]
+              if (field === 'privateUsers') {
+                const invalid = findInvalidPrivateUser(value)
+                if (invalid) return Result.error(`分流规则 ${slot} 的私聊账号「${invalid}」格式不支持，填 QQ 号或完整 id 即可`)
+              }
+              sessionSlots[slot] = { ...(sessionSlots[slot] || {}), [field]: value }
+              continue
             }
             // tags 下拉交回的就是数组，这里只做去空白与去重；空列表 = 不启用
             if (keyPath === 'botReplyWhitelist') {
@@ -3346,6 +3434,20 @@ export function supportGuoba() {
               target.enthusiasm = row.enthusiasm
             }
             candidate.groupReply = { ...(candidate.groupReply || {}), groups }
+          }
+
+          // 分流槽位：只重建前 5 条，第 6 条起原样拼回（手改配置写的规则不能被一次保存抹掉）。
+          // 强校验在落盘之前——引用已删提供商、选群未选提供商、同一群重复，都会拦住保存，
+          // 否则配错的规则会一直在运行期降级，而面板上看不出任何异常。
+          if (Object.keys(sessionSlots).length) {
+            const merged = mergePanelSlots(candidate.sessionProviderRules, sessionSlots)
+            const providerIds = new Set(listProviders(candidate).map(row => row.id))
+            try {
+              validateSessionRules(merged, id => providerIds.has(id))
+            } catch (err) {
+              return Result.error(err.message)
+            }
+            candidate.sessionProviderRules = merged
           }
 
           // 正确储存azureRoleSelect结果
