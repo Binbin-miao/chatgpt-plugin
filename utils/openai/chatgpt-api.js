@@ -15,6 +15,8 @@ const CHATGPT_MODEL = 'gpt-4o-mini';
 const usageShapeLogged = new Set();
 /** 已经确认不接受 prompt_cache_retention 的上游（baseUrl|provider）。命中后不再发送，避免每次白跑一次失败 */
 const retentionUnsupported = new Set();
+/** 探测「这个 400 是不是参数引起的」连续失败的次数；到达 2 次就不再白试 */
+const retentionProbeMiss = new Map();
 const USER_LABEL_DEFAULT = 'User';
 const ASSISTANT_LABEL_DEFAULT = 'ChatGPT';
 const TOOL_LABEL_DEFAULT = 'Tool';
@@ -401,9 +403,15 @@ export class ChatGPTAPI {
             // 等于插件不可用）。反过来，有些网关会回显整个请求体，按包含匹配又会把模型名写错、
             // 上下文超长这类无关 400 误判成「不支持该参数」，把通道永久拉黑。
             // 所以改成行为判定：400/422 时先去参重发，只有重发成功才认定是参数被拒。
+            //
+            // 探测本身有成本（多打一次全量请求），所以连续两次都证明「与你无关」之后
+            // 就不再探了——否则模型名写错这类长期 400 会让每轮都发两次、延迟和配额翻倍。
             const fetchWithRetry = async (requestUrl, requestOptions) => {
                 const retention = body.prompt_cache_retention;
                 if (!retention) {
+                    return baseFetch(requestUrl, requestOptions);
+                }
+                if ((retentionProbeMiss.get(retentionKey) || 0) >= 2) {
                     return baseFetch(requestUrl, requestOptions);
                 }
                 const res = await baseFetch(requestUrl, requestOptions);
@@ -420,12 +428,17 @@ export class ChatGPTAPI {
                 }
                 delete body.prompt_cache_retention;
                 const retry = await baseFetch(requestUrl, { ...requestOptions, body: JSON.stringify(body) });
-                if (retry.status >= 400) {
-                    // 去掉参数仍然失败 → 不是它的问题，把原响应还给上层正常报错，不记忆
+                if (!retry.ok) {
+                    // 去掉参数仍然失败 → 不是它的问题。恢复字段、记一次探测失败，
+                    // 把原响应还给上层正常报错（下次先带参数再试，连续两次后就别再探了）
                     body.prompt_cache_retention = retention;
+                    retentionProbeMiss.set(retentionKey, (retentionProbeMiss.get(retentionKey) || 0) + 1);
+                    // 首个 400 的响应体只读过 clone，这条连接还占着，主动放掉
+                    res.body?.cancel?.().catch(() => { });
                     return res;
                 }
                 retentionUnsupported.add(retentionKey);
+                retentionProbeMiss.delete(retentionKey);
                 logger.warn(`[Chatgpt][OpenAI] 上游拒绝 prompt_cache_retention，已自动降级，本通道后续不再发送：${detail.slice(0, 160)}`);
                 return retry;
             };
