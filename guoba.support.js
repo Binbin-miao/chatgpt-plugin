@@ -310,12 +310,18 @@ export function supportGuoba() {
           field: 'chatgptBlockCount',
           label: '对话历史记录条数',
           helpMessage: '单位：条',
-          bottomHelpMessage: '限制历史记录最大条数，用户+AI回复 为2条，建议不小于 50（太小时裁完很快就再涨满，稳定窗口很短）。超过后不会每轮剔一条（那会让缓存前缀每轮错位、整段重算），而是一次裁到约 70%（向下取偶）再继续累积。设置为0则由 token 控制（短消息场景不受约束，长期会话仍建议设条数）。注意：API 通道有 token 预算兜底，可以放心设大（如 500）；Claude / Gemini 没有兜底，建议不超过 200，否则长消息可能超出模型上下文',
+          bottomHelpMessage: '限制历史记录最大条数，用户+AI回复 为2条，建议不小于 50（太小时裁完很快就再涨满，稳定窗口很短）。超过后不会每轮剔一条（那会让缓存前缀每轮错位、整段重算），而是一次裁到约 70%（向下取偶）再继续累积。设置为0则由 token 控制。四条通道共用这一个值；另有 token 预算兜底（按默认 128k 上下文估算，Claude / Gemini 的真实窗口更大，会被提前裁）。API 通道有 tokenizer 兜底，可放心设大（如 500）；其余通道建议不超过 200',
           component: 'InputNumber',
           componentProps: {
             min: 0,
             step: 2
           }
+        },
+        {
+          field: 'promptCacheRetention',
+          label: '提示词缓存保留时长',
+          bottomHelpMessage: '仅对 OpenAI 兼容（Chat API）通道生效，交给支持的上游把前缀缓存保留更久。填 24h 表示尽量保留一天，填 in_memory 表示只留在内存（较短），留空则关闭。上游若不认这个参数，插件会自动去掉它重试并记住该通道，不会导致对话失败',
+          component: 'Input'
         },
         {
           label: '输入控制Dev',

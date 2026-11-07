@@ -114,7 +114,7 @@ export class ChatGPTAPI {
      * @param fetch - Optional override for the `fetch` implementation to use. Defaults to the global `fetch` function.
      */
     constructor(opts) {
-        const { apiKey, apiOrg, apiBaseUrl = 'https://api.openai.com/v1', debug = false, providerName = '', messageStore, completionParams, systemMessage, maxModelTokens = 16000, maxResponseTokens = 8192, chatgptBlockCount = 0, promptCacheRetention = '24h', getMessageById, upsertMessage, fetch = globalFetch } = opts;
+        const { apiKey, apiOrg, apiBaseUrl = 'https://api.openai.com/v1', debug = false, providerName = '', messageStore, completionParams, systemMessage, maxModelTokens = 16000, maxResponseTokens = 8192, chatgptBlockCount = 0, promptCacheRetention, getMessageById, upsertMessage, fetch = globalFetch } = opts;
         this._apiKey = apiKey;
         this._promptCacheRetention = promptCacheRetention;
         this._apiOrg = apiOrg;
@@ -395,12 +395,20 @@ export class ChatGPTAPI {
             // 上游若把 prompt_cache_retention 当未知参数拒掉，去掉它重发一次并记住这个通道，
             // 后续请求不再白白失败一轮（流式与非流式共用这条路径）。
             // 注意：HTTP 400 是「正常返回」而非 throw，必须看 status 而不是 catch。
+            //
+            // 判定方式刻意不依赖错误文案：很多网关只回一句「Invalid request」，不点名参数，
+            // 按字符串匹配会漏判——而漏判的后果是整个通道每句话都失败（对只配一条通道的用户
+            // 等于插件不可用）。反过来，有些网关会回显整个请求体，按包含匹配又会把模型名写错、
+            // 上下文超长这类无关 400 误判成「不支持该参数」，把通道永久拉黑。
+            // 所以改成行为判定：400/422 时先去参重发，只有重发成功才认定是参数被拒。
             const fetchWithRetry = async (requestUrl, requestOptions) => {
-                if (!body.prompt_cache_retention) {
+                const retention = body.prompt_cache_retention;
+                if (!retention) {
                     return baseFetch(requestUrl, requestOptions);
                 }
                 const res = await baseFetch(requestUrl, requestOptions);
-                if (!(res.status >= 400 && res.status < 500)) {
+                // 只有 400 / 422 可能是「参数不被接受」。429 限流、401 鉴权与参数无关
+                if (res.status !== 400 && res.status !== 422) {
                     return res;
                 }
                 let detail = '';
@@ -410,13 +418,16 @@ export class ChatGPTAPI {
                 catch {
                     return res;
                 }
-                if (!/prompt_cache_retention/i.test(detail)) {
+                delete body.prompt_cache_retention;
+                const retry = await baseFetch(requestUrl, { ...requestOptions, body: JSON.stringify(body) });
+                if (retry.status >= 400) {
+                    // 去掉参数仍然失败 → 不是它的问题，把原响应还给上层正常报错，不记忆
+                    body.prompt_cache_retention = retention;
                     return res;
                 }
                 retentionUnsupported.add(retentionKey);
-                logger.warn(`[Chatgpt][OpenAI] 上游不接受 prompt_cache_retention，本通道后续不再发送：${detail.slice(0, 160)}`);
-                delete body.prompt_cache_retention;
-                return baseFetch(requestUrl, { ...requestOptions, body: JSON.stringify(body) });
+                logger.warn(`[Chatgpt][OpenAI] 上游拒绝 prompt_cache_retention，已自动降级，本通道后续不再发送：${detail.slice(0, 160)}`);
+                return retry;
             };
             if (stream) {
                 fetchSSE(url, {

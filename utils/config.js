@@ -349,8 +349,9 @@ const defaultConfig = {
   ScheduleTask_CronMinInterval: 60,
   ScheduleTask_CronTasks: [],
   rateLimiting: 0,
-  // 默认取保守值：Claude / Gemini 通道没有 token 预算兜底，条数设太大时
-  // 长消息场景可能直接超出模型上下文。API 通道有 tokenizer 兜底，用户可自行调大。
+  // 默认取保守值：四条通道共用这一个条数，token 预算兜底又按 128k 上下文的默认
+  // 口径估算（provider 行没填 maxModelTokens 时），对 Claude / Gemini 的真实窗口偏保守。
+  // 需要更长历史的实例自行调大（本项目生产为 500）。
   chatgptBlockCount: 50,
   // prompt_cache_retention：交给支持的上游把前缀缓存保留更久（OpenAI 取值 in_memory / 24h）。
   // 默认 24h，避免「隔几分钟才有人说话」的群每次都重新写缓存；填 "" 可关闭。

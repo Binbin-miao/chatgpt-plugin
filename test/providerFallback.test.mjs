@@ -63,11 +63,12 @@ test('历史裁剪后能稳定累积很多轮才再次触发', () => {
   for (let turn = 0; turn < 600; turn++) {
     const before = history.length
     history = trimConversation(history.concat(pairs(2)), trimCfg)
-    if (history.length < before) cuts++
+    // 必须比「加了两条之后」少，才算真的裁过。只比 before 会漏掉
+    // 「每轮从头部挤掉一条」这种退化——那正是本改动要消灭的行为
+    if (history.length < before + 2) cuts++
     assert.ok(history.length <= 500, '任何时候都不得超过上界')
   }
-  // 逐轮裁剪会是 600 次；批量裁剪应该只有个位数
-  assert.ok(cuts <= 12, `裁剪次数应远小于轮数，实际 ${cuts}`)
+  assert.ok(cuts <= 7, `裁剪次数应远小于轮数，实际 ${cuts}`)
 })
 
 test('条数上限为奇数或极小值时仍安全，且结果为偶数', () => {
@@ -92,4 +93,15 @@ test('token 预算分支：超预算也一次裁到 70%，不会连轮丢一条'
   assert.ok(chars <= 87449, `应收敛到 70% 预算以内，实际 ${chars}`)
   assert.ok(out.length < 40)
   assert.equal(out.length % 2, 0)
+
+  // 稳态才是关键：触发线与目标线若写成同一个，裁完刚好停在目标线，
+  // 下一轮加一对又超，于是每轮都裁——与本次要修的滑窗完全一样。
+  let steady = out
+  let steadyCuts = 0
+  for (let turn = 0; turn < 20; turn++) {
+    const before = steady.length
+    steady = trimConversation(steady.concat(longPairs(2)), cfg)
+    if (steady.length < before + 2) steadyCuts++
+  }
+  assert.ok(steadyCuts <= 5, `稳态下不应每轮裁剪，实际 20 轮裁了 ${steadyCuts} 次`)
 })
