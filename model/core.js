@@ -31,6 +31,7 @@ import { SendPictureTool } from '../utils/tools/SendPictureTool.js'
 import { SendVideoTool } from '../utils/tools/SendBilibiliTool.js'
 import { BilibiliSearchVideoTool } from '../utils/tools/SearchBilibiliTool.js'
 import { SendAvatarTool } from '../utils/tools/SendAvatarTool.js'
+import { DrawImageTool } from '../utils/tools/DrawImageTool.js'
 import { SerpImageTool } from '../utils/tools/SearchImageTool.js'
 import { SendNetEaseMusicTool } from '../utils/tools/SendNetEaseMusicTool.js'
 import { SendMessageToSpecificGroupOrUserTool } from '../utils/tools/SendMessageToSpecificGroupOrUserTool.js'
@@ -1317,6 +1318,8 @@ async function collectTools(e) {
   const optionalTools = [
     { condition: !Config.disable_sendMessage_tool, ToolClass: SendMessageToSpecificGroupOrUserTool },
     { condition: !Config.disable_SendAvatarTool, ToolClass: SendAvatarTool },
+    // 绘图工具与「仅主人可用」开关都在注册层拦一道：关掉开关时模型根本看不到这个工具
+    { condition: Config.imageDrawEnable && (!Config.imageDrawOnlyMaster || e.isMaster), ToolClass: DrawImageTool },
     { condition: Config.switch_atOtherUserTool, ToolClass: AtOtherUserTool },
     { condition: Config.poke_userIDs, ToolClass: SendGroupPokeTool },
     { condition: Config.agent_MarkmapToolSwitch, ToolClass: GenerateMarkmapTool },

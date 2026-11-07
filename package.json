@@ -72,6 +72,7 @@
     "test:mcpToolFilter": "node --test --test-force-exit test/mcpToolFilter.test.mjs",
     "test:command-map": "node --test --test-force-exit test/commandMap.test.mjs test/commandLookupTool.test.mjs test/commandRunTool.test.mjs",
     "check:static": "node test/checkSyntax.mjs && node test/pathLeak.check.mjs && node test/lint.check.mjs",
-    "check": "npm run check:static && npm run test:contextInjection && npm run test:env && npm run test:mcpHeaders && npm run test:mcpToolFilter && npm run test:config && npm run test:help && npm run test:providers && npm run test:thinking && npm run test:emoji && npm run test:media && npm run test:command-map && npm run test:group-reply && npm run test:nuwa"
+    "check": "npm run check:static && npm run test:contextInjection && npm run test:env && npm run test:mcpHeaders && npm run test:mcpToolFilter && npm run test:config && npm run test:help && npm run test:providers && npm run test:thinking && npm run test:emoji && npm run test:media && npm run test:command-map && npm run test:imageDraw && npm run test:group-reply && npm run test:nuwa",
+    "test:imageDraw": "node --experimental-test-module-mocks --test --test-force-exit test/imageDrawClient.test.mjs test/imageDrawQuota.test.mjs test/imageDrawFlow.test.mjs test/imageDrawArgs.test.mjs test/imageDrawAck.test.mjs test/imageDrawTool.test.mjs"
   }
 }

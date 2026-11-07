@@ -349,6 +349,19 @@ const defaultConfig = {
   ScheduleTask_CronMinInterval: 60,
   ScheduleTask_CronTasks: [],
   rateLimiting: 0,
+  // 绘图：密钥与地址复用 modelProviders 里的某一行，这里只管「用哪行、画什么模型、怎么限」。
+  // 主人全程不受张数与冷却限制（接口熔断除外，那是上游真的坏了）。
+  imageDrawEnable: false,
+  imageDrawOnlyMaster: false, // 开了就只有主人能画；和 #识图 的 gemini_vqa_needMaster 同一套口径
+  imageDrawProviderId: '',
+  imageDrawModel: 'gpt-image-2',
+  imageDrawDailyLimit: 0, // 每人每天张数，0 表示不限；主人不受限
+  imageDrawCooldownMinutes: 1, // 出图成功后多少分钟内不能再画，0 表示不冷却
+  imageDrawSize: '1024x1024',
+  imageDrawQuality: 'medium',
+  imageDrawTimeoutSeconds: 180, // 同步出图实测 40-100 秒，留够余量
+  imageDrawFailStreakLimit: 5, // 接口连续失败多少次触发全员停画，0 表示不熔断
+  imageDrawGlobalCooldownHours: 5, // 熔断停画时长
   // 默认取保守值：四条通道共用这一个条数，token 预算兜底又按 128k 上下文的默认
   // 口径估算（provider 行没填 maxModelTokens 时），对 Claude / Gemini 的真实窗口偏保守。
   // 需要更长历史的实例自行调大（本项目生产为 500）。
