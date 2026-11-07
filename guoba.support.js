@@ -1769,91 +1769,6 @@ export function supportGuoba() {
           }
         },
         {
-          label: '智能模式 绘画设置',
-          component: 'Divider'
-        },
-        {
-          field: 'drawToolsArr',
-          label: '智能模式绘画',
-          bottomHelpMessage: '智能模式绘画 适用于支持调用函数的大模型，需要开启 智能模式；若你已安装对应绘画插件并支持（括号）中的指令，可勾选后提供给Agent调用。注意 “智能模式绘画” 和 “绘画prompt模式” 只推荐开启其中一个',
-          component: "Select",
-          componentProps: {
-            allowAdd: true,
-            allowDel: true,
-            mode: 'multiple',
-            options: [
-              { label: "nai-plugin（#绘画）", value: "nai-plugin-1" },
-              { label: "nai-plugin-4.0（#draw）", value: "nai-plugin-4" },
-              { label: "paimonnai-plugin（#绘画）", value: "paimonnai-plugin" },
-              { label: "ap-plugin（#绘图）", value: "ap-plugin" },
-              { label: "siliconflow-plugin（#sf绘画）", value: "siliconflow-paint" },
-              { label: "siliconflow-plugin（#mjp #niji）", value: "Midjourney-paint" },
-              { label: "siliconflow-Jimeng（#即梦绘画）", value: "Jimeng-paint" },
-              { label: "siliconflow-Jimeng（#即梦视频）", value: "Jimeng-videoGeneration" },
-              { label: "siliconflow-plugin（#g谷歌编辑图片）", value: "gemini-Image-gg" },
-              { label: "siliconflow-plugin（#sgpt编辑图片）", value: "gpt-Image-2-ss" },
-              { label: "siliconflow-plugin（#d魔搭编辑图片）", value: "sf-dd-paint" },
-            ],
-          },
-        },
-        {
-          field: 'siliconflow-gemini-Image_help_field',
-          label: '帮助: Siliconflow-Plugin',
-          component: 'Input',
-          bottomHelpMessage: '1. #g谷歌编辑图片: （工具名 gemini-Image-gg） 增加基于sf插件的gemini的图片修改/以图画图工具，需要先安装siliconflow插件：然后配置一个对话接口名为 #g谷歌编辑图片 的接口 ； 参考文档： https://github.com/AIGC-Yunzai/siliconflow-plugin/blob/main/docs/openrouter_ai.md 参考图： https://github.com/misaka20002/chatgpt-plugin/blob/v2/docs/guoba_imgs/guobaHelp-Gemini%20Image.webp ; 2. #sgpt编辑图片 （工具名 gpt-Image-2-ss） 配置方法同1，使用 openai 接口接入 gpt-Image ; 3. #d魔搭编辑图片 （工具名 sf-dd-paint） 配置方法参考 https://github.com/AIGC-Yunzai/siliconflow-plugin/blob/main/docs/moscope.md',
-          componentProps: {
-            readonly: true,
-            defaultValue: 'https://github.com/AIGC-Yunzai/siliconflow-plugin'
-          }
-        },
-        {
-          field: 'drawByJsonToPlugin',
-          label: '绘画prompt模式',
-          bottomHelpMessage: '绘画prompt模式 适用于不支持智能模式(Agent)的接口；用法：开启后直接告知你想要画画的内容，需要先安装对应插件；若失效请缩短你的设定的长度、关闭是否允许机器人读取近期的群聊聊天记录、关闭Suno音乐、或使用#结束对话。注意 “智能模式绘画” 和 “绘画prompt模式” 只推荐开启其中一个',
-          component: "Select",
-          componentProps: {
-            options: [
-              { label: "关闭绘画prompt模式", value: false },
-              { label: "nai-plugin（#绘画）", value: "nai-plugin-1" },
-              { label: "nai-plugin-4.0（#draw）", value: "nai-plugin-4" },
-              { label: "paimonnai-plugin（#绘画）", value: "paimonnai-plugin" },
-              { label: "ap-plugin（#绘图）", value: "ap-plugin" },
-              { label: "siliconflow-plugin（#sf绘画）", value: "siliconflow-plugin-sf" },
-              { label: "siliconflow-plugin（#mjp）", value: "siliconflow-plugin-mj" },
-            ],
-          },
-        },
-        // {
-        //   field: 'doNotCheckPaintPluginSuccess',
-        //   label: '不检测画图成功',
-        //   bottomHelpMessage: '绘画prompt模式时检测是否成功调用#绘画/#绘图，未返回成功则回复“在这个群还不能使用#绘画 功能啦”；需要调用指定插件：https://github.com/misaka20002/ap-plugin 或 https://github.com/misaka20002/paimonnai-plugin 或 https://github.com/misaka20002/siliconflow-plugin',
-        //   component: 'Switch'
-        // },
-        {
-          field: 'nai3PluginToPaintPrefix',
-          label: 'nai绘画前缀',
-          bottomHelpMessage: '定义绘画前缀，例如画师、画风、模型、采样器等；应用于 #绘画 #绘图 #draw',
-          component: 'InputTextArea',
-          componentProps: {
-            placeholder: 'toddler, artist:ciloranko, [artist:tianliang duohe fangdongye], [artist:sho_(sho_lwlw)], [artist:baku-p], [artist:tsubasa_tsubasa], ',
-          },
-        },
-        {
-          field: 'sfPluginToPaintPrefix',
-          label: 'sf绘画前缀',
-          bottomHelpMessage: '定义绘画前缀，例如画师、画风、模型、sf绘画模式预设词等；应用于 #sf绘画 #mjp #niji #即梦绘画 #d魔搭编辑图片',
-          component: 'InputTextArea',
-          componentProps: {
-            placeholder: ' --1:1',
-          },
-        },
-        {
-          field: 'draw_PluginCharactersList',
-          label: '绘画添加作品名',
-          bottomHelpMessage: '连接绘画插件时使作品角色添加*更多*作品名（只需要添加你的新角色即可），请严格按照JSON格式书写，必要时使用https://json-online.com/check/；例子：{"last(_|\\\\s)order|misaka":"last order (Toaru Majutsu no Index), toddler","nahida":"nahida (genshin impact), toddler"}',
-          component: 'InputTextArea'
-        },
-        {
           label: '智能模式 记忆设置',
           component: 'Divider'
         },
@@ -2829,6 +2744,215 @@ export function supportGuoba() {
           component: 'Input',
           componentProps: {
             placeholder: '留空使用默认源'
+          }
+        },
+        {
+          label: '绘图',
+          component: 'SOFT_GROUP_BEGIN'
+        },
+        {
+          field: 'imageDrawEnable',
+          label: '启用绘图',
+          bottomHelpMessage: '开启后 AI 可以调用绘图工具，群友也可以用 #绘图 指令。密钥与地址复用下面选中的模型提供商。',
+          component: 'Switch'
+        },
+        {
+          field: 'imageDrawOnlyMaster',
+          label: '仅主人可用',
+          bottomHelpMessage: '开启后只有主人能用绘图（指令与 AI 调用都受限），其他人在群里用 #绘图 会被拒绝。默认关闭，所有人都能用，但受下面的每日张数与冷却约束。',
+          component: 'Switch'
+        },
+        {
+          field: 'imageDrawProviderId',
+          label: '绘图使用的提供商',
+          bottomHelpMessage: '选一个已在「模型提供商」里配置好的条目，密钥与地址直接复用，不用重复填。',
+          component: 'Select',
+          componentProps: {
+            options: [{ label: '不启用', value: '' }, ...providerOptions]
+          }
+        },
+        {
+          field: 'imageDrawModel',
+          label: '绘图模型名',
+          bottomHelpMessage: '填上游实际认的绘图模型名，例如 gpt-image-2。与对话模型无关，单独填。',
+          component: 'Input',
+          componentProps: {
+            placeholder: 'gpt-image-2'
+          }
+        },
+        {
+          label: '额度与冷却',
+          component: 'Divider'
+        },
+        {
+          field: 'imageDrawDailyLimit',
+          label: '每人每天张数',
+          bottomHelpMessage: '每人每天最多画几张，0 表示不限。主人不受此限制，也不计入统计。',
+          helpMessage: '单位：张',
+          component: 'InputNumber',
+          componentProps: {
+            min: 0,
+            step: 1
+          }
+        },
+        {
+          field: 'imageDrawCooldownMinutes',
+          label: '每人出图冷却',
+          bottomHelpMessage: '画完一张后要等多少分钟才能再画，0 表示不冷却。主人不受限。',
+          helpMessage: '单位：分钟',
+          component: 'InputNumber',
+          componentProps: {
+            min: 0,
+            step: 1
+          }
+        },
+        {
+          field: 'imageDrawFailStreakLimit',
+          label: '接口连续失败熔断',
+          bottomHelpMessage: '绘图接口连续失败达到这个次数时，所有人停止绘图（含主人），避免持续烧钱刷错误。0 表示不熔断。',
+          helpMessage: '单位：次',
+          component: 'InputNumber',
+          componentProps: {
+            min: 0,
+            step: 1
+          }
+        },
+        {
+          field: 'imageDrawGlobalCooldownHours',
+          label: '熔断停画时长',
+          bottomHelpMessage: '触发熔断后停多久。主人可用 #绘图解禁 提前恢复。',
+          helpMessage: '单位：小时',
+          component: 'InputNumber',
+          componentProps: {
+            min: 1,
+            step: 1
+          }
+        },
+        {
+          label: '出图参数',
+          component: 'Divider'
+        },
+        {
+          field: 'imageDrawSize',
+          label: '默认尺寸',
+          bottomHelpMessage: 'gpt-image 系列只支持这几档，填别的会被上游拒绝。指令里可用 -s 临时覆盖。',
+          component: 'Select',
+          componentProps: {
+            options: [
+              { label: '1024x1024（方图）', value: '1024x1024' },
+              { label: '1536x1024（横图）', value: '1536x1024' },
+              { label: '1024x1536（竖图）', value: '1024x1536' },
+              { label: 'auto（由模型决定）', value: 'auto' }
+            ]
+          }
+        },
+        {
+          field: 'imageDrawQuality',
+          label: '默认质量',
+          bottomHelpMessage: '质量越高越慢越贵：high 大约是 medium 的 4 倍、low 的 15 倍。指令里可用 -q 临时覆盖。',
+          component: 'Select',
+          componentProps: {
+            options: [
+              { label: 'low（最快最省）', value: 'low' },
+              { label: 'medium（推荐）', value: 'medium' },
+              { label: 'high（最精细）', value: 'high' },
+              { label: 'auto（由模型决定）', value: 'auto' }
+            ]
+          }
+        },
+        {
+          field: 'imageDrawTimeoutSeconds',
+          label: '出图超时',
+          bottomHelpMessage: '超过这个时间还没返回就判失败并退回额度。同步出图实测 40-100 秒，不建议低于 120。',
+          helpMessage: '单位：秒',
+          component: 'InputNumber',
+          componentProps: {
+            min: 30,
+            max: 600,
+            step: 10
+          }
+        },
+        {
+          label: '交给第三方绘图插件（可选）',
+          component: 'Divider'
+        },
+        {
+          field: 'drawToolsArr',
+          label: '智能模式绘画（Agent 调用插件）',
+          bottomHelpMessage: '适用于支持调用函数的大模型，需要开启 智能模式；装好对应绘画插件且支持（括号）中的指令后，勾选即交给 Agent 调用。与下方「绘画prompt模式」只推荐开启其中一个',
+          component: "Select",
+          componentProps: {
+            allowAdd: true,
+            allowDel: true,
+            mode: 'multiple',
+            options: [
+              { label: "nai-plugin（#绘画）", value: "nai-plugin-1" },
+              { label: "nai-plugin-4.0（#draw）", value: "nai-plugin-4" },
+              { label: "paimonnai-plugin（#绘画）", value: "paimonnai-plugin" },
+              { label: "ap-plugin（#绘图）", value: "ap-plugin" },
+              { label: "siliconflow-plugin（#sf绘画）", value: "siliconflow-paint" },
+              { label: "siliconflow-plugin（#mjp #niji）", value: "Midjourney-paint" },
+              { label: "siliconflow-Jimeng（#即梦绘画）", value: "Jimeng-paint" },
+              { label: "siliconflow-Jimeng（#即梦视频）", value: "Jimeng-videoGeneration" },
+              { label: "siliconflow-plugin（#g谷歌编辑图片）", value: "gemini-Image-gg" },
+              { label: "siliconflow-plugin（#sgpt编辑图片）", value: "gpt-Image-2-ss" },
+              { label: "siliconflow-plugin（#d魔搭编辑图片）", value: "sf-dd-paint" },
+            ],
+          },
+        },
+        {
+          field: 'drawByJsonToPlugin',
+          label: '绘画prompt模式（提示词直达插件）',
+          bottomHelpMessage: '适用于不支持智能模式(Agent)的接口；开启后直接说想画什么即可，需要先安装对应插件。若失效：缩短设定长度、关闭读取近期群聊记录、关闭 Suno 音乐，或用 #结束对话。与上方「智能模式绘画」只推荐开启其中一个',
+          component: "Select",
+          componentProps: {
+            options: [
+              { label: "关闭绘画prompt模式", value: false },
+              { label: "nai-plugin（#绘画）", value: "nai-plugin-1" },
+              { label: "nai-plugin-4.0（#draw）", value: "nai-plugin-4" },
+              { label: "paimonnai-plugin（#绘画）", value: "paimonnai-plugin" },
+              { label: "ap-plugin（#绘图）", value: "ap-plugin" },
+              { label: "siliconflow-plugin（#sf绘画）", value: "siliconflow-plugin-sf" },
+              { label: "siliconflow-plugin（#mjp）", value: "siliconflow-plugin-mj" },
+            ],
+          },
+        },
+        {
+          field: 'nai3PluginToPaintPrefix',
+          label: 'nai绘画前缀',
+          bottomHelpMessage: '定义绘画前缀，例如画师、画风、模型、采样器等；应用于 #绘画 #绘图 #draw',
+          component: 'InputTextArea',
+          componentProps: {
+            placeholder: 'toddler, artist:ciloranko, [artist:tianliang duohe fangdongye], [artist:sho_(sho_lwlw)], [artist:baku-p], [artist:tsubasa_tsubasa], ',
+          },
+        },
+        {
+          field: 'sfPluginToPaintPrefix',
+          label: 'sf绘画前缀',
+          bottomHelpMessage: '定义绘画前缀，例如画师、画风、模型、sf绘画模式预设词等；应用于 #sf绘画 #mjp #niji #即梦绘画 #d魔搭编辑图片',
+          component: 'InputTextArea',
+          componentProps: {
+            placeholder: ' --1:1',
+          },
+        },
+        {
+          field: 'draw_PluginCharactersList',
+          label: '绘画添加作品名',
+          bottomHelpMessage: '连接绘画插件时使作品角色添加*更多*作品名（只需要添加你的新角色即可），请严格按照JSON格式书写，必要时使用https://json-online.com/check/；例子：{"last(_|\\\\s)order|misaka":"last order (Toaru Majutsu no Index), toddler","nahida":"nahida (genshin impact), toddler"}',
+          component: 'InputTextArea'
+        },
+        {
+          label: '第三方插件接入帮助',
+          component: 'Divider'
+        },
+        {
+          field: 'siliconflow-gemini-Image_help_field',
+          label: '帮助: Siliconflow-Plugin',
+          component: 'Input',
+          bottomHelpMessage: '1. #g谷歌编辑图片: （工具名 gemini-Image-gg） 增加基于sf插件的gemini的图片修改/以图画图工具，需要先安装siliconflow插件：然后配置一个对话接口名为 #g谷歌编辑图片 的接口 ； 参考文档： https://github.com/AIGC-Yunzai/siliconflow-plugin/blob/main/docs/openrouter_ai.md 参考图： https://github.com/misaka20002/chatgpt-plugin/blob/v2/docs/guoba_imgs/guobaHelp-Gemini%20Image.webp ; 2. #sgpt编辑图片 （工具名 gpt-Image-2-ss） 配置方法同1，使用 openai 接口接入 gpt-Image ; 3. #d魔搭编辑图片 （工具名 sf-dd-paint） 配置方法参考 https://github.com/AIGC-Yunzai/siliconflow-plugin/blob/main/docs/moscope.md',
+          componentProps: {
+            readonly: true,
+            defaultValue: 'https://github.com/AIGC-Yunzai/siliconflow-plugin'
           }
         },
         {
