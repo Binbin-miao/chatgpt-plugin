@@ -162,6 +162,9 @@ export class SubLLM {
       maxModelTokens: Config.maxModelTokens,
       maxResponseTokens: this.maxTokens || Config.apiMaxToken,
       providerName: this.providerName,
+      // 跟随全局开关：记忆抽取、群聊判断这些子调用的 system 很稳定，缓存收益不小；
+      // 用户把 promptCacheRetention 填空时它们也应一起停发
+      promptCacheRetention: Config.promptCacheRetention,
     }
 
     const client = new ChatGPTAPI(opts)

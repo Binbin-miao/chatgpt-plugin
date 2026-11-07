@@ -834,12 +834,17 @@ test('去掉参数仍然 4xx 时不记忆该通道，避免把无关报错误判
     }
   })
   await assert.rejects(() => client.sendMessage('问题', {}))
-  assert.equal(calls, 2, '确认不是参数问题就该放弃，不要反复试')
+  assert.equal(calls, 2, '第一轮会探测一次：先带参数、再去参')
   await assert.rejects(() => client.sendMessage('再问', {}))
-  // 第二轮同样先带参数、再降级：说明上一轮的 400 没有被记成「参数不支持」
+  // 第二轮仍会探测：要连续两次失败才认定「这个 400 与参数无关」
   const secondTurn = bodies.slice(2)
-  assert.equal(secondTurn.length, 2, '仍然应当先带参数试一次')
+  assert.equal(secondTurn.length, 2, '连续两次探测期间仍然先带参数试一次')
   assert.equal(secondTurn[0].prompt_cache_retention, '24h', '无关的 400 不该被记成参数不支持')
+
+  // 连续两次探测都失败 → 之后不再白试，每轮只发一次，避免延迟和配额翻倍
+  await assert.rejects(() => client.sendMessage('三问', {}))
+  assert.equal(bodies.length, 5, '第三轮起不再探测，只发一次')
+  assert.equal(bodies.at(-1).prompt_cache_retention, '24h', '仍然带参数发送，只是不再做降级探测')
 })
 
 test('429 限流不触发参数降级，避免白白多打一次', async () => {
