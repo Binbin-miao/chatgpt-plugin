@@ -1107,7 +1107,7 @@ export class chatgpt extends plugin {
       previousConversation.messages = trimConversation([
         ...(previousConversation.messages || []), { role: 'user', content: prompt },
         { role: 'assistant', content: chatMessage.text || '' }
-      ], config)
+      ], config, profile)
       if (!chatMessage.error) {
         // 没错误的时候再更新，不然易出错就对话没了
         previousConversation.num = previousConversation.num + 1

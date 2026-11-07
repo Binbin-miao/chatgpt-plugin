@@ -310,7 +310,7 @@ export function supportGuoba() {
           field: 'chatgptBlockCount',
           label: '对话历史记录条数',
           helpMessage: '单位：条',
-          bottomHelpMessage: '限制历史记录最大条数，用户+AI回复 为2条，建议不小于 50（太小时裁完很快就再涨满，稳定窗口很短）。超过后不会每轮剔一条（那会让缓存前缀每轮错位、整段重算），而是一次裁到约 70%（向下取偶）再继续累积。设置为0则由 token 控制。四条通道共用这一个值；另有 token 预算兜底（按默认 128k 上下文估算，Claude / Gemini 的真实窗口更大，会被提前裁）。API 通道有 tokenizer 兜底，可放心设大（如 500）；其余通道建议不超过 200',
+          bottomHelpMessage: '限制历史记录最大条数，用户+AI回复 为2条，建议不小于 50（太小时裁完很快就再涨满，稳定窗口很短）。超过后不会每轮剔一条（那会让缓存前缀每轮错位、整段重算），而是一次裁到约 70%（向下取偶）再继续累积。设置为 0 则按所选通道的上下文窗口估算 token 预算。注意：Responses 开启 store 续聊时历史存在上游，本条不生效；Claude / Gemini 的通道行没有单独的窗口配置，用内置默认值（200k / 1M）',
           component: 'InputNumber',
           componentProps: {
             min: 0,

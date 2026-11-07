@@ -105,3 +105,38 @@ test('token 预算分支：超预算也一次裁到 70%，不会连轮丢一条'
   }
   assert.ok(steadyCuts <= 5, `稳态下不应每轮裁剪，实际 20 轮裁了 ${steadyCuts} 次`)
 })
+
+test('上下文窗口按通道类型取值：claude / gemini 不会被当成 12.8 万来裁', () => {
+  const longPairs = n => Array.from({ length: n }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: 'x'.repeat(4000) }))
+  const history = longPairs(80)
+  const cfg = { chatgptBlockCount: 0 }
+  const api = trimConversation(history, cfg, { type: 'api' })
+  const claude = trimConversation(history, cfg, { type: 'claude' })
+  const gemini = trimConversation(history, cfg, { type: 'gemini' })
+  assert.ok(claude.length > api.length, `200k 的 claude 应比 128k 的 api 留得多，实际 ${claude.length} vs ${api.length}`)
+  assert.ok(gemini.length >= claude.length, '1M 的 gemini 应留得最多')
+  assert.equal(gemini.length, 80, 'gemini 的窗口足够装下全部，不该裁')
+})
+
+test('输出预留大于窗口时不吃掉全部预算，否则历史每轮只剩 2 条', () => {
+  const pairs = n => Array.from({ length: n }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: 'x'.repeat(100) }))
+  const out = trimConversation(pairs(10), { chatgptBlockCount: 0, maxModelTokens: 8192, apiMaxToken: 16384 })
+  assert.equal(out.length, 10, '窗口被输出上限吃掉时应退回保守预算，而不是砍到 2 条')
+})
+
+test('迁移遗留的奇数条 / assistant 起头历史会被收敛成 user 起头且偶数', () => {
+  const cfg = { chatgptBlockCount: 500 }
+  const mk = (role, i) => ({ role, content: `第${i}条` })
+  // 以 assistant 起头的 5 条
+  const dirty = [mk('assistant', 0), mk('user', 1), mk('assistant', 2), mk('user', 3), mk('assistant', 4)]
+  const out = trimConversation(dirty, cfg, { type: 'gemini' })
+  assert.equal(out[0].role, 'user', '首条必须是 user，否则 Gemini 直接 400')
+  assert.equal(out.length % 2, 0, '长度必须是偶数才能保证 user/model 交替')
+  assert.equal(out.length, 4, '从第一个 user 起算，尾部对齐成偶数对')
+
+  // 正常数据不应被改动
+  const clean = [mk('user', 0), mk('assistant', 1), mk('user', 2), mk('assistant', 3)]
+  assert.deepEqual(trimConversation(clean, cfg, { type: 'gemini' }), clean)
+  // 其他通道不做这层约束，正常数据同样不应被改动
+  assert.deepEqual(trimConversation(clean, cfg), clean)
+})
