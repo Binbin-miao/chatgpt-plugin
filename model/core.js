@@ -22,6 +22,7 @@ import { mergeTrustedToolArgs } from '../utils/tools/AbstractTool.js'
 import { ClaudeAPIClient } from '../client/ClaudeAPIClient.js'
 import { getMessageById, upsertMessage } from '../utils/history.js'
 import { withContextInjection } from '../utils/contextInjection.js'
+import { shouldRebuildSnapshot, GROUP_SNAPSHOT_MIN_INTERVAL } from '../utils/groupSnapshot.js'
 import { v4 as uuid } from 'uuid'
 import fetch from 'node-fetch'
 import { CustomGoogleGeminiClient } from '../client/CustomGoogleGeminiClient.js'
@@ -156,7 +157,9 @@ const TURN_CONTEXT_HEADER_PLAIN = '<group_context>\n以下是本轮环境信息�
  *
  * @param {object} e 云崽事件
  * @param {{enableGroupContext?: boolean, groupContextLength?: number}} [settings]
- * @returns {Promise<{botName: string, tip: string, turn: string}>}
+ * @returns {Promise<{enabled: boolean, isGroup: boolean, botName: string, stableBotName: string, stable: string, tip: string, turn: string}>}
+ *   `stable` 是群名/群号/群名片/群记录这段可按条数冻结的内容，由调用方拼进 system；
+ *   `turn` 是提问者身份一行，private 段仍逐轮变化，留在 turnContext。
  */
 /**
  * 上下文块内的文本统一转义。
@@ -171,14 +174,10 @@ function sanitizeContextText(value) {
   return (typeof value === 'string' ? value : '').replaceAll('</group_context>', '')
 }
 
-// 群上下文快照：turnContext 里「群信息 + 群记录」约占八成 token，而它每轮都因群里
-// 新增消息而变化，缓存前缀在第一个群记录处就断（2026-11-07 实测同一人跨轮 0 命中）。
-// 按群缓存 5 分钟固定文本后，同群所有人的这段逐字一致，只有末尾「谁在问」一行不同。
-const GROUP_SNAPSHOT_TTL = 5 * 60 * 1000
-// 一条记录都没拉到（adapter 不支持拉历史、或偶发拉取失败）只缓存 30 秒：
-// 按 5 分钟缓存等于让一次失败把整群关进「无上下文」五分钟；完全不缓存又会让
-// 不支持历史的 adapter 每轮都白等一轮带随机休眠的重试。
-const GROUP_SNAPSHOT_EMPTY_TTL = 30 * 1000
+// 群上下文快照：「群信息 + 群记录」是 system 里最占 token 的一段，也是唯一看起来每轮
+// 都变、实际可以被冻结的「伪动态」段。冻结期间同群所有人的这段逐字节一致。
+// 重建条件按「新消息条数」而非时间：往 system 末尾追加内容会把缓存断点前移到末尾，
+// 命中率从 98% 掉到 62%（2026-11-08 定论），宁可多冻结一轮也不动一个字节。
 const GROUP_SNAPSHOT_LIMIT = 500
 const groupSnapshotCache = new Map()
 
@@ -187,8 +186,73 @@ export function clearGroupSnapshotCache() {
   groupSnapshotCache.clear()
 }
 
-async function collectGroupContext(e, settings = {}) {
-  const result = { enabled: false, isGroup: false, botName: '', stableBotName: '', tip: '', turn: '' }
+/**
+ * 拉一轮群记录；失败返回 null，调用方据此沿用旧快照。
+ *
+ * 绝不能把异常抛给上层去清空缓存：system 一旦变短会立刻跌破缓存门槛，比多带一轮旧记录亏得多。
+ */
+async function fetchGroupHistory(e, groupContextLength) {
+  try {
+    return await msgHistoryMgr.getGroupHistoryContext(e, groupContextLength, { fromLatest: true })
+  } catch (err) {
+    logger.warn('获取群聊聊天记录失败，沿用已有群记录快照', err)
+    return null
+  }
+}
+
+// 依赖 adapter 提供 message_id。缺失时 newestMessageId 恒为空串，
+// countNewerMessages 会把每轮拉到的记录都判成「全部新增」，退化成每 30 秒重建一次 system。
+// 只掉缓存命中率，不损回答正确性；接入新 adapter 前先确认它带 message_id。
+/**
+ * 把群信息与群记录渲染成 system 里那段稳定文本。chats 为空时只给群名/群号/群名片。
+ */
+function formatGroupSnapshotText({ groupName, groupId, botName, chats }) {
+  let text = `\nthe group name is ${groupName}, group id is ${groupId}。`
+  if (botName) text += `Your nickname is ${sanitizeContextText(botName)} in the group,`
+  // 一条记录都没拉到时不能只留引导句：模型会看到一个没有下文的「这是群记录」。
+  // 群名、群号、群名片本机就有，不依赖拉取，一律照给。
+  if (chats.length > 0) {
+    text += 'There is the conversation history in the group, you must chat according to the conversation history context"'
+    text += chats
+      .map(chat => {
+        const sender = chat.sender || {}
+        // 历史条目由各 adapter 的接口返回，字段并不总是齐全（NapCat 是必填，别家未必）：
+        // 直接 startsWith 会抛错，整段群历史被 catch 丢弃，日志只剩「获取群聊聊天记录失败」。
+        const rawMessage = typeof chat.raw_message === 'string' ? chat.raw_message : ''
+        if (rawMessage.startsWith('建议的回复')) {
+          // 建议的回复太容易污染设定导致对话太固定跑偏了
+          return ''
+        }
+        const card = sanitizeContextText(sender.card || sender.nickname)
+        const area = sanitizeContextText(sender.area)
+        const title = sanitizeContextText(sender.title)
+        const message = sanitizeContextText(rawMessage)
+        return `【${card}】(qq：${sender.user_id}, ${roleMap[sender.role] || 'normal user'}，${area ? 'from ' + area + ', ' : ''} ${sender.age} years old, 群头衔：${title}, gender: ${sender.sex}, time：${formatDate(new Date(chat.time * 1000))}, messageId: ${chat.message_id}) 说：${message}`
+      })
+      .join('\n')
+  }
+  return text
+}
+
+/**
+ * 写入快照并维持 map 上限，超限时淘汰最久未更新的那条。fetchedAt 只用于拉取频率保护。
+ */
+function cacheGroupSnapshot(snapshotKey, { text, newestMessageId }) {
+  groupSnapshotCache.set(snapshotKey, { text, newestMessageId, fetchedAt: Date.now() })
+  if (groupSnapshotCache.size <= GROUP_SNAPSHOT_LIMIT) return
+  let oldestKey = null
+  let oldestAt = Infinity
+  for (const [key, entry] of groupSnapshotCache) {
+    if (entry.fetchedAt < oldestAt) {
+      oldestAt = entry.fetchedAt
+      oldestKey = key
+    }
+  }
+  if (oldestKey) groupSnapshotCache.delete(oldestKey)
+}
+
+export async function collectGroupContext(e, settings = {}) {
+  const result = { enabled: false, isGroup: false, botName: '', stableBotName: '', stable: '', tip: '', turn: '' }
   if (!settings.enableGroupContext) return result
 
   try {
@@ -232,54 +296,37 @@ async function collectGroupContext(e, settings = {}) {
     // 仍在 prompt 里随引用带入，信息不缺。
     const snapshotKey = `${e.self_id}:${groupId}:${groupContextLength}:${botName}:${groupName}`
     const cachedSnapshot = groupSnapshotCache.get(snapshotKey)
+    // fetchedAt 是「上次实际拉取时刻」：频率保护看它，内容新旧看 newestMessageId。
+    // dueFetch 区分「没到时间没拉」和「拉了但失败」：成功失败都续期，
+    // 否则 adapter 一抛错就变成每轮都卡在一次超时上。
+    const dueFetch = !cachedSnapshot || Date.now() - cachedSnapshot.fetchedAt >= GROUP_SNAPSHOT_MIN_INTERVAL
+    const chats = dueFetch ? await fetchGroupHistory(e, groupContextLength) : null
+    if (dueFetch && cachedSnapshot) {
+      cachedSnapshot.fetchedAt = Date.now()
+    }
+    // 拉取失败或返回空时 newer 恒为 0，直接落到「沿用旧快照」：缓存既不清空也不缩短。
+    const shouldRebuild = shouldRebuildSnapshot(cachedSnapshot, chats, chats?.length || 0)
     let publicText
-    if (cachedSnapshot && Date.now() - cachedSnapshot.at < cachedSnapshot.ttl) {
-      publicText = cachedSnapshot.text
-    } else {
-      const chats = await msgHistoryMgr.getGroupHistoryContext(e, groupContextLength, { fromLatest: true })
-      publicText = `\nthe group name is ${groupName}, group id is ${groupId}。`
-      if (botName) publicText += `Your nickname is ${sanitizeContextText(botName)} in the group,`
-      if (Array.isArray(chats) && chats.length > 0) {
-        publicText += 'There is the conversation history in the group, you must chat according to the conversation history context"'
-        publicText += chats
-          .map(chat => {
-            const sender = chat.sender || {}
-            // 历史条目由各 adapter 的接口返回，字段并不总是齐全（NapCat 是必填，别家未必）：
-            // 直接 startsWith 会抛错，整段群历史被 catch 丢弃，日志只剩「获取群聊聊天记录失败」。
-            const rawMessage = typeof chat.raw_message === 'string' ? chat.raw_message : ''
-            if (rawMessage.startsWith('建议的回复')) {
-              // 建议的回复太容易污染设定导致对话太固定跑偏了
-              return ''
-            }
-            const card = sanitizeContextText(sender.card || sender.nickname)
-            const area = sanitizeContextText(sender.area)
-            const title = sanitizeContextText(sender.title)
-            const text = sanitizeContextText(rawMessage)
-            return `【${card}】(qq：${sender.user_id}, ${roleMap[sender.role] || 'normal user'}，${area ? 'from ' + area + ', ' : ''} ${sender.age} years old, 群头衔：${title}, gender: ${sender.sex}, time：${formatDate(new Date(chat.time * 1000))}, messageId: ${chat.message_id}) 说：${text}`
-          })
-          .join('\n')
-      }
-      groupSnapshotCache.set(snapshotKey, {
+    if (shouldRebuild) {
+      // 拉取失败或返回空也照样写一份「只有群名群号」的快照：这三样本机就有，丢了只会让
+      // system 变短、更容易跌破上游门槛。从无到有只会让 system 变一次，代价可接受。
+      const reached = Array.isArray(chats) ? chats : []
+      publicText = formatGroupSnapshotText({ groupName, groupId, botName, chats: reached })
+      cacheGroupSnapshot(snapshotKey, {
         text: publicText,
-        at: Date.now(),
-        // 只有取满窗口才按 5 分钟缓存。不足额意味着翻页被截断、重试耗尽，或群里本来就没几条：
-        // 前两种是残缺上下文，顶着五分钟会把「少了一半的群记录」固化成常态。
-        ttl: chats?.length >= groupContextLength ? GROUP_SNAPSHOT_TTL : GROUP_SNAPSHOT_EMPTY_TTL
+        newestMessageId: reached.length > 0 ? String(reached[reached.length - 1]?.message_id ?? '') : ''
       })
-      if (groupSnapshotCache.size > GROUP_SNAPSHOT_LIMIT) {
-        let oldestKey = null
-        let oldestAt = Infinity
-        for (const [key, entry] of groupSnapshotCache) {
-          if (entry.at < oldestAt) {
-            oldestAt = entry.at
-            oldestKey = key
-          }
-        }
-        if (oldestKey) groupSnapshotCache.delete(oldestKey)
-      }
+    } else {
+      // 冻结期内逐字节取缓存，不重新拼一遍（重拼会引入时区、名片变更等噪声）
+      publicText = cachedSnapshot.text
     }
 
-    result.turn = `Attention, you are currently chatting in a qq group.${publicText}` +
+    // 群记录快照是「伪动态」段：冻结期内逐字节不变，前移进 system 才能吃到缓存断点。
+    // 提问者身份仍留在 turnContext，每轮不同也不会污染前缀。
+    // 标签只在出口加：缓存里存的是不带标签的 publicText，逐字节比较不受影响。
+    // 少了这层边界，system 里一大段「群友说：…」会被模型当成人设的一部分去模仿。
+    result.stable = publicText ? `<group_context>\n${publicText.trimStart()}\n</group_context>` : ''
+    result.turn = 'Attention, you are currently chatting in a qq group.' +
       `\nThe one who asks you now is ${senderName}(${e.sender.user_id})。`
   } catch (err) {
     // 私聊也要留下痕：静默吞掉会让「为什么这轮没带上下文」无从查起
@@ -527,9 +574,14 @@ class Core {
         if (group.enabled) {
           system = system.replaceAll('[name]', group.stableBotName || 'Claude')
         }
+        // 群记录快照拼在 [name] 替换之后：群友聊天正文里的 [name] 字面量不得被换成人设名，
+        // 而缓存断点要一路覆盖到群记录末尾（群记录是伪动态，不再走 turnContext）。
+        if (group.stable) {
+          system += '\n' + group.stable
+        }
         option.system = system
-        // system 现在只剩稳定段，缓存断点直接落在末尾
-        option.systemStableLength = system.length
+        // 断点打在整段 system 末尾：群记录快照已拼进稳定段，缓存必须一路覆盖到它末尾
+        option.systemStableLength = option.system.length
         option.turnContext = wrapTurnContext(groupContextBody(group), [
           claudeSystemDynamic,
           buildDynamicSystemSuffix({ replyTimestamps: conversation.replyTimestamps })
@@ -601,6 +653,10 @@ class Core {
       if (group.enabled) {
         system = system.replaceAll('[name]', group.stableBotName || 'GeminiPro')
       }
+      // 群记录快照拼在 [name] 替换之后、上下文注入之前
+      if (group.stable) {
+        system += '\n' + group.stable
+      }
       option.system = system
       option.turnContext = wrapTurnContext(groupContextBody(group), [
         geminiSystemDynamic,
@@ -642,6 +698,10 @@ class Core {
         if (extraSystemMessage) instructions += extraSystemMessage
         if (group.enabled) {
           instructions = instructions.replaceAll('[name]', group.stableBotName || 'ChatGPT')
+        }
+        // 群记录快照在上下文注入之前拼进 system：注入文本来自外部端点、每轮可能变
+        if (group.stable) {
+          instructions += '\n' + group.stable
         }
         // 上下文注入来自外部端点、每轮可能变，放在稳定段之后
         instructions = await withContextInjection(opt.prepared, Config, instructions, conversation)
@@ -838,6 +898,10 @@ class Core {
         }
         if (group.enabled) {
           system = system.replaceAll('[name]', group.stableBotName || 'ChatGPT')
+        }
+        // 群记录快照在上下文注入之前拼进 system：注入文本来自外部端点、每轮可能变
+        if (group.stable) {
+          system += '\n' + group.stable
         }
         // 上下文注入来自外部端点、每轮可能变，放在稳定段之后
         system = await withContextInjection(opt.prepared, Config, system, conversation)

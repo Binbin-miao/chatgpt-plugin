@@ -53,8 +53,8 @@ test('四条通道都先拼稳定段、再追加动态段', () => {
 })
 
 test('Claude 分支把稳定段长度交给客户端', () => {
-  // system 现在只剩稳定段，断点长度直接取整段长度
-  assert.ok(core.includes('option.systemStableLength = system.length'), 'Claude 分支没传稳定段长度')
+  // 群记录快照已拼进 system，断点长度必须取拼完之后的整段长度
+  assert.ok(core.includes('option.systemStableLength = option.system.length'), 'Claude 分支没传稳定段长度')
 })
 
 test('Claude 客户端的缓存断点按稳定段切分，而不是打在整段末尾', () => {
