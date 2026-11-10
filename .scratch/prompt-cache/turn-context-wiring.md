@@ -66,7 +66,7 @@ N 条（`fromLatest: true`），普通回复与自主回复共用同一份。提
 | system 里群历史多一行 | 0 |
 | system 只改末尾 `Current time` | 0 |
 
-对 `cpa.aichen.qzz.io`（渠道 23「辰」）与自建 gcli2api 各测一轮，结论一致。
+对第三方聚合中转与自建 gcli2api 各测一轮，结论一致。
 
 ## 5. 避坑备忘录
 

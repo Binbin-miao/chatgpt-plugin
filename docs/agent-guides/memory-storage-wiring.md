@@ -156,4 +156,4 @@ runDaily
 #清理无效记忆 [预览]
 ```
 
-文件位置：容器内 `/root/TRSS_AllBot/TRSS-Yunzai/data/chatgpt/memory/raw`（进程 cwd 是 Yunzai 根目录，不是插件目录）。
+文件位置：`data/chatgpt/memory/raw`（相对 Yunzai 根目录，不是插件目录）。
