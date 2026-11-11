@@ -635,14 +635,19 @@ export class chatgpt extends plugin {
         }
 
         if (isBlacklisted) {
+          // 黑名单只拦别人：主人被误配进去会把自己锁死且无自救入口，放行并留痕便于发现配错。
+          if (e.isMaster) {
+            logger.info(`[Chatgpt][对话拦截] 主人命中黑名单(${item})，已豁免 (用户:${userId} 群:${groupId})`)
+            continue
+          }
           logger.info(`[Chatgpt][对话拦截] 用户匹配到黑名单(${item})，拒绝对话 (用户:${userId} 群:${groupId})`)
           return false
         }
       }
     }
 
-    // 当白名单设置不为空的时候，使用白名单加黑名单模式
-    if (whitelist.length > 0 && !chatPermission) {
+    // 当白名单设置不为空的时候，使用白名单加黑名单模式；主人不受白名单约束
+    if (whitelist.length > 0 && !chatPermission && !e.isMaster) {
       // logger.info(`[Chatgpt][对话拦截] 用户不在白名单中，拒绝对话 (用户:${userId} 群:${groupId})`)
       return false
     }

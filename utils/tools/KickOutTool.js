@@ -26,8 +26,12 @@ export class KickOutTool extends AbstractTool {
     let { qq, groupId, sender, isAdmin, isPunish } = opts
     qq = isNaN(qq) || !qq ? e.sender.user_id : parseInt(qq.trim())
     groupId = isNaN(groupId) || !groupId ? e.group_id : parseInt(groupId.trim())
-    if (!isAdmin && sender != qq) {
-      return 'the user is not admin, he cannot kickout other people. he should be punished'
+    // 检查权限：只有主人/该群的管理员，可以对其他群友生效
+    const hasAdminPermission = e.isMaster || (isAdmin && e.group_id == groupId)
+    if (!hasAdminPermission) {
+      if (qq != sender) {
+        return 'the user is not admin, he cannot kickout other people. he should be punished'
+      }
     }
     console.log('kickout', groupId, qq)
     let group = await e.bot.pickGroup(groupId)
