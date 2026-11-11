@@ -46,8 +46,6 @@ import { pickSessionProfile, sessionProfile, allowFallbackFor } from '../utils/s
 
 let version = Config.version
 
-// 同群串行队列：避免同一群多条对话同时打上游触发 429
-const __gptQueue = new Map()
 let proxy = getProxy()
 const isTrss = Array.isArray(Bot.uin)
 const sleep_zz = (delay) => new Promise((resolve) => setTimeout(resolve, delay))
@@ -676,18 +674,18 @@ export class chatgpt extends plugin {
   }
 
   async abstractChat(e, prompt, use, forcePictureMode = false, opts = {}) {
-    const __key = String(e.group_id || e.user_id || 'default')
-
-    // 冷却预检：冷却中的请求直接丢弃，既不发确认也不入队。
-    // 确认必须在冷却之后，否则用户会看到「贴表情 / 在哦」却永远等不到回复。
-    // check 只读（仅 redis.get），_abstractChat 里再查一次是幂等的。
-    const __cool = await ChatCooldown.check(e.user_id, e.group_id, e.isMaster)
-    if (!__cool.canChat) {
-      logger.info(`[Chatgpt][ChatCooldown]${e.user_id}上一次对话未完成，跳过此次对话，超时时间剩余 ${__cool.remainingTime} 秒`)
-      return false
+    // 冷却预检放在确认之前：被冷却拒绝的请求不发「在哦」也不贴表情。
+    // 用户看到反应却等不到回复，比一开始就没反应更难受。
+    // 自主回复是机器人自己发起的，既不查冷却，也不占用户的冷却位。
+    if (!opts.automatic) {
+      const __cool = await ChatCooldown.check(e.user_id, e.group_id, e.isMaster)
+      if (!__cool.canChat) {
+        logger.info(`[Chatgpt][ChatCooldown]${e.user_id}上一次对话未完成，跳过此次对话，超时时间剩余 ${__cool.remainingTime} 秒`)
+        return false
+      }
     }
 
-    // 入队即确认：排队期间也让用户立刻看到反应，不必等轮到自己
+    // 立即确认：先给用户一个反应，不必等模型开始吐字
     if (!opts.automatic) {
       try {
         const __cfg = Config.getConfig()
@@ -698,21 +696,11 @@ export class chatgpt extends plugin {
         }
         if (e.send_typing) e.send_typing()
       } catch (err) {
-        logger.warn('[chatgpt] 入队确认失败', err)
+        logger.warn('[chatgpt] 回复确认失败', err)
       }
     }
 
-    const __prev = __gptQueue.get(__key) || Promise.resolve()
-    const __cur = __prev.then(() => this._abstractChat(e, prompt, use, forcePictureMode, opts))
-    const __tail = __cur.catch(() => {})
-    __gptQueue.set(__key, __tail)
-    const __wd = setTimeout(() => logger.warn(`[chatgpt][Queue] 排队超过 120s key=${__key}`), 120000)
-    __wd.unref?.()
-    __tail.then(() => {
-      clearTimeout(__wd)
-      if (__gptQueue.get(__key) === __tail) __gptQueue.delete(__key)
-    })
-    return __cur
+    return this._abstractChat(e, prompt, use, forcePictureMode, opts)
   }
 
   async _abstractChat(e, prompt, use, forcePictureMode = false, { automatic = false } = {}) {
@@ -889,15 +877,18 @@ export class chatgpt extends plugin {
       has: (arg1) => false
     }
 
-    /** 检查对话冷却 */
-    const cooldownResult = await ChatCooldown.check(e.user_id, e.group_id, e.isMaster)
-    if (!cooldownResult.canChat) {
-      logger.info(`[Chatgpt][ChatCooldown]${e.user_id}上一次对话未完成，跳过此次对话，超时时间剩余 ${cooldownResult.remainingTime} 秒`)
-      return false
+    /** 检查对话冷却。自主回复不参与并发限制：它由机器人自己发起，
+     *  既不该被用户的对话挡住，也不该去占用户的冷却位。 */
+    if (!automatic) {
+      const cooldownResult = await ChatCooldown.check(e.user_id, e.group_id, e.isMaster)
+      if (!cooldownResult.canChat) {
+        logger.info(`[Chatgpt][ChatCooldown]${e.user_id}上一次对话未完成，跳过此次对话，超时时间剩余 ${cooldownResult.remainingTime} 秒`)
+        return false
+      }
+      // 标记对话开始
+      if (config.switch_ChatCooldown)
+        await ChatCooldown.start(e.user_id, e.group_id)
     }
-    // 标记对话开始
-    if (config.switch_ChatCooldown)
-      await ChatCooldown.start(e.user_id, e.group_id)
 
     // 加载相关记忆（V2：按当前问题相关性召回，非最新N条）
     __perf.tMem = Date.now()
@@ -931,7 +922,7 @@ export class chatgpt extends plugin {
       }
 
       // 回复确认
-      // 确认逻辑已前移到 abstractChat 入队处，此处不再重复
+      // 确认逻辑已前移到 abstractChat 入口，此处不再重复
 
       // 自主回复可能选中较早的消息：引用身份保留在 e，群记录仍取群内最新窗口（全群共用快照）。
       const options = automatic && e.isGroup
@@ -1598,7 +1589,9 @@ export class chatgpt extends plugin {
         }
       }
     } finally {
-      ChatCooldown.end(e.user_id, e.group_id)
+      // 自主回复没有 start 过，自然不能 end：否则会把用户正在进行的对话标记删掉，
+      // 等于替用户解除了并发保护。
+      if (!automatic) ChatCooldown.end(e.user_id, e.group_id)
     }
   }
 
