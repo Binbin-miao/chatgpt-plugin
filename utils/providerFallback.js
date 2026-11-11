@@ -78,7 +78,7 @@ export function trimConversation(messages, config, provider = null) {
   // 输出预留吃掉整个窗口时预算会变成 1，历史被砍到只剩 2 条；照客户端守卫的写法兜住
   const budget = Math.max(1, windowTokens > outTokens ? windowTokens - outTokens : windowTokens - 1)
   // 中文约 1 字 1 token、英文约 4 字符 1 token，按 1.5 折中：宁可裁早一点，也不要把
-  // 中文历史算得太乐观而撞上真实上限（api 通道另有真 tokenizer 兜底，不受此影响）
+  // 中文历史算得太乐观而撞上真实上限
   const charCap = Math.max(1, Math.floor(budget * 1.5))
   let chars = result.reduce((n, m) => n + m.content.length, 0)
   // 与条数分支同构：涨过上界才裁，一次裁到 70%。触发线与目标线必须分开，

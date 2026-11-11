@@ -1,4 +1,4 @@
-import { resolveProvider, providerConfig } from '../utils/providers.js'
+import { resolveProvider, providerConfig, providerConversationKey } from '../utils/providers.js'
 import { PROMPT_FIELDS, KEY_FIELDS, providerLabel, connectionVersion } from '../utils/providerProfiles.js'
 import { createAttemptHistory, runProviderFallback } from '../utils/providerFallback.js'
 import {
@@ -14,7 +14,6 @@ import {
   normalizeChatMode,
   // isCN
 } from '../utils/common.js'
-import { KeyvFile } from 'keyv-file'
 // import { getChatHistoryGroup } from '../utils/chat.js'
 import { msgHistoryMgr } from '../model/Onebot11_MessageHistoryManager.js'
 import { APTool } from '../utils/tools/APTool.js'
@@ -58,9 +57,8 @@ import { ChatGPTAPI } from '../utils/openai/chatgpt-api.js'
 import { ResponsesAPI } from '../utils/openai/responses-api.js'
 import { getEnabledHostedBuiltinTools } from '../utils/hostedTools.js'
 import { newFetch } from '../utils/proxy.js'
-import Keyv from 'keyv'
 import crypto from 'crypto'
-import { loadQuotedImages, appendMediaFailureHint, resolveTurnSystem } from '../utils/quotedImage.js'
+import { loadQuotedImages, resolveTurnSystem } from '../utils/quotedImage.js'
 import { buildOpenAIContent, buildResponsesInput } from '../utils/visionPayload.js'
 import { sendToolCallForwardMsg, sendToolRoundTextForwardMsg } from '../utils/toolForward.js'
 import { normalizeModelText } from '../utils/thinking.js'
@@ -120,21 +118,6 @@ function appendGroupAutoReplyPrompt(system, opt) {
   return opt.groupAutoReply ? `${system}\n${groupAutoReplyPrompt}` : system
 }
 
-function getRetryGroupContextLengths(baseLength = 0) {
-  if (!Number.isFinite(baseLength) || baseLength <= 0) {
-    return [0]
-  }
-
-  const fallbackLengths = [
-    Math.floor(baseLength * 0.75),
-    Math.floor(baseLength * 0.5),
-    Math.floor(baseLength * 0.25),
-    0
-  ]
-
-  return [...new Set(fallbackLengths.filter(length => length >= 0 && length < baseLength))]
-}
-
 /**
  * 本轮可变上下文的外层标记。
  *
@@ -192,8 +175,12 @@ export function clearGroupSnapshotCache() {
  * 绝不能把异常抛给上层去清空缓存：system 一旦变短会立刻跌破缓存门槛，比多带一轮旧记录亏得多。
  */
 async function fetchGroupHistory(e, groupContextLength) {
+  const __tGH = Date.now()
   try {
-    return await msgHistoryMgr.getGroupHistoryContext(e, groupContextLength, { fromLatest: true })
+    const __r = await msgHistoryMgr.getGroupHistoryContext(e, groupContextLength, { fromLatest: true })
+    const __d = Date.now() - __tGH
+    if (Config.debug && __d > 2000) logger.mark(`[PERF-GH] 群历史拉取=${__d}ms 条数=${Array.isArray(__r) ? __r.length : '?'}`)
+    return __r
   } catch (err) {
     logger.warn('获取群聊聊天记录失败，沿用已有群记录快照', err)
     return null
@@ -448,6 +435,7 @@ function applyQuotedMedias(option, medias) {
 
 class Core {
   async sendMessage(prompt, conversation = {}, use, e, opt = {}) {
+    opt.__s0 = Date.now()
     const source = opt.providerSource || structuredClone(Config.getConfig())
     const main = resolveProvider(use || source.defaultProviderId, source)
     const backup = opt.allowFallback && source.fallbackProviderId ? resolveProvider(source.fallbackProviderId, source) : null
@@ -455,6 +443,7 @@ class Core {
     const prepared = {}
     const owner = this
     return runProviderFallback(main, backup, async (row, state) => {
+      opt.__t0 = Date.now()
       if (!String(row[KEY_FIELDS[row.type]] || '').split(/[,，;]/).some(key => key.trim())) throw new Error(`${providerLabel(row)} 尚未配置密钥`)
       const cfg = providerConfig(row, source)
       cfg[PROMPT_FIELDS[row.type]] = main[PROMPT_FIELDS[main.type]]
@@ -470,6 +459,10 @@ class Core {
         const url = new URL(args[0])
         if (!['http:', 'https:'].includes(url.protocol)) throw new Error('模型提供商地址需要使用 http 或 https')
         state.requested = true
+        if (opt.__req0 === undefined) {
+          opt.__req0 = Date.now()
+          if (Config.debug) logger.mark(`[PERF-REQ] use=${use} 准备=${opt.__t0 - opt.__s0}ms 分支前置=${opt.__req0 - opt.__t0}ms`)
+        }
         return newFetch(...args)
       }
       const result = await Core.prototype.sendWithProvider.call(context, prompt, nextConversation, row.type, event,
@@ -482,6 +475,17 @@ class Core {
 
   async sendWithProvider(prompt, conversation, use, e, opt, Config) {
     const { getMessageById, upsertMessage } = opt.history
+
+    /**
+     * 上下文超限后清空当前会话。key 必须与 apps/chat.js 落盘时同一套算法
+     * （V2 + 通道 id + 连接版本 + scope）：旧格式 `CHATGPT:CONVERSATIONS:<uin>`
+     * 早已无人写入，删它等于没删，会让下一轮继续撞同一堵墙。
+     */
+    const clearOverflowConversation = async () => {
+      const scope = e.isGroup && Config.groupMerge ? String(e.group_id) : e.sender.user_id
+      await redis.del(providerConversationKey(Config, scope))
+      await redis.del(`CHATGPT:WRONG_EMOTION:${e.sender.user_id}`)
+    }
 
     opt = {
       enableSmart: Config.smartMode,
@@ -595,6 +599,7 @@ class Core {
         return await client.sendMessage(promptForClaude, option)
       }
     } else if (use === 'gemini') { // 使用接口 ##############################
+      const __gp = { t0: Date.now() }
       let client = new CustomGoogleGeminiClient({
         config: Config, fetch: opt.request, onToolStart: opt.onToolStart, ...opt.history,
         e,
@@ -622,6 +627,7 @@ class Core {
 
       // 记录点: opt.medias —— 引用图统一走 quotedImage
       const quoted = await collectQuotedImages(e, opt.prepared)
+      __gp.quoted = Date.now()
       applyQuotedMedias(option, quoted.medias)
       const quotedFailed = quoted.failed > 0
 
@@ -638,6 +644,7 @@ class Core {
           systemAddition,
           systemDynamic
         } = await collectTools(e)
+      __gp.tools = Date.now()
         let tools = Object.keys(funcMap).map(k => funcMap[k].tool)
         client.addTools(tools)
         geminiSystemAddition = systemAddition || ''
@@ -650,6 +657,7 @@ class Core {
       system += geminiSystemAddition
 
       const group = await collectGroupContext(e, opt.settings)
+      __gp.group = Date.now()
       if (group.enabled) {
         system = system.replaceAll('[name]', group.stableBotName || 'GeminiPro')
       }
@@ -677,8 +685,12 @@ class Core {
       option.auto_makeForwardMsg = Config.auto_makeForwardMsg
 
       option.system = await withContextInjection(opt.prepared, Config, option.system, conversation)
+      __gp.inject = Date.now()
       option.system = appendGroupAutoReplyPrompt(resolveTurnSystem(opt.prepared, option.system, quotedFailed), opt)
-      return await client.sendMessage(prompt, option)
+      const __gr = await client.sendMessage(prompt, option)
+      __gp.api = Date.now()
+      if (Config.debug) logger.mark(`[PERF-G] 引用图=${__gp.quoted - __gp.t0}ms 工具=${(__gp.tools || __gp.quoted) - __gp.quoted}ms 群上下文=${__gp.group - (__gp.tools || __gp.quoted)}ms 拼装=${__gp.inject - __gp.group}ms API=${__gp.api - __gp.inject}ms`)
+      return __gr
     } else if (use === 'responses') { // OpenAI Responses API ##############################
       const completionParams = {}
       if (Config.responsesModel) completionParams.model = Config.responsesModel
@@ -779,26 +791,11 @@ class Core {
         ? [...initialInput]
         : [{ role: 'user', content: initialInput }]
 
-      const sendResponsesWithContextFallback = async (input, sendOptions) => {
-        const retryLengths = !opt.allowFallback && opt.settings.enableGroupContext
-          ? getRetryGroupContextLengths(Config.groupContextLength)
-          : []
-        for (let i = 0; i <= retryLengths.length; i++) {
-          try {
-            const result = await client.sendMessage(input, sendOptions)
-            // 官网已执行的内置工具同样不能随整轮重试重复执行。
-            if (result.responseOutput?.some(item => item.type !== 'function_call' && item.type?.endsWith('_call'))) opt.onToolStart()
-            return result
-          } catch (err) {
-            const isContextExceeded = err.message?.includes('context_length_exceeded')
-            if (!isContextExceeded || i >= retryLengths.length) throw err
-            const nextGroupContextLength = retryLengths[i]
-            logger.warn(`[chatgpt][Responses] 上下文超限，压缩群聊记录后重试，groupContextLength=${nextGroupContextLength}`)
-            const rebuilt = await buildResponsesInstructions(nextGroupContextLength)
-            sendOptions.instructions = quotedFailed ? appendMediaFailureHint(rebuilt.instructions) : rebuilt.instructions
-            sendOptions.turnContext = rebuilt.turnContext
-          }
-        }
+      const sendResponses = async (input, sendOptions) => {
+        const result = await client.sendMessage(input, sendOptions)
+        // 官网已执行的内置工具要提前记账，否则外层会当成「本轮没调工具」再跑一遍。
+        if (result.responseOutput?.some(item => item.type !== 'function_call' && item.type?.endsWith('_call'))) opt.onToolStart()
+        return result
       }
 
       const sendOptions = {
@@ -811,7 +808,7 @@ class Core {
       }
 
       try {
-        let msg = await sendResponsesWithContextFallback(initialInput, sendOptions)
+        let msg = await sendResponses(initialInput, sendOptions)
         let toolRoundCount = 0
         /** 工具轮思考（含被重归类的独白），跨轮累积后并入最终 thinking_text */
         let toolRoundThinking = ''
@@ -843,10 +840,10 @@ class Core {
 
           if (Config.responsesStore) {
             sendOptions.previousResponseId = msg.id
-            msg = await sendResponsesWithContextFallback(toolResults, sendOptions)
+            msg = await sendResponses(toolResults, sendOptions)
           } else {
             statelessToolInput.push(...msg.responseOutput, ...toolResults)
-            msg = await sendResponsesWithContextFallback(statelessToolInput, sendOptions)
+            msg = await sendResponses(statelessToolInput, sendOptions)
           }
         }
 
@@ -862,6 +859,7 @@ class Core {
       } catch (err) {
         if (!opt.allowFallback && err.message?.includes('context_length_exceeded')) {
           logger.warn(err)
+          await clearOverflowConversation()
           await this.reply('字数超限啦，将为您自动结束本次对话。')
           return null
         }
@@ -960,30 +958,9 @@ class Core {
       // Chat Completions 的图片走 messageContent（buildOpenAIContent），option 上没有 medias 字段
 
       /** 定义OpenAI格式请求 */
-      const sendOpenAIWithContextFallback = async (messageContent, sendOption) => {
-        const retryLengths = !opt.allowFallback && opt.settings.enableGroupContext
-          ? getRetryGroupContextLengths(Config.groupContextLength)
-          : []
-
-        for (let i = 0; i <= retryLengths.length; i++) {
-          try {
-            // logger.mark(`messageContent:\n` + JSON.stringify(messageContent, null, 2))
-            // logger.mark(`sendOption:\n` + JSON.stringify(sendOption, null, 2))
-            // 第 0 次走缓存；压缩重试后的 system 是本次特意重建的，必须绕过缓存
-            sendOption.systemMessage = resolveTurnSystem(opt.prepared, sendOption.systemMessage, quotedFailed, { useCache: i === 0 })
-            return await this.chatGPTApi.sendMessage(messageContent, sendOption)
-          } catch (err) {
-            const isContextExceeded = err.message?.indexOf('context_length_exceeded') > 0
-            if (!isContextExceeded || i >= retryLengths.length) {
-              throw err
-            }
-            const nextGroupContextLength = retryLengths[i]
-            logger.warn(`[chatgpt] 上下文超限，压缩群聊记录后重试，groupContextLength=${nextGroupContextLength}。若频繁出现，请检查锅巴中的“回复内容最大Token数(apiMaxToken)”与“模型总上下文Token数(maxModelTokens)”配置是否过紧。`)
-            const rebuilt = await buildOpenAIRequest(nextGroupContextLength)
-            sendOption.systemMessage = rebuilt.system
-            sendOption.turnContext = rebuilt.turnContext
-          }
-        }
+      const sendOpenAI = async (messageContent, sendOption) => {
+        sendOption.systemMessage = resolveTurnSystem(opt.prepared, sendOption.systemMessage, quotedFailed, { useCache: true })
+        return await this.chatGPTApi.sendMessage(messageContent, sendOption)
       }
 
       if (opt.enableSmart) {
@@ -1028,7 +1005,7 @@ class Core {
             ? buildOpenAIContent(prompt || '请描述这张图片', quotedMedias)
             : prompt;
 
-          msg = await sendOpenAIWithContextFallback(messageContent, option)
+          msg = await sendOpenAI(messageContent, option)
 
           // 本轮用户消息的 id 只在这里可靠：进入工具轮后 msg.parentMessageId 已经是 tool 消息。
           // 只在本轮真的带了引用图时才记录，普通路径不带这个字段。
@@ -1178,7 +1155,7 @@ class Core {
             await common.sleep(300)
 
             // 将所有并行工具的结果一次性POST回给API，进入下一轮
-            msg = await sendOpenAIWithContextFallback(null, option)
+            msg = await sendOpenAI(null, option)
 
             if (Config.debug)
               logger.info(JSON.stringify(msg, null, 2))
@@ -1194,10 +1171,9 @@ class Core {
             upsertMessage(msg).catch(err => logger.warn('[chatgpt] 清理存储中的工具调用记录失败', err))
           }
         } catch (err) {
-          if (!opt.allowFallback && err.message?.indexOf('context_length_exceeded') > 0) {
+          if (!opt.allowFallback && err.message?.includes('context_length_exceeded')) {
             logger.warn(err)
-            await redis.del(`CHATGPT:CONVERSATIONS:${e.sender.user_id}`)
-            await redis.del(`CHATGPT:WRONG_EMOTION:${e.sender.user_id}`)
+            await clearOverflowConversation()
             await this.reply('字数超限啦，将为您自动结束本次对话。')
             return null
           } else {
@@ -1215,12 +1191,11 @@ class Core {
           let messageContent = quotedMedias.length
             ? buildOpenAIContent(prompt || '请描述这张图片', quotedMedias)
             : prompt;
-          msg = await sendOpenAIWithContextFallback(messageContent, option)
+          msg = await sendOpenAI(messageContent, option)
         } catch (err) {
-          if (!opt.allowFallback && err.message?.indexOf('context_length_exceeded') > 0) {
+          if (!opt.allowFallback && err.message?.includes('context_length_exceeded')) {
             logger.warn(err)
-            await redis.del(`CHATGPT:CONVERSATIONS:${e.sender.user_id}`)
-            await redis.del(`CHATGPT:WRONG_EMOTION:${e.sender.user_id}`)
+            await clearOverflowConversation()
             await this.reply('字数超限啦，将为您自动结束本次对话。')
             return null
           } else {

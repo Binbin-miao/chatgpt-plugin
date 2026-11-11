@@ -41,7 +41,7 @@ export function appendMediaFailureHint(system) {
  * @param {{system?: string}} prepared 本轮共享的准备态（主备复用同一个对象）
  * @param {string} system 本次尝试构建的基础 system
  * @param {boolean} failed 本次尝试是否有引用图未送入模型
- * @param {{useCache?: boolean}} [options] useCache=false 用于上下文压缩重试：本次重建的 system 必须生效，不能回落到缓存
+ * @param {{useCache?: boolean}} [options] useCache=false 跳过缓存，强制以本次传入的 system 为准
  * @returns {string}
  */
 export function resolveTurnSystem(prepared, system, failed, { useCache = true } = {}) {

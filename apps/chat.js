@@ -19,15 +19,12 @@ import {
   getUserReplySetting,
   isImage,
   makeForwardMsg,
-  normalizeChatMode,
   randomString,
-  render,
   renderUrl
 } from '../utils/common.js'
 
 import fetch from 'node-fetch'
-import { KeyvFile } from 'keyv-file'
-import { deleteConversation, getConversations, getLatestMessageIdByConversationId } from '../utils/conversation.js'
+import { getConversations } from '../utils/conversation.js'
 import { convertSpeaker, speakers } from '../utils/tts.js'
 import { convertFacesAndCQCode } from '../utils/face.js'
 import { ConversationManager, originalValues } from '../model/conversation.js'
@@ -48,6 +45,9 @@ import { isBotReplyAllowed } from '../utils/botReplyWhitelist.js'
 import { pickSessionProfile, sessionProfile, allowFallbackFor } from '../utils/sessionProvider.js'
 
 let version = Config.version
+
+// 同群串行队列：避免同一群多条对话同时打上游触发 429
+const __gptQueue = new Map()
 let proxy = getProxy()
 const isTrss = Array.isArray(Bot.uin)
 const sleep_zz = (delay) => new Promise((resolve) => setTimeout(resolve, delay))
@@ -293,245 +293,12 @@ export class chatgpt extends plugin {
     return routed ? routed.profile : sessionProfile(e, source, resolveProvider)
   }
 
-  async getClearContextMode(e) {
-    return Config.defaultProviderId
-  }
-
   getClearContextScope(e, use) {
     return (e.isGroup && Config.groupMerge) ? e.group_id.toString() : e.sender.user_id
   }
 
   getClearContextConversationKey(e, use) {
     return providerConversationKey(this.sessionProfileFor(e), this.getClearContextScope(e, use))
-  }
-
-  getClearContextMessageSuffix(use) {
-    use = resolveProvider(use).type
-    switch (use) {
-      case 'gemini':
-        return 'Gemini'
-      case 'claude':
-        return 'Claude'
-      default:
-        return ''
-    }
-  }
-
-  getMessageRedisKey(messageId, suffix = '') {
-    return `CHATGPT:MESSAGE${suffix ? '_' + suffix : ''}:${messageId}`
-  }
-
-  getConversationExpireOption() {
-    return Config.conversationPreserveTime > 0 ? { EX: Config.conversationPreserveTime } : {}
-  }
-
-  async getKeyvCache(namespace) {
-    let Keyv
-    try {
-      Keyv = (await import('keyv')).default
-    } catch (err) {
-      throw new Error('依赖keyv未安装，请执行pnpm install keyv')
-    }
-    return new Keyv({
-      namespace,
-      store: new KeyvFile({ filename: 'cache.json' })
-    })
-  }
-
-  parseClearContextConversation(raw) {
-    if (!raw) {
-      return null
-    }
-    try {
-      return JSON.parse(raw)
-    } catch (err) {
-      logger.warn('[Chatgpt] parse conversation failed', err)
-      return null
-    }
-  }
-
-  async getStoredMessage(messageId, suffix = '') {
-    const raw = await redis.get(this.getMessageRedisKey(messageId, suffix))
-    if (!raw) {
-      return null
-    }
-    try {
-      return JSON.parse(raw)
-    } catch (err) {
-      logger.warn('[Chatgpt] parse stored message failed', err)
-      return null
-    }
-  }
-
-  isUserMessage(message) {
-    return (message?.role || '').toLowerCase() === 'user'
-  }
-
-  applyClearContextMeta(previousConversation, deletedCount) {
-    previousConversation.num = Math.max(0, (Number(previousConversation.num) || 0) - deletedCount)
-    previousConversation.utime = new Date()
-    if (Array.isArray(previousConversation.replyTimestamps)) {
-      previousConversation.replyTimestamps = previousConversation.replyTimestamps.slice(
-        0,
-        Math.max(0, previousConversation.replyTimestamps.length - deletedCount)
-      )
-    }
-  }
-
-  async saveClearContextConversation(key, previousConversation) {
-    await redis.set(key, JSON.stringify(previousConversation), this.getConversationExpireOption())
-  }
-
-  async clearParentChainContext(key, suffix, count) {
-    const previousConversation = this.parseClearContextConversation(await redis.get(key))
-    if (!previousConversation?.parentMessageId) {
-      return { success: true, deletedCount: 0 }
-    }
-
-    const keysToDelete = []
-    let deletedCount = 0
-    let nextParentMessageId = previousConversation.parentMessageId
-
-    while (nextParentMessageId && deletedCount < count) {
-      const turnKeys = []
-      let scanMessageId = nextParentMessageId
-      let parentBeforeTurn
-      let foundUserTurn = false
-
-      while (scanMessageId) {
-        const message = await this.getStoredMessage(scanMessageId, suffix)
-        if (!message) {
-          break
-        }
-
-        turnKeys.push(this.getMessageRedisKey(scanMessageId, suffix))
-        const parentMessageId = message.parentMessageId
-        if (this.isUserMessage(message)) {
-          parentBeforeTurn = parentMessageId
-          foundUserTurn = true
-          break
-        }
-        scanMessageId = parentMessageId
-      }
-
-      if (!foundUserTurn) {
-        break
-      }
-
-      keysToDelete.push(...turnKeys)
-      nextParentMessageId = parentBeforeTurn
-      deletedCount++
-    }
-
-    if (deletedCount === 0) {
-      return { success: true, deletedCount: 0 }
-    }
-
-    for (const messageKey of [...new Set(keysToDelete)]) {
-      await redis.del(messageKey)
-    }
-
-    if (nextParentMessageId) {
-      previousConversation.parentMessageId = nextParentMessageId
-    } else {
-      delete previousConversation.parentMessageId
-    }
-    this.applyClearContextMeta(previousConversation, deletedCount)
-    await this.saveClearContextConversation(key, previousConversation)
-
-    return { success: true, deletedCount }
-  }
-
-  trimMessageArrayByCount(messages, count) {
-    if (!Array.isArray(messages)) {
-      return 0
-    }
-
-    let deletedCount = 0
-    while (deletedCount < count) {
-      let userIndex = -1
-      for (let i = messages.length - 1; i >= 0; i--) {
-        if (this.isUserMessage(messages[i])) {
-          userIndex = i
-          break
-        }
-      }
-
-      if (userIndex < 0) {
-        break
-      }
-
-      messages.splice(userIndex)
-      deletedCount++
-    }
-
-    return deletedCount
-  }
-
-  async clearChatglmContextByCount(e, key, count) {
-    const previousConversation = this.parseClearContextConversation(await redis.get(key))
-    if (!previousConversation?.parentMessageId) {
-      return { success: true, deletedCount: 0 }
-    }
-
-    const conversationsCache = await this.getKeyvCache('chatglm_6b')
-    const historyKey = `ChatGLMUser_${e.sender.user_id}`
-    const conversation = await conversationsCache.get(historyKey)
-    if (!conversation?.messages?.length) {
-      return { success: true, deletedCount: 0 }
-    }
-
-    const idsToDelete = new Set()
-    let deletedCount = 0
-    let nextParentMessageId = previousConversation.parentMessageId
-
-    while (nextParentMessageId && deletedCount < count) {
-      const turnIds = []
-      let scanMessageId = nextParentMessageId
-      let parentBeforeTurn
-      let foundUserTurn = false
-
-      while (scanMessageId) {
-        const message = conversation.messages.find(item => item.id === scanMessageId)
-        if (!message) {
-          break
-        }
-
-        turnIds.push(message.id)
-        const parentMessageId = message.parentMessageId
-        if (this.isUserMessage(message)) {
-          parentBeforeTurn = parentMessageId
-          foundUserTurn = true
-          break
-        }
-        scanMessageId = parentMessageId
-      }
-
-      if (!foundUserTurn) {
-        break
-      }
-
-      turnIds.forEach(id => idsToDelete.add(id))
-      nextParentMessageId = parentBeforeTurn
-      deletedCount++
-    }
-
-    if (deletedCount === 0) {
-      return { success: true, deletedCount: 0 }
-    }
-
-    conversation.messages = conversation.messages.filter(message => !idsToDelete.has(message.id))
-    await conversationsCache.set(historyKey, conversation)
-
-    if (nextParentMessageId) {
-      previousConversation.parentMessageId = nextParentMessageId
-    } else {
-      delete previousConversation.parentMessageId
-    }
-    this.applyClearContextMeta(previousConversation, deletedCount)
-    await this.saveClearContextConversation(key, previousConversation)
-
-    return { success: true, deletedCount }
   }
 
   async clearContextByCount(e) {
@@ -908,7 +675,48 @@ export class chatgpt extends plugin {
     return true;
   }
 
-  async abstractChat(e, prompt, use, forcePictureMode = false, { automatic = false } = {}) {
+  async abstractChat(e, prompt, use, forcePictureMode = false, opts = {}) {
+    const __key = String(e.group_id || e.user_id || 'default')
+
+    // 冷却预检：冷却中的请求直接丢弃，既不发确认也不入队。
+    // 确认必须在冷却之后，否则用户会看到「贴表情 / 在哦」却永远等不到回复。
+    // check 只读（仅 redis.get），_abstractChat 里再查一次是幂等的。
+    const __cool = await ChatCooldown.check(e.user_id, e.group_id, e.isMaster)
+    if (!__cool.canChat) {
+      logger.info(`[Chatgpt][ChatCooldown]${e.user_id}上一次对话未完成，跳过此次对话，超时时间剩余 ${__cool.remainingTime} 秒`)
+      return false
+    }
+
+    // 入队即确认：排队期间也让用户立刻看到反应，不必等轮到自己
+    if (!opts.automatic) {
+      try {
+        const __cfg = Config.getConfig()
+        if (__cfg.replyConfirmType == -1) {
+          this.reply(`${__cfg.tts_First_person}在哦`, true, { recallMsg: !__cfg.is_recallMsg ? 0 : 30 }).catch(() => {})
+        } else if (__cfg.replyConfirmType && e.group?.setEmojiLike) {
+          e.group.setEmojiLike(e.message_id, __cfg.replyConfirmType)
+        }
+        if (e.send_typing) e.send_typing()
+      } catch (err) {
+        logger.warn('[chatgpt] 入队确认失败', err)
+      }
+    }
+
+    const __prev = __gptQueue.get(__key) || Promise.resolve()
+    const __cur = __prev.then(() => this._abstractChat(e, prompt, use, forcePictureMode, opts))
+    const __tail = __cur.catch(() => {})
+    __gptQueue.set(__key, __tail)
+    const __wd = setTimeout(() => logger.warn(`[chatgpt][Queue] 排队超过 120s key=${__key}`), 120000)
+    __wd.unref?.()
+    __tail.then(() => {
+      clearTimeout(__wd)
+      if (__gptQueue.get(__key) === __tail) __gptQueue.delete(__key)
+    })
+    return __cur
+  }
+
+  async _abstractChat(e, prompt, use, forcePictureMode = false, { automatic = false } = {}) {
+    const __perf = { t0: Date.now(), tMem: 0 }
     const providerSource = structuredClone(Config.getConfig())
     // 会话分流只影响正式对话：群聊自主回复的判断模型是独立配置（groupReply.provider），刻意不动。
     // 分流层任何异常都只降级、不阻断——配错规则不能让这个群的对话直接挂掉。
@@ -1092,6 +900,7 @@ export class chatgpt extends plugin {
       await ChatCooldown.start(e.user_id, e.group_id)
 
     // 加载相关记忆（V2：按当前问题相关性召回，非最新N条）
+    __perf.tMem = Date.now()
     if (config.enableMemory) {
       try {
         const { buildMemoryPrompt } = await import('../utils/memory/recall.js')
@@ -1122,19 +931,15 @@ export class chatgpt extends plugin {
       }
 
       // 回复确认
-      if (config.replyConfirmType == -1) {
-        await this.reply(`${config.tts_First_person}在哦`, true, { recallMsg: !config.is_recallMsg ? 0 : 30 })
-      } else if (config.replyConfirmType && e.group?.setEmojiLike) {
-        e.group.setEmojiLike(e.message_id, config.replyConfirmType)
-      }
-      // 适配器发送“正在输入”状态
-      if (e.send_typing) e.send_typing();
+      // 确认逻辑已前移到 abstractChat 入队处，此处不再重复
 
       // 自主回复可能选中较早的消息：引用身份保留在 e，群记录仍取群内最新窗口（全群共用快照）。
       const options = automatic && e.isGroup
         ? { groupAutoReply: true, settings: { enableGroupContext: true } }
         : {}
+      const __tModel = Date.now()
       let chatMessage = await Core.sendMessage.bind(this)(prompt, conversation, profile.id, e, { ...options, allowFallback, providerSource })
+      if (Config.debug) { const __cost = Date.now() - __perf.t0; if (__cost > 3000) logger.mark(`[PERF] 总=${__cost}ms 组装=${__perf.tMem - __perf.t0}ms 记忆=${__tModel - __perf.tMem}ms 模型=${Date.now() - __tModel}ms`) }
       if (chatMessage?.noMsg) {
         return false
       }

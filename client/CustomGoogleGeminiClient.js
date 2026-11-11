@@ -345,6 +345,7 @@ export class CustomGoogleGeminiClient extends GoogleGeminiClient {
         'x-goog-api-key': this._key
       }
     }, {
+      delayMs: 2000, // 连接失败重试不空等 60s：本通道走国内直连，快速重试比长等更有效
       onRetry: ({ error, retry, maxRetries, delayMs }) => {
         logger.warn(`[Chatgpt][Gemini] 连接失败 (${error.code || error.message})，${delayMs / 1000} 秒后进行第 ${retry}/${maxRetries} 次重试`)
       }

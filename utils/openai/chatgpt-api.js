@@ -3,7 +3,6 @@ import pTimeout from 'p-timeout';
 import QuickLRU from 'quick-lru';
 // @ts-ignore
 import { v4 as uuidv4 } from 'uuid';
-import * as tokenizer from './tokenizer.js';
 import * as types from './types.js';
 import globalFetch from 'node-fetch';
 import { fetchSSE } from './fetch-sse.js';
@@ -17,9 +16,6 @@ const usageShapeLogged = new Set();
 const retentionUnsupported = new Set();
 /** 探测「这个 400 是不是参数引起的」连续失败的次数；到达 2 次就不再白试 */
 const retentionProbeMiss = new Map();
-const USER_LABEL_DEFAULT = 'User';
-const ASSISTANT_LABEL_DEFAULT = 'ChatGPT';
-const TOOL_LABEL_DEFAULT = 'Tool';
 function extractTextContent(content) {
     if (!content) {
         return '';
@@ -58,6 +54,56 @@ function extractReasoningText(source, includeDetails = false) {
     }
     return '';
 }
+/**
+ * 预算守卫用的保守估算：宁可高估，不能低估。
+ * 实测 cl100k_base：中文 49 字 = 56 token（约 1.14 token/字）、英文 109 字符 = 22 token（约 4.95 字符/token）。
+ * 这里按中文 1.2 token/字、其余 4 字符/token 起算，两边都留余量。
+ * 刻意不复用 utils/tokenEstimate.js（那份按 1.2 字/token，偏乐观，用于分块而非硬闸）。
+ * 这里的值只决定「本轮带多少历史」，精确计费以上游返回的 usage 为准。
+ */
+function estimatePromptTokens(text) {
+    if (!text) return 0;
+    const cjk = (text.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) || []).length;
+    return Math.ceil(cjk * 1.2 + (text.length - cjk) / 4);
+}
+
+/**
+ * 单条消息的保守 token 估算。
+ *
+ * content 里的图片/音频按上游折算后的固定额度计，绝不能按 base64 长度算：一张 230KB 图
+ * 的 base64 有 30 万字符，按字符估会虚高到 7.6 万 token，把识图轮的历史直接砍到 0。
+ * tool_calls / function_call / tool_call_id 在 content 之外，必须单独累加——一条工具调用
+ * 实测 81 token，漏算就会放行超预算请求，撞上上游 context_length_exceeded 后清空会话。
+ */
+function estimateMessageTokens(message) {
+    if (!message) return 0;
+    let tokens = 4; // 每条消息的角色标签与分隔符开销
+    const content = message.content;
+    if (typeof content === 'string') {
+        tokens += estimatePromptTokens(content);
+    } else if (Array.isArray(content)) {
+        for (const part of content) {
+            if (typeof part === 'string') {
+                tokens += estimatePromptTokens(part);
+            } else if (part?.type === 'text' || part?.type === 'input_text') {
+                tokens += estimatePromptTokens(part.text ?? '');
+            } else if (part?.type === 'image_url' || part?.type === 'input_image') {
+                tokens += 1500; // 高清图约 765~1500，低清固定 85；取上限保证不低估
+            } else if (part?.type === 'input_audio') {
+                tokens += 1000;
+            } else if (part) {
+                tokens += estimatePromptTokens(JSON.stringify(part));
+            }
+        }
+    } else if (content != null) {
+        tokens += estimatePromptTokens(JSON.stringify(content));
+    }
+    for (const field of ['function_call', 'tool_calls', 'tool_call_id', 'name']) {
+        if (message[field] != null) tokens += estimatePromptTokens(JSON.stringify(message[field]));
+    }
+    return tokens;
+}
+
 function getStoredMessageRole(role) {
     if (role === 'tool' || role === 'assistant' || role === 'system') {
         return role;
@@ -84,6 +130,7 @@ function insertTurnContext(messages, turnContext) {
     }
     messages.push({ role: 'user', content: turnContext });
 }
+
 export class ChatGPTAPI {
     _apiKey;
     _apiBaseUrl;
@@ -187,44 +234,6 @@ export class ChatGPTAPI {
             tool_calls: storedRole === 'assistant' ? message.toolCalls : undefined
         };
     }
-    async _getMessageTokenEstimate(message) {
-        const contentString = extractTextContent(message.content);
-        let nonTextTokens = 0;
-        if (Array.isArray(message.content)) {
-            for (const part of message.content) {
-                if (part.type === 'image_url')
-                    nonTextTokens += 85;
-                if (part.type === 'input_audio')
-                    nonTextTokens += 100;
-            }
-        }
-        let promptLine = '';
-        switch (message.role) {
-            case 'system':
-                promptLine = `Instructions:\n${contentString}`;
-                break;
-            case 'user':
-                promptLine = `${USER_LABEL_DEFAULT}:\n${contentString}`;
-                break;
-            case 'assistant':
-                promptLine = `${ASSISTANT_LABEL_DEFAULT}:\n${contentString}`;
-                break;
-            case 'tool':
-                promptLine = `${TOOL_LABEL_DEFAULT}:\n${contentString}`;
-                break;
-        }
-        let tokenCount = await this._getTokenCount(promptLine) + nonTextTokens;
-        if (message.function_call) {
-            tokenCount += await this._getTokenCount(JSON.stringify(message.function_call));
-        }
-        if (message.tool_calls) {
-            tokenCount += await this._getTokenCount(JSON.stringify(message.tool_calls));
-        }
-        if (message.tool_call_id) {
-            tokenCount += await this._getTokenCount(message.tool_call_id);
-        }
-        return tokenCount;
-    }
     _stripImages(content) {
         if (!content || typeof content === 'string')
             return content;
@@ -326,7 +335,7 @@ export class ChatGPTAPI {
           upsert: m => this._upsertMessage(m),
         })
         if (trimInfo.trimmed) {
-            logger.info(`[chatgpt] history trimmed: current=${trimInfo.currentTurnMessages}, keptHistory=${trimInfo.keptHistoryMessages}, attemptedHistory=${trimInfo.attemptedHistoryMessages}, droppedHistory=${trimInfo.droppedHistoryMessages}, keptToolChains=${trimInfo.keptToolChainCount}, budget=${trimInfo.promptBudget}, finalTokens=${numTokens}, reason=${trimInfo.stopReason}。若这类日志频繁出现，请检查锅巴中的“回复内容最大Token数(apiMaxToken)”与“模型总上下文Token数(maxModelTokens)”配置是否过紧。`);
+            logger.info(`[chatgpt] history trimmed: current=${trimInfo.currentTurnMessages}, keptHistory=${trimInfo.keptHistoryMessages}, attemptedHistory=${trimInfo.attemptedHistoryMessages}, droppedHistory=${trimInfo.droppedHistoryMessages}, keptToolChains=${trimInfo.keptToolChainCount}, budget=${trimInfo.promptBudget}, blockLimit=${trimInfo.blockLimit}, reason=${trimInfo.stopReason}。达到条数上限属正常行为；如需更长记忆可调大锅巴中的“对话历史保留条数”。`);
         }
         // 本轮群聊环境放在 innerOs 之后插入：innerOs 找的是「首条 user 消息」，
         // 先插会让全局破限提示落进群聊记录块里，而不是落进用户这句提问。
@@ -648,9 +657,6 @@ export class ChatGPTAPI {
                 ? ''
                 : ` | 缓存命中(${cacheReadTokens}, ${cacheHitRate.toFixed(1)}%)`;
             logger.info(`[Chatgpt][API]${this._providerName ? `[${this._providerName}]` : ''} 输入Token(${apiPromptTokens})${maxTokens ? ` | 回复上限(${maxTokens})` : ''} | 回答Token(${answerTokens})${reasoningInfo} | 累计Token(${totalTokenCount})${cacheWriteInfo}${cacheReadInfo}`);
-            if (apiPromptTokens + maxTokens > this._maxModelTokens) {
-                logger.warn(`[ChatGPT][API] 当前 token 配置边界过紧：输入Token(${apiPromptTokens}) + 回复上限(${maxTokens}) > 总上下文(${this._maxModelTokens})。请检查锅巴中的“回复内容最大Token数(apiMaxToken)”与“模型总上下文Token数(maxModelTokens)”配置是否过紧；插件将依赖历史裁剪，若仍超限，可能触发群聊上下文压缩或重试。`);
-            }
             const cleanedCurrentMessages = currentMessages.map(m => ({
                 ...m,
                 originalContent: this._stripImages(m.originalContent)
@@ -694,9 +700,6 @@ export class ChatGPTAPI {
     async _buildMessages(currentMessages, opts, completionParams) {
         const { systemMessage = this._systemMessage } = opts;
         let parentMessageId = currentMessages[0]?.parentMessageId;
-        const promptBudget = this._maxResponseTokens < this._maxModelTokens
-            ? this._maxModelTokens - this._maxResponseTokens
-            : this._maxModelTokens - 1;
         let messages = [];
         if (systemMessage) {
             messages.push({
@@ -715,29 +718,36 @@ export class ChatGPTAPI {
         let keptHistoryMessagesCount = 0;
         let keptToolChainCount = 0;
         let stopReason = 'complete';
-        let functionToken = 0;
-        // 本轮群聊环境不在 messages 里，但仍占上下文预算：漏算会让压缩判断失灵，
-        // 一超限就只能靠上层重试兜底。
-        const turnContextTokens = opts.turnContext ? await this._getTokenCount(opts.turnContext) : 0;
-        let numTokens = functionToken + turnContextTokens;
+        // 本轮群聊环境不在 messages 里，但仍占上下文预算：漏算会让预算守卫失灵。
+        // 不做逐字 BPE 编码：改用 estimatePromptTokens 粗估，成本比 js-tiktoken 低两个数量级，
+        // 且不阻塞事件循环。估算方向必须向上偏——估低了就会放行超预算的请求，
+        // 撞上上游 context_length_exceeded 后只能清空会话。
+        const promptBudget = this._maxResponseTokens < this._maxModelTokens
+            ? this._maxModelTokens - this._maxResponseTokens
+            : this._maxModelTokens - 1;
+        const turnContextTokens = opts.turnContext ? estimatePromptTokens(opts.turnContext) : 0;
+        let numTokens = 0;
         do {
-            let nextNumTokensEstimate = functionToken + turnContextTokens;
-            for (const message of nextMessages) {
-                nextNumTokensEstimate += await this._getMessageTokenEstimate(message);
-            }
-            const isValidPrompt = nextNumTokensEstimate <= promptBudget;
             const includesOnlyCurrentTurn = nextMessages.length === systemMessageOffset + currentRequestMessages.length;
-            if (includesOnlyCurrentTurn || isValidPrompt) {
+            // 条数上限：> 而非 >=，保证 chatgptBlockCount=300 时确实保留 300 条
+            const reachedBlockLimit = this._chatgptBlockCount > 0 && nextHistoryMessagesCount > this._chatgptBlockCount;
+            let nextNumTokensEstimate = turnContextTokens;
+            for (const message of nextMessages) {
+                nextNumTokensEstimate += estimateMessageTokens(message);
+            }
+            // 估算终究是估算：判断时留 20% 余量，边界上宁可早停，也不放行可能超预算的请求。
+            const overBudget = nextNumTokensEstimate * 1.2 > promptBudget;
+            if (includesOnlyCurrentTurn || (!overBudget && !reachedBlockLimit)) {
                 messages = nextMessages;
                 numTokens = nextNumTokensEstimate;
                 keptHistoryMessagesCount = nextHistoryMessagesCount;
                 keptToolChainCount = nextToolChainCount;
             }
-            if (!isValidPrompt) {
+            if (overBudget) {
                 stopReason = 'budget';
                 break;
             }
-            if (this._chatgptBlockCount > 0 && nextHistoryMessagesCount >= this._chatgptBlockCount) {
+            if (reachedBlockLimit) {
                 stopReason = 'block_count_reached';
                 break;
             }
@@ -806,6 +816,7 @@ export class ChatGPTAPI {
             trimInfo: {
                 currentTurnMessages,
                 promptBudget,
+                blockLimit: this._chatgptBlockCount,
                 attemptedHistoryMessages,
                 keptHistoryMessages: keptHistoryMessagesCount,
                 droppedHistoryMessages,
@@ -814,13 +825,6 @@ export class ChatGPTAPI {
                 stopReason
             }
         };
-    }
-    async _getTokenCount(text) {
-        if (!text) {
-            return 0;
-        }
-        text = text.replace(/<\|endoftext\|>/g, '');
-        return tokenizer.encode(text).length;
     }
     async _defaultGetMessageById(id) {
         const res = await this._messageStore.get(id);
