@@ -1,4 +1,6 @@
 import { resolveProvider, providerConfig } from '../utils/providers.js'
+import { conversationScopeOfKey } from '../utils/conversationKey.js'
+import { clearScopeHistory } from '../utils/conversationMigration.js'
 import { PROMPT_FIELDS, KEY_FIELDS, providerLabel, connectionVersion } from '../utils/providerProfiles.js'
 import { createAttemptHistory, runProviderFallback, isContextOverflowError, trimForOverflow } from '../utils/providerFallback.js'
 import {
@@ -455,7 +457,10 @@ async function clearOverflowConversation({ e, opt, conversation }) {
     return false
   }
   try {
-    await redis.del(key)
+    // 连旧 V2 桶一起删：只删新键的话，下一轮读取会懒迁移把刚清掉的历史搬回来，再撞一次上限
+    const scope = conversationScopeOfKey(key)
+    if (scope) await clearScopeHistory({ client: redis, scope })
+    else await redis.del(key)
     await redis.del(`CHATGPT:WRONG_EMOTION:${e.sender.user_id}`)
   } catch (err) {
     // 删不掉也要把提示照发出去，但问题必须留痕

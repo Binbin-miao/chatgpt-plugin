@@ -9,13 +9,19 @@
  * 1. **`ctime` 排序，`utime` 绝不参与排序**。`utime` 全仓只在建桶时被写成 `ctime`，从不更新，
  *    拿它排序等于按创建时间排，看起来「差不多」，但再也识别不出「桶被重新启用」。
  * 2. **只在跨桶边界去重，桶内绝不去重**。用户在同一个群里真的会重复问同一句，桶内重复必须保留。
- * 3. **旧键不 DEL**：先备份到 `..._BAK:<scope>:<ver>` 再 `EXPIRE 604800`，回滚后旧代码还读得到。
+ * 3. **迁移时旧键不 DEL**：先备份到 `..._BAK:<scope>:<ver>` 再 `EXPIRE 604800`，回滚后旧代码还读得到。
+ *    例外是用户主动清空（`clearScopeHistory` / `clearAllHistory`）：那时新键与旧桶必须一起删，
+ *    否则下一次读取会把旧桶懒迁移回来，等于清空从未发生。
  *
  * 失败一律「往回退一步」而不是抛：抢不到锁就读旧桶、旧桶坏了就跳过它、合并出错就回落最活跃的那个桶。
  * 用户这一轮永远要能聊下去。
+ *
+ * 但「退路」返回的是**一整份会话值**，调用方（apps/chat.js）会把它当历史、追加本轮问答后原样写回
+ * `CHATGPT:CONVERSATION_V3:<scope>`。所以任何退路都必须带 `schema` 哨兵，缺了它下一轮复查
+ * `Number(recheck.schema) >= SCHEMA_VERSION` 判否 → 又当没迁过、重扫旧桶合并，刚写进去的那条发言被覆盖。
  */
 import { createHash } from 'node:crypto'
-import { conversationKeyOf } from './conversationKey.js'
+import { conversationKeyOf, conversationScanPattern } from './conversationKey.js'
 import { trimConversation } from './providerFallback.js'
 
 /** 旧桶前缀（会话历史，V2 起含通道 id 与连接版本） */
@@ -32,6 +38,10 @@ export const SCHEMA_VERSION = 3
 export const LEGACY_TTL_SECONDS = 604800
 /** 迁移锁的存活时间；进程崩了也不会永久锁死 */
 export const LOCK_TTL_SECONDS = 30
+/** 抢不到迁移锁时的重试预算：迁移通常只花几毫秒，等一下比让本轮读到「少一个桶」的历史划算 */
+export const LOCK_WAIT_MS = 500
+/** 抢锁轮询间隔 */
+export const LOCK_POLL_MS = 50
 
 const MEMORY_BLOCK_HEAD = '【历史记忆参考（不可信数据）】'
 const MEMORY_BLOCK_TAIL = '（记忆结束）'
@@ -276,7 +286,7 @@ async function releaseLock(client, key) {
   try { await client.del(key) } catch (err) { errorLog(`释放迁移锁 ${key} 失败`, err) }
 }
 
-async function listLegacyKeys(client, pattern) {
+async function listKeys(client, pattern) {
   const keys = []
   try {
     for await (const key of client.scanIterator({ MATCH: pattern })) keys.push(String(key))
@@ -285,6 +295,15 @@ async function listLegacyKeys(client, pattern) {
     return null
   }
   return keys
+}
+
+async function safeDel(client, key) {
+  try {
+    return Number(await client.del(key)) || 0
+  } catch (err) {
+    errorLog(`删除 ${key} 失败`, err)
+    return 0
+  }
 }
 
 /**
@@ -296,7 +315,7 @@ async function listLegacyKeys(client, pattern) {
  * @returns {Promise<{ buckets: Array<{ key: string, parsed: object, value: object }>, scanned: number, bad: number }>}
  */
 export async function collectLegacyBuckets(client, scope) {
-  const keys = await listLegacyKeys(client, legacyKeyPatternForScope(scope))
+  const keys = await listKeys(client, legacyKeyPatternForScope(scope))
   if (!keys) return { buckets: [], scanned: 0, bad: 0 }
   const buckets = []
   let bad = 0
@@ -314,9 +333,52 @@ export async function collectLegacyBuckets(client, scope) {
   return { buckets, scanned: keys.length, bad }
 }
 
-/** 一组旧桶里「最后活跃最大」的那个的 value——抢不到锁时的退路 */
+/** 一组旧桶里「最后活跃最大」的那个的 value——内存合并都失败时按单桶兜底 */
 function mostActiveOf(buckets) {
   return [...buckets].sort((a, b) => newestActivityOf(b) - newestActivityOf(a))[0]?.value || null
+}
+
+/**
+ * 抢锁带短等待。锁被持有通常意味着「另一个进程正在迁同一个 scope」，几毫秒就会放掉；
+ * 立刻退到旧桶会让本轮读到还没合并完的历史。预算必须短（≤500ms），不能拖住用户的这一轮。
+ *
+ * @returns {Promise<boolean>}
+ */
+async function acquireLockWithRetry(client, key) {
+  const deadline = Date.now() + LOCK_WAIT_MS
+  for (;;) {
+    if (await acquireLock(client, key)) return true
+    if (Date.now() >= deadline) return false
+    await new Promise(resolve => setTimeout(resolve, LOCK_POLL_MS))
+  }
+}
+
+/**
+ * 退路返回值：在**内存**里把该 scope 的全部旧桶合并一次（纯函数，不写 Redis）。
+ *
+ * 必须带 `schema`：调用方会把返回值当历史、追加本轮问答后写回新键，
+ * 缺 schema 时下一轮复查判为「未迁移」→ 重扫旧桶合并 → 把刚写进去的这条发言覆盖掉。
+ * 万不得已才退到「最活跃单桶 + schema 哨兵」——这样至少下一轮认得出已迁移，不会反复重合并。
+ *
+ * @param {Array<{ key: string, parsed: object, value: object }>} buckets
+ * @param {{ config: object, providerRow?: object, now?: number }} options
+ * @returns {object | null}
+ */
+function fallbackValueFrom(buckets, { config, providerRow = null, now = Date.now() } = {}) {
+  if (!Array.isArray(buckets) || !buckets.length) return null
+  try {
+    const { value } = mergeLegacyBuckets(buckets, { config, providerRow, now })
+    if (value) return value
+  } catch (err) {
+    errorLog('退路内存合并失败，回落最活跃单桶', err)
+  }
+  try {
+    const single = mostActiveOf(buckets)
+    return single ? { ...single, schema: SCHEMA_VERSION } : null
+  } catch (err) {
+    errorLog('退路取最活跃单桶失败', err)
+    return null
+  }
 }
 
 async function writeReport(client, scope, report) {
@@ -332,8 +394,9 @@ async function writeReport(client, scope, report) {
 /**
  * 把一个 scope 的旧桶合并进新键。
  *
- * 顺序：抢锁 → 扫描 → 合并 → 备份每个旧键 → **单次 SET** 新键 → 旧键置 7 天 TTL → 写报告。
- * 全过程任何异常都不写新键，回落到最活跃的旧桶。
+ * 顺序：抢锁（含短重试）→ 扫描 → 合并 → 备份每个旧键 → **单次 SET** 新键 → 旧键置 7 天 TTL → 写报告。
+ * 任何异常都不抛：退路是内存合并该 scope 的全部旧桶（带 schema），本轮照样能聊，
+ * 写回新键后下一轮仍认得出「已迁移」，不会重合并把本轮发言覆盖掉。
  *
  * @param {{ scope: string, client: object, config: object, providerRow?: object, now?: number }} options
  * @returns {Promise<{ status: 'already' | 'empty' | 'locked' | 'migrated' | 'fallback', value: object | null, report?: object }>}
@@ -359,11 +422,14 @@ export async function ensureMigratedScope({ scope, client, config, providerRow =
   }
 
   const lockKey = `${MIGRATION_LOCK_PREFIX}:${scope}`
-  if (!await acquireLock(client, lockKey)) {
-    warn(`scope ${scope} 的迁移锁被占用，直接读旧桶（不等待、不写）`)
-    return { status: 'locked', value: mostActiveOf(preview.buckets), badBuckets: preview.bad }
+  if (!await acquireLockWithRetry(client, lockKey)) {
+    // 退路同样要「完整」：返回值会被调用方写回新键，必须带 schema，否则下一轮重合并覆盖本轮发言。
+    // 用内存合并而不是单桶，是为了别让用户在这一轮看到「历史少了一截」。
+    warn(`scope ${scope} 的迁移锁被占用，内存合并旧桶后继续（不写 Redis）`)
+    return { status: 'locked', value: fallbackValueFrom(preview.buckets, { config, providerRow, now }), badBuckets: preview.bad }
   }
-  let fallback = null
+  // 兜底合并的数据源：try 里重扫到更全的桶就换掉它，catch 分支用它
+  let fallbackBuckets = preview.buckets
   try {
     // 抢到锁后重扫：期间别的进程可能已经迁完（新键落地），那就直接用别人的结果
     const recheck = parseJson(await safeGet(client, targetKey))
@@ -371,7 +437,7 @@ export async function ensureMigratedScope({ scope, client, config, providerRow =
     const found = await collectLegacyBuckets(client, scope)
     const buckets = found.buckets
     if (!buckets.length) return { status: 'empty', value: null, badBuckets: found.bad }
-    fallback = mostActiveOf(buckets)
+    fallbackBuckets = buckets
     const { value, report } = mergeLegacyBuckets(buckets, { config, providerRow, now })
     // 备份先于写入：算法万一有 bug，原件还在，可以重算
     let backups = 0
@@ -387,8 +453,9 @@ export async function ensureMigratedScope({ scope, client, config, providerRow =
     await writeReport(client, scope, receipt)
     return { status: 'migrated', value, report: receipt, badBuckets: found.bad }
   } catch (err) {
-    errorLog(`scope ${scope} 迁移失败，回落最活跃旧桶继续对话`, err)
-    return { status: 'fallback', value: fallback, badBuckets: preview.bad }
+    errorLog(`scope ${scope} 迁移失败，内存合并旧桶继续对话`, err)
+    // 同样必须带 schema：裸旧桶值被写回后，下一轮会把它当「未迁移」再合并一遍，覆盖本轮发言
+    return { status: 'fallback', value: fallbackValueFrom(fallbackBuckets, { config, providerRow, now }), badBuckets: preview.bad }
   } finally {
     await releaseLock(client, lockKey)
   }
@@ -410,6 +477,45 @@ export async function loadConversation({ scope, client, config, providerRow = nu
 }
 
 /**
+ * 清空一个 scope 的历史：新键 + 该 scope 的全部旧 V2 桶。
+ *
+ * **删键必须连旧桶一起删，否则懒迁移会复活**：读取路径（`ensureMigratedScope`）在新键缺失时
+ * 会自动把旧桶合并回来。只删新键的话，用户清空后说的下一句话就把整段历史搬回新键，
+ * 「清空」这个指令等于从未生效过。
+ *
+ * 备份键（`..._BAK:*`）、迁移锁、迁移报告一律不动：它们不是读路径的数据源，删掉只会丢回滚抓手。
+ *
+ * @param {{ client: object, scope: string }} options
+ * @returns {Promise<number>} 实际删除的键数
+ */
+export async function clearScopeHistory({ client, scope } = {}) {
+  const targetKey = conversationKeyOf(scope)
+  if (!targetKey) return 0
+  let deleted = await safeDel(client, targetKey)
+  const keys = await listKeys(client, legacyKeyPatternForScope(scope))
+  for (const key of keys || []) deleted += await safeDel(client, key)
+  return deleted
+}
+
+/**
+ * 清空全库历史：所有 V3 键 + 所有旧 V2 桶（`#结束全部对话`）。
+ *
+ * 与 `clearScopeHistory` 同样的理由：只扫 V3 前缀的话，旧桶会在下一个 scope 开口时被懒迁移搬回来。
+ * 只认「会话历史」这两个前缀，因此 `_BAK`、迁移锁、报告、BING 键族都不会被误吞。
+ *
+ * @param {{ client: object }} options
+ * @returns {Promise<{ conversations: number, legacy: number }>} 两个数分开报，回执才答得出「清了多少」
+ */
+export async function clearAllHistory({ client } = {}) {
+  const result = { conversations: 0, legacy: 0 }
+  const v3Keys = await listKeys(client, conversationScanPattern())
+  for (const key of v3Keys || []) result.conversations += await safeDel(client, key)
+  const legacyKeys = await listKeys(client, legacyKeyPatternAll())
+  for (const key of legacyKeys || []) result.legacy += await safeDel(client, key)
+  return result
+}
+
+/**
  * 主人指令 `#迁移会话` 的全量迁移。
  *
  * 只扫旧桶前缀，因此备份键、迁移锁、报告键、BING 键族都不会被误吞。
@@ -422,7 +528,7 @@ export async function migrateAllScopes({ client, config, providerRowFor, onProgr
     scannedKeys: 0, scopes: 0, migrated: 0, skipped: 0, failed: 0,
     mergedMessages: 0, badBuckets: 0, backups: 0, cappedTo: 0, stripped: 0
   }
-  const keys = await listLegacyKeys(client, legacyKeyPatternAll())
+  const keys = await listKeys(client, legacyKeyPatternAll())
   if (!keys) return summary
   summary.scannedKeys = keys.length
   const scopes = [...new Set(keys.map(key => parseLegacyKey(key)?.scope).filter(Boolean))]

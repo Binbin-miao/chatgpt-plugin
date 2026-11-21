@@ -1,6 +1,6 @@
 import { resolveProvider, providerConfig } from '../utils/providers.js'
 import { conversationKeyFor, conversationKeyOf, conversationScope, conversationScanPattern } from '../utils/conversationKey.js'
-import { loadConversation, migrateAllScopes } from '../utils/conversationMigration.js'
+import { clearScopeHistory, loadConversation, migrateAllScopes } from '../utils/conversationMigration.js'
 import { connectionVersion, findProvider } from '../utils/providerProfiles.js'
 import { trimConversation } from '../utils/providerFallback.js'
 import plugin from '../../../lib/plugins/plugin.js'
@@ -378,12 +378,19 @@ export class chatgpt extends plugin {
     }
 
     const count = Math.max(1, Number(match[4]))
+    const scope = this.getClearContextScope(e)
     const key = this.getClearContextConversationKey(e)
     const raw = await redis.get(key)
     if (!raw) { await this.reply('当前没有可清除的对话记录', true); return true }
     const conversation = JSON.parse(raw)
     const messages = conversation.messages || []
     const deleted = Math.min(count * 2, messages.length)
+    // 一次清光就当「清空」办：旧 V2 桶必须一起删，否则下一轮懒迁移把刚删的历史搬回来
+    if (deleted >= messages.length) {
+      await clearScopeHistory({ client: redis, scope })
+      await this.reply(`已清除当前会话最近 ${Math.ceil(deleted / 2)} 条对话`, true)
+      return true
+    }
     conversation.messages = messages.slice(0, Math.max(0, messages.length - deleted))
     delete conversation.previousResponseId
     delete conversation.parentMessageId

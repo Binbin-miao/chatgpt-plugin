@@ -63,5 +63,12 @@ export async function acquireScopeLock(scope, { waitMs = 0, pollMs = 25 } = {}) 
 export async function releaseScopeLock(scope) {
   const key = scopeLockKey(scope)
   if (!key) return
-  await redis.del(key)
+  // 这里跑在调用方的 finally 里：del 抛错会顶替掉真正的业务异常，把「模型超时」
+  // 变成「redis 报错」，排查方向全跑偏。锁本身有 TTL 兜底，最坏只是该 scope
+  // 多等一会儿，所以释放失败只 warn，绝不上抛。
+  try {
+    await redis.del(key)
+  } catch (error) {
+    globalThis.logger?.warn?.(`[ScopeLock] 释放锁失败 scope=${scope}，等 ${SCOPE_LOCK_TTL_SECONDS} 秒 TTL 自然过期：${error?.message ?? error}`)
+  }
 }

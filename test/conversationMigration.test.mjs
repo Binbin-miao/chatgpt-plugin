@@ -17,6 +17,7 @@ globalThis.logger = { info() {}, warn() {}, error() {}, debug() {}, mark() {} }
 
 const {
   LEGACY_TTL_SECONDS, MIGRATION_LOCK_PREFIX, MIGRATION_REPORT_KEY, SCHEMA_VERSION,
+  clearAllHistory, clearScopeHistory,
   ensureMigratedScope, loadConversation, mergeLegacyBuckets, parseLegacyKey, stripMemoryBlock
 } = await import('../utils/conversationMigration.js')
 const { CONVERSATION_KEY_PREFIX, conversationKeyOf } = await import('../utils/conversationKey.js')
@@ -148,7 +149,7 @@ test('连跑两次不翻倍：schema:3 哨兵让第二次直接命中已迁移�
   assert.equal(JSON.parse(await redis.get(conversationKeyOf(scope))).messages.length, lengthAfterFirst, '历史条数不许翻倍')
 })
 
-test('抢不到迁移锁时直接读旧桶：不阻塞、不报错、不写新键', async () => {
+test('抢不到迁移锁时用内存合并代替单桶：不阻塞、不报错、不写新键', async () => {
   const scope = '400'
   const redis = new FakeRedis([
     [legacyKey(scope, 'pA', 'va'), legacyValue({ ctime: '2026-10-01T00:00:00.000Z', messages: qa('冷门问题', '冷门回答'), replyTimestamps: [999] })],
@@ -159,8 +160,17 @@ test('抢不到迁移锁时直接读旧桶：不阻塞、不报错、不写新�
 
   const result = await ensureMigratedScope({ scope, client: redis, config: {} })
   assert.equal(result.status, 'locked')
-  // 退路是「最后活跃最大」的那个桶（replyTimestamps 999 > 1），不是 ctime 最新那个
-  assert.deepEqual(result.value.messages.map(m => m.content), ['冷门问题', '冷门回答'])
+  // 退路是「在内存里合并该 scope 的全部旧桶」，按 ctime 升序（pA 2026-10-01 在前，pB 2026-10-02 在后）。
+  //
+  // 契约已变更，且**这不是回归**：以前这里按 replyTimestamps 只取「最活跃单桶」（999 > 1 只得到 pA），
+  // 那已不是现行契约。原因是该退路返回值会被 apps/chat.js 当历史、追加本轮问答后写回新键：
+  // 只给单桶会让用户这一轮看不到其他桶的历史；而裸旧桶值没有 schema 哨兵，
+  // 下一轮复查 `Number(schema) >= SCHEMA_VERSION` 判否 → 又当没迁过重扫旧桶合并，覆盖本轮发言。
+  assert.deepEqual(
+    result.value.messages.map(m => m.content),
+    ['冷门问题', '冷门回答', '更新的问题', '更新的回答']
+  )
+  assert.equal(result.value.schema, SCHEMA_VERSION, '退路必须带 schema 哨兵，否则下一轮会重合并覆盖本轮发言')
   assert.equal(redis.store.has(conversationKeyOf(scope)), false, '抢不到锁时不许写新键')
   assert.equal([...redis.store.keys()].some(key => key.startsWith('CHATGPT:CONVERSATIONS_V2_BAK')), false, '也不许写备份')
 })
@@ -324,4 +334,77 @@ test('全量迁移统计：同 scope 多桶算一个 scope，第二次跑全部�
   assert.equal(second.migrated, 0)
   assert.equal(second.skipped, 2)
   assert.equal(redis.store.has(`${CONVERSATION_KEY_PREFIX}:1001`), true)
+})
+
+test('清空某个 scope：新键与该 scope 所有旧桶一起删，再读就是全新对话', async () => {
+  const scope = '3101'
+  const other = '3102'
+  const redis = new FakeRedis([
+    [conversationKeyOf(scope), JSON.stringify({ schema: SCHEMA_VERSION, messages: qa('已迁移的问题', '已迁移的回答') })],
+    [legacyKey(scope, 'pA', 'va'), legacyValue({ ctime: '2026-10-01T00:00:00.000Z', messages: qa('旧问题一', '旧回答一') })],
+    [legacyKey(scope, 'pB', 'vb'), legacyValue({ ctime: '2026-10-02T00:00:00.000Z', messages: qa('旧问题二', '旧回答二') })],
+    [legacyKey(other, 'pA', 'va'), legacyValue({ ctime: '2026-10-01T00:00:00.000Z', messages: qa('别人的问题', '别人的回答') })]
+  ])
+
+  const deleted = await clearScopeHistory({ client: redis, scope })
+  assert.equal(deleted, 3, '新键 + 两个旧桶，一个都不能剩')
+
+  const loaded = await loadConversation({ scope, client: redis, config: {} })
+  assert.equal(loaded.isNewConversation, true, '旧桶还在的话这里会是 false——懒迁移把历史搬了回来')
+  assert.equal(loaded.value, null)
+
+  const untouched = await loadConversation({ scope: other, client: redis, config: {} })
+  assert.equal(untouched.isNewConversation, false, '清空只作用于给定 scope，不许误伤别人')
+})
+
+test('全库清空：所有 scope 都读不到历史，但 _BAK 备份键原样保留', async () => {
+  const scopes = ['3201', '3202']
+  const backupKey = `CHATGPT:CONVERSATIONS_V2_BAK:3201:v1`
+  const redis = new FakeRedis([
+    [conversationKeyOf('3201'), JSON.stringify({ schema: SCHEMA_VERSION, messages: qa('甲问题', '甲回答') })],
+    [conversationKeyOf('3202'), JSON.stringify({ schema: SCHEMA_VERSION, messages: qa('乙问题', '乙回答') })],
+    [legacyKey('3201', 'pA', 'va'), legacyValue({ ctime: '2026-10-01T00:00:00.000Z', messages: qa('甲旧一', '甲旧答一') })],
+    [legacyKey('3201', 'pB', 'vb'), legacyValue({ ctime: '2026-10-02T00:00:00.000Z', messages: qa('甲旧二', '甲旧答二') })],
+    [legacyKey('3202', 'pA', 'va'), legacyValue({ ctime: '2026-10-01T00:00:00.000Z', messages: qa('乙旧', '乙旧答') })],
+    [backupKey, legacyValue({ ctime: '2026-10-01T00:00:00.000Z', messages: qa('备份里的话', '备份里的回答') })]
+  ])
+  redis.ttl.set(backupKey, LEGACY_TTL_SECONDS)
+
+  const result = await clearAllHistory({ client: redis })
+  assert.deepEqual(result, { conversations: 2, legacy: 3 }, '两个数要分开报，回执才答得出清了多少')
+
+  for (const scope of scopes) {
+    const loaded = await loadConversation({ scope, client: redis, config: {} })
+    assert.equal(loaded.isNewConversation, true, `${scope} 清空后必须读不到任何历史`)
+    assert.equal(loaded.value, null)
+  }
+  assert.equal(redis.store.has(backupKey), true, '备份键不是读路径的数据源，清空不许连它一起删')
+  assert.equal(redis.ttl.get(backupKey), LEGACY_TTL_SECONDS)
+})
+
+test('清空之后不会重新合并出内容：清空 → 再读 → 仍为空，新写入只看到新内容', async () => {
+  const scope = '3301'
+  const redis = new FakeRedis([
+    [legacyKey(scope, 'pA', 'va'), legacyValue({ ctime: '2026-10-01T00:00:00.000Z', messages: qa('清空前的问题', '清空前的回答') })],
+    [legacyKey(scope, 'pB', 'vb'), legacyValue({ ctime: '2026-10-02T00:00:00.000Z', messages: qa('清空前的问题二', '清空前的回答二') })]
+  ])
+
+  await clearScopeHistory({ client: redis, scope })
+
+  const afterClear = await loadConversation({ scope, client: redis, config: {} })
+  assert.equal(afterClear.value, null, '清空后的第一次读取必须仍然为空')
+  assert.equal(afterClear.isNewConversation, true)
+  assert.equal(redis.store.has(conversationKeyOf(scope)), false, '读路径不许因为旧桶残留而写出新键')
+
+  // 用户接着说了一句：chat.js 会带 schema:3 写回，此后读取只该看到这一句
+  await redis.set(conversationKeyOf(scope), JSON.stringify({
+    schema: SCHEMA_VERSION,
+    messages: qa('清空后的第一句', '清空后的回答'),
+    ctime: '2026-11-20T00:00:00.000Z',
+    utime: '2026-11-20T00:00:00.000Z'
+  }))
+  const afterSpeak = await loadConversation({ scope, client: redis, config: {} })
+  assert.equal(afterSpeak.isNewConversation, false)
+  assert.deepEqual(afterSpeak.value.messages.map(m => m.content), ['清空后的第一句', '清空后的回答'],
+    '旧桶被删干净了，历史不许再合并出「清空前的问题」')
 })

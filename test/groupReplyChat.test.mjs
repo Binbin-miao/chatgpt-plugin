@@ -748,6 +748,19 @@ test('B6 抛异常时锁被释放：紧接着的下一次调用能拿到', async
   assert.equal(requests.length, 1, '锁没泄漏，下一次调用能正常拿到')
 })
 
+test('B6 释放锁时 redis.del 抛错：只 warn 不抛，不覆盖调用方的真实异常', async t => {
+  const warns = []
+  const originalDel = redis.del
+  t.mock.method(globalThis.logger, 'warn', message => warns.push(String(message)))
+  redis.del = async () => { throw new Error('del 炸了') }
+  t.after(() => { redis.del = originalDel })
+
+  await assert.doesNotReject(() => releaseScopeLock('123'), '释放锁失败不许上抛')
+  assert.equal(warns.length, 1, '恰好一条 warn')
+  assert.match(warns[0], /scope=123/, 'warn 必须带 scope')
+  assert.match(warns[0], /del 炸了/, 'warn 必须带原因')
+})
+
 test('B6 锁粒度是 scope 不是全局：键按 scope 出现，不同账号互不阻塞', async t => {
   const { store, e, chat } = lockAwareHarness(t)
   let releaseA

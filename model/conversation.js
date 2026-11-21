@@ -1,4 +1,5 @@
-import { conversationKeyFor, conversationScanPattern } from '../utils/conversationKey.js'
+import { conversationScope } from '../utils/conversationKey.js'
+import { clearAllHistory, clearScopeHistory } from '../utils/conversationMigration.js'
 import { providerLabel } from '../utils/providerProfiles.js'
 import { getUin } from '../utils/common.js'
 import { Config } from '../utils/config.js'
@@ -9,9 +10,10 @@ export class ConversationManager {
   async endConversation(e, row = this.sessionProfileFor(e)) {
     const ats = (e.message || []).filter(m => m.type === 'at' && String(m.qq) !== String(getUin(e)))
     if (ats.length && !e.isMaster) { await this.reply('只有主人可以结束他人的对话'); return }
-    const key = conversationKeyFor(e, Config.groupMerge, ats[0]?.qq)
-    if (!key) { await this.reply('取不到会话身份，无法结束对话', true); return }
-    await redis.del(key)
+    const scope = conversationScope(e, Config.groupMerge, ats[0]?.qq)
+    if (!scope) { await this.reply('取不到会话身份，无法结束对话', true); return }
+    // 新键与旧 V2 桶必须一起删：只删新键的话，下一句话会触发懒迁移把历史整段搬回来
+    await clearScopeHistory({ client: redis, scope })
     await this.reply(`${providerLabel(row)} 对话已结束`, true)
   }
 
@@ -30,8 +32,8 @@ export class ConversationManager {
    */
   async endAllConversations(e) {
     if (!e.isMaster) { await this.reply('只有主人可以结束全部会话'); return }
-    let count = 0
-    for await (const key of redis.scanIterator({ MATCH: conversationScanPattern() })) count += await redis.del(key)
-    await this.reply(`已结束 ${count} 个会话`, false)
+    // 全库语义：V3 与旧 V2 两个前缀都要扫，只扫 V3 会让旧桶在下一轮被懒迁移复活
+    const { conversations, legacy } = await clearAllHistory({ client: redis })
+    await this.reply(`已结束 ${conversations} 个会话（含 ${legacy} 个旧会话桶）`, false)
   }
 }
