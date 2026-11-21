@@ -1,5 +1,5 @@
 import { Config } from './config.js'
-import { findProvider, MODEL_FIELDS, PROVIDER_FIELDS, connectionVersion } from './providerProfiles.js'
+import { findProvider, MODEL_FIELDS, PROVIDER_FIELDS } from './providerProfiles.js'
 
 export function resolveProvider(id = Config.defaultProviderId, source = Config.getConfig()) {
   const reference = id === 'current' ? source.defaultProviderId : id
@@ -22,9 +22,6 @@ export function currentProviderType() { return resolveProvider().type }
 export function currentProviderId() { return Config.defaultProviderId }
 export function currentProviderConfig() { return providerConfig(resolveProvider()) }
 export function providerModel(row) { return row[MODEL_FIELDS[row.type]] || '' }
-export function providerConversationKey(row, scope) {
-  return `CHATGPT:CONVERSATIONS_V2:${row.id}:${connectionVersion(row)}:${scope}`
-}
 
 export function updateProvider(id, changes) {
   const candidate = structuredClone(Config.getConfig())

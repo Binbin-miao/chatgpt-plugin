@@ -20,6 +20,23 @@ const DAY_SEC = 86400
 const DAY_FILE_RE = /^(\d{4}-\d{2}-\d{2})\.ndjson$/
 
 /**
+ * 已经告警过的坏文件（每个进程一份）。
+ *
+ * 坏行计数本身要留痕，但「每次召回都 warn 一次」会把日志刷爆——按**文件**去重，
+ * 而不是按读取次数：同一个日期文件一小时能被读几百次。
+ */
+const corruptWarnedFiles = new Set()
+
+/** 坏行告警：逐文件计数照实给，同一文件每个进程只提示一次 */
+function warnCorruptFiles(groupId, byFile) {
+  for (const [file, count] of byFile) {
+    if (corruptWarnedFiles.has(file)) continue
+    corruptWarnedFiles.add(file)
+    logger?.warn?.(`[MemoryV2] 群 ${groupId} 的原文文件 ${path.basename(file)} 有 ${count} 行无法解析，已跳过（同一文件每个进程只提示一次）`)
+  }
+}
+
+/**
  * 秒级时间戳 → 北京时间自然日 YYYY-MM-DD
  * 与 `dailyTask.dayKey`、`store.dayKeyOf` 同口径：文件分天、提炼窗口、游标都用同一个日期键。
  */
@@ -114,6 +131,7 @@ export class RawStore {
         row = JSON.parse(line)
       } catch {
         skipped.count++
+        skipped.byFile.set(file, (skipped.byFile.get(file) || 0) + 1)
         continue
       }
       const time = Number(row?.time) || 0
@@ -135,7 +153,7 @@ export class RawStore {
   async readRange(groupId, fromSec, toSec) {
     const from = Number(fromSec) || 0
     const to = Number.isFinite(Number(toSec)) ? Number(toSec) : Number.MAX_SAFE_INTEGER
-    const skipped = { count: 0 }
+    const skipped = { count: 0, byFile: new Map() }
     const seen = new Set()
     const rows = []
     for (const day of await this.days(groupId)) {
@@ -144,9 +162,7 @@ export class RawStore {
       if (start > to || start + DAY_SEC - 1 < from) continue
       rows.push(...await this._readDay(groupId, day, from, to, skipped, seen))
     }
-    if (skipped.count > 0) {
-      logger?.warn?.(`[MemoryV2] 群 ${groupId} 的原文文件有 ${skipped.count} 行无法解析，已跳过`)
-    }
+    warnCorruptFiles(groupId, skipped.byFile)
     rows.sort((a, b) => a.time - b.time)
     return rows
   }
@@ -157,7 +173,7 @@ export class RawStore {
    */
   async readRecent(groupId, endTime, limit = 20000) {
     const to = Number.isFinite(Number(endTime)) ? Number(endTime) : Number.MAX_SAFE_INTEGER
-    const skipped = { count: 0 }
+    const skipped = { count: 0, byFile: new Map() }
     const seen = new Set()
     const rows = []
     const days = (await this.days(groupId)).reverse() // 新→旧，够 limit 条就停
@@ -168,9 +184,7 @@ export class RawStore {
       rows.push(...dayRows)
       if (rows.length > limit) break
     }
-    if (skipped.count > 0) {
-      logger?.warn?.(`[MemoryV2] 群 ${groupId} 的原文文件有 ${skipped.count} 行无法解析，已跳过`)
-    }
+    warnCorruptFiles(groupId, skipped.byFile)
     return { rows: rows.slice(0, limit), limited: rows.length > limit, limit }
   }
 

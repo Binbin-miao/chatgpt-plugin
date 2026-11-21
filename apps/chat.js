@@ -1,4 +1,6 @@
-import { resolveProvider, providerConfig, providerConversationKey } from '../utils/providers.js'
+import { resolveProvider, providerConfig } from '../utils/providers.js'
+import { conversationKeyFor, conversationKeyOf, conversationScope, conversationScanPattern } from '../utils/conversationKey.js'
+import { loadConversation, migrateAllScopes } from '../utils/conversationMigration.js'
 import { connectionVersion, findProvider } from '../utils/providerProfiles.js'
 import { trimConversation } from '../utils/providerFallback.js'
 import plugin from '../../../lib/plugins/plugin.js'
@@ -38,6 +40,7 @@ import {
 } from '../utils/paimonFuction.js'
 import { INNER_OS_BEGIN, INNER_OS_END } from '../utils/innerOs.js'
 import ChatCooldown from '../utils/chatCooldown.js'
+import { acquireScopeLock, releaseScopeLock } from '../utils/scopeLock.js'
 import { groupReply } from '../utils/groupReply.js'
 import { avatarReply } from '../utils/avatarReply.js'
 import { expandQuotedForwards } from '../utils/forwardMessage.js'
@@ -45,6 +48,15 @@ import { isBotReplyAllowed } from '../utils/botReplyWhitelist.js'
 import { pickSessionProfile, sessionProfile, allowFallbackFor } from '../utils/sessionProvider.js'
 
 let version = Config.version
+
+/**
+ * 正常回复抢不到 scope 锁时最多等这么久。
+ *
+ * 为什么是「短等」而不是「立刻放弃」：另一轮通常几秒内就跑完，等一小会儿远好过丢掉
+ * 用户这句话；而锁被崩溃进程占着时要等 TTL 到期，死等会把消息链挂住——所以上限 1 秒，
+ * 等不到就跳过本轮，由用户重发。
+ */
+const SCOPE_LOCK_WAIT_MS = 1000
 
 let proxy = getProxy()
 const isTrss = Array.isArray(Bot.uin)
@@ -114,6 +126,31 @@ function routeSessionProvider(e, source) {
 }
 
 /**
+ * 全量迁移时按 scope 解析「这个会话该用哪条通道」。
+ *
+ * 只用于 `trimConversation` 的裁剪预算（`maxModelTokens` / 输出预留）——键本身与通道无关。
+ * 若对全部 scope 都返回全局默认，分流群就会按错的窗口裁剪：claude/gemini 行没有
+ * `maxModelTokens` 字段，会被当成 12.8 万窗口砍掉大半可用历史。
+ *
+ * scope 既可能是群号也可能是账号，两种身份各试一次：规则写在哪一边就命中哪一边。
+ * 数字 id 偶然撞车（群号恰好等于某人账号）时按群处理——对裁剪预算的影响可忽略，但会记一条 warn。
+ */
+function providerRowForScope(scope) {
+  try {
+    const source = structuredClone(Config.getConfig())
+    const asGroup = pickSessionProfile({ isGroup: true, group_id: scope, sender: { user_id: scope } }, source, resolveProvider)
+    if (asGroup) return asGroup.profile
+    const asPrivate = pickSessionProfile({ isGroup: false, user_id: scope, sender: { user_id: scope } }, source, resolveProvider)
+    if (asPrivate) return asPrivate.profile
+    return resolveProvider(source.defaultProviderId, source)
+  } catch (err) {
+    // 通道行被删是常态：裁剪退回 trimConversation 的默认预算即可，不许让迁移失败
+    logger.warn(`[Chatgpt][Migration] scope ${scope} 解析通道失败，裁剪按默认预算`, err)
+    return null
+  }
+}
+
+/**
  * 每个对话保留的时长。单个对话内ai是保留上下文的。超时后销毁对话，再次对话创建新的对话。
  * 单位：秒
  * @type {number}
@@ -170,6 +207,11 @@ export class chatgpt extends plugin {
         {
           reg: `^#?(${originalValues.join('|')})?(结束|新开|摧毁|毁灭|完结|清理)全部(模式|模型)?对话$`,
           fnc: 'endAllConversations',
+          permission: 'master'
+        },
+        {
+          reg: '^#迁移会话$',
+          fnc: 'migrateConversations',
           permission: 'master'
         },
         // {
@@ -246,13 +288,13 @@ export class chatgpt extends plugin {
    */
   async getConversations(e) {
     // todo 根据use返回不同的对话列表
-    const profile = this.sessionProfileFor(e)
+    // 新键不含通道信息，所以这里扫全部 scope，不再按当前提供商过滤
     let keys = []
-    for await (const key of redis.scanIterator({ MATCH: `CHATGPT:CONVERSATIONS_V2:${profile.id}:*` })) keys.push(key)
+    for await (const key of redis.scanIterator({ MATCH: conversationScanPattern() })) keys.push(key)
     if (!keys || keys.length === 0) {
       await this.reply('当前没有人正在与机器人对话', true)
     } else {
-      let response = '当前提供商对话列表：(格式为【开始时间 ｜ qq昵称 ｜ 对话长度 ｜ 最后活跃时间】)\n'
+      let response = '当前对话列表：(格式为【开始时间 ｜ qq昵称 ｜ 对话长度 ｜ 最后活跃时间】)\n'
       await Promise.all(keys.map(async (key) => {
         let conversation = await redis.get(key)
         if (conversation) {
@@ -280,6 +322,36 @@ export class chatgpt extends plugin {
   }
 
   /**
+   * `#迁移会话`（仅主人）：把全站旧桶（`CONVERSATIONS_V2`）合并进新键。
+   *
+   * 懒迁移只覆盖「有人说话」的 scope，冷用户永远轮不到；这条是全量收尾。
+   * 可中断可重跑：已迁的 scope 靠 `schema:3` 哨兵直接跳过。
+   */
+  async migrateConversations(e) {
+    if (!e.isMaster) return this.reply('只有主人可以迁移会话', true)
+    await this.reply('开始迁移旧会话，稍后回报结果…', true)
+    try {
+      const summary = await migrateAllScopes({
+        client: redis,
+        config: Config.getConfig(),
+        // 按 scope 解析该会话的通道：分流群要用自己那条的裁剪预算，全局默认会按错窗口砍历史
+        providerRowFor: providerRowForScope
+      })
+      // 回执要给全：没有回执的全量迁移等于黑盒，出问题连「合成了什么样」都答不了
+      await this.reply([
+        '迁移完成',
+        `扫描 ${summary.scannedKeys} 个旧键 / ${summary.scopes} 个会话`,
+        `新迁移 ${summary.migrated}，跳过 ${summary.skipped}（已迁或无旧桶），失败 ${summary.failed}`,
+        `合并 ${summary.mergedMessages} 条消息，写备份 ${summary.backups} 个`,
+        `跳过坏桶 ${summary.badBuckets}，裁剪到 ${summary.cappedTo}，剥除记忆块 ${summary.stripped}`
+      ].join('｜'), true)
+    } catch (err) {
+      logger.error('[Chatgpt][Migration] 全量迁移失败', err)
+      await this.reply(`迁移失败：${err.message}`, true)
+    }
+  }
+
+  /**
    * 这个会话该用哪条提供商条目：命中分流用规则的，否则全局默认。
    *
    * 会话管理（`#结束对话`、`#清除最近N条`、`#对话列表`）必须和 `abstractChat` 用同一套判定算 key，
@@ -292,11 +364,11 @@ export class chatgpt extends plugin {
   }
 
   getClearContextScope(e, use) {
-    return (e.isGroup && Config.groupMerge) ? e.group_id.toString() : e.sender.user_id
+    return conversationScope(e, Config.groupMerge)
   }
 
   getClearContextConversationKey(e, use) {
-    return providerConversationKey(this.sessionProfileFor(e), this.getClearContextScope(e, use))
+    return conversationKeyFor(e, Config.groupMerge)
   }
 
   async clearContextByCount(e) {
@@ -708,7 +780,39 @@ export class chatgpt extends plugin {
     return this._abstractChat(e, prompt, use, forcePictureMode, opts)
   }
 
-  async _abstractChat(e, prompt, use, forcePictureMode = false, { automatic = false } = {}) {
+  /**
+   * 会话级在途互斥（B6）。
+   *
+   * 「读历史 → 请求模型 → 写历史」是一个整体临界区，锁必须包住这三步：只在写之前加锁
+   * 挡不住「两个请求都先读到旧历史」这个真正的问题。所以加锁点在 `_abstractChatLocked`
+   * 的入口，释放放 `finally`。
+   *
+   * 抢不到锁时的策略（两条都是明确选择，不是兜底）：
+   * - 自主回复：直接跳过，不排队。排队会让群里突然冒出一条延迟很久的回复，比不回复更怪。
+   * - 正常回复：最多等 `SCOPE_LOCK_WAIT_MS`，等不到就跳过本轮。
+   */
+  async _abstractChat(e, prompt, use, forcePictureMode = false, opts = {}) {
+    const { automatic = false } = opts
+    // 锁粒度 = 会话 scope（groupMerge 下是群号，否则是账号），与会话键同源
+    const scope = conversationScope(e, Config.getConfig().groupMerge)
+    let lockHeld = false
+    if (scope) {
+      lockHeld = await acquireScopeLock(scope, { waitMs: automatic ? 0 : SCOPE_LOCK_WAIT_MS })
+      if (!lockHeld) {
+        if (automatic) logger.debug(`[Chatgpt][ScopeLock] 自主回复抢不到锁，跳过本次 (scope=${scope})`)
+        else logger.info(`[Chatgpt][ScopeLock] 该会话上一轮还没结束，跳过本次 (scope=${scope})`)
+        return false
+      }
+    }
+    try {
+      return await this._abstractChatLocked(e, prompt, use, forcePictureMode, opts)
+    } finally {
+      // 异常路径同样释放：否则这个 scope 会被锁到 TTL 到期，期间谁都答不了
+      if (lockHeld) await releaseScopeLock(scope)
+    }
+  }
+
+  async _abstractChatLocked(e, prompt, use, forcePictureMode = false, { automatic = false } = {}) {
     const __perf = { t0: Date.now(), tMem: 0 }
     const providerSource = structuredClone(Config.getConfig())
     // 会话分流只影响正式对话：群聊自主回复的判断模型是独立配置（groupReply.provider），刻意不动。
@@ -843,11 +947,22 @@ export class chatgpt extends plugin {
     logger.info(`[Chatgpt][Input]: ${prompt}`)
     let previousConversation
     let conversation = {}
-    const key = providerConversationKey(profile, e.isGroup && config.groupMerge ? e.group_id.toString() : e.sender.user_id)
+    // 会话键的唯一来源（与通道无关）；取不到身份时必须中止，不能拿空串去读写 Redis
+    const key = conversationKeyFor(e, config.groupMerge)
+    if (!key) {
+      logger.warn(`[Chatgpt][ConversationKey] 取不到会话身份，跳过本轮对话 (群:${e.group_id} 用户:${e.sender?.user_id})`)
+      return false
+    }
     let ctime = new Date()
+    // 读会话必须经过懒迁移入口：新键没命中时归并该 scope 的旧桶（utils/conversationMigration.js）。
+    // 直接 redis.get 会绕过迁移——老用户在换键之后第一句就变成「全新对话」。
+    // isNewConversation 的口径由迁移层给：只有「新键不存在且一个旧桶都没有」才算首轮。
+    const loaded = key
+      ? await loadConversation({ scope: conversationScope(e, config.groupMerge), client: redis, config, providerRow: profile })
+      : { value: null, isNewConversation: true }
+    const savedConversation = loaded.value ? JSON.stringify(loaded.value) : null
     // 「Redis 中无该会话」判定先例：作为会话首轮标志传下去，供 when:"session"
     // 的上下文注入条目触发（docs/adr/0016）；#结束对话或过期后下一轮重新为真
-    const savedConversation = key ? await redis.get(key) : null
     previousConversation = savedConversation || JSON.stringify({
       sender: e.sender,
       ctime,
@@ -875,7 +990,7 @@ export class chatgpt extends plugin {
       conversationSignature: previousConversation.conversationSignature,
       bingToken: previousConversation.bingToken,
       replyTimestamps: previousConversation.replyTimestamps || [],
-      isNewConversation: !savedConversation
+      isNewConversation: loaded.isNewConversation
     }
 
     let handler = this.e.runtime?.handler || {
@@ -896,22 +1011,29 @@ export class chatgpt extends plugin {
     }
 
     // 加载相关记忆（V2：按当前问题相关性召回，非最新N条）
+    //
+    // 记忆块**只贴在本轮请求上**：落盘的是用户原始输入（下面的 `userInput`）。曾经把
+    // 「记忆块 + 原文」整段当成 user 消息落盘，于是之后每轮都重放一遍过时记忆，
+    // 历史越长污染越重，既占 token 又把旧事实当成本轮对话内容。
     __perf.tMem = Date.now()
+    let memoryBlock = ''
     if (config.enableMemory) {
       try {
         const { buildMemoryPrompt } = await import('../utils/memory/recall.js')
-        const memoryPrompt = await buildMemoryPrompt(e, prompt, {
+        const recalled = await buildMemoryPrompt(e, prompt, {
           config: {
             memoryContextLimit: config.memoryContextLimit,
             memoryRecallProvider: config.memoryRecallProvider,
           }
         })
-        if (memoryPrompt) {
-          prompt = memoryPrompt + '\n\n' + prompt
-          logger.info(`[Memory] 为用户 ${e.user_id} 召回了 ${memoryPrompt.split('\n').filter(l => l.startsWith('- {')).length} 条相关记忆`)
+        // 召回接口的契约：空串 = 确实没有记忆；抛错 = 后端失败。两者都不许伪造内容。
+        if (recalled && String(recalled).trim()) {
+          memoryBlock = recalled
+          logger.info(`[Memory] 为用户 ${e.user_id} 召回了 ${memoryBlock.split('\n').filter(l => l.startsWith('- {')).length} 条相关记忆`)
         }
       } catch (err) {
-        logger.error('[Memory] 加载记忆失败:', err)
+        // 失败绝不注入占位文案：「（无相关记忆）」这种句子写进 prompt 会被模型当成事实陈述
+        logger.warn(`[Memory] 召回失败，本轮不注入记忆（scope=${e.group_id ? `group:${e.group_id}` : `user:${e.user_id}`}）：${err?.message || err}`)
       }
     }
 
@@ -919,6 +1041,10 @@ export class chatgpt extends plugin {
     if (config.paimon_globalInnerOs && previousConversation?.num === 0) {
       prompt += `\n${INNER_OS_BEGIN}${config.paimon_globalInnerOs}${INNER_OS_END}`
     }
+
+    // 落盘用原文（含 innerOs，属既有行为）；记忆块只进本轮请求，用完即弃
+    const userInput = prompt
+    if (memoryBlock) prompt = memoryBlock + '\n\n' + prompt
 
     try {
       if (config.debug) {
@@ -934,7 +1060,8 @@ export class chatgpt extends plugin {
         ? { groupAutoReply: true, settings: { enableGroupContext: true } }
         : {}
       const __tModel = Date.now()
-      let chatMessage = await Core.sendMessage.bind(this)(prompt, conversation, profile.id, e, { ...options, allowFallback, providerSource })
+      // conversationKey 一路传到 sendWithProvider：溢出清空要用同一个键，不许在 core 里重算
+      let chatMessage = await Core.sendMessage.bind(this)(prompt, conversation, profile.id, e, { ...options, allowFallback, providerSource, conversationKey: key })
       if (Config.debug) { const __cost = Date.now() - __perf.t0; if (__cost > 3000) logger.mark(`[PERF] 总=${__cost}ms 组装=${__perf.tMem - __perf.t0}ms 记忆=${__tModel - __perf.tMem}ms 模型=${Date.now() - __tModel}ms`) }
       if (chatMessage?.noMsg) {
         return false
@@ -975,7 +1102,7 @@ export class chatgpt extends plugin {
       previousConversation.actualProviderId = chatMessage.actualProviderId
       previousConversation.actualProviderVersion = chatMessage.actualProviderVersion
       previousConversation.messages = trimConversation([
-        ...(previousConversation.messages || []), { role: 'user', content: prompt },
+        ...(previousConversation.messages || []), { role: 'user', content: userInput },
         { role: 'assistant', content: chatMessage.text || '' }
       ], config, profile)
       if (!chatMessage.error) {
@@ -1695,9 +1822,17 @@ export class chatgpt extends plugin {
       let at = ats[0]
       let qq = at.qq
       let atUser = _.trimStart(at.text, '@') || _.trimStart(at.name, '@')
-      const conversationKey = providerConversationKey(resolveProvider(), '')
-      let target = await redis.get(conversationKey + qq)
-      await redis.set(conversationKey + e.sender.user_id, target)
+      // 本指令搬的是「某个账号自己的私聊会话」，与群共用设置无关，所以直接按账号算 scope。
+      // 旧写法先算一个「空 scope」的键（末尾留下冒号）再直接 `+ qq` 当分隔符：
+      // 键格式一改就静默拼出一个谁也读不到的键，不抛异常、不告警，只能靠这里显式构造来杜绝。
+      const fromKey = conversationKeyOf(qq)
+      const toKey = conversationKeyOf(e.sender.user_id)
+      if (!fromKey || !toKey) {
+        await this.reply('指令错误，取不到要加入的账号', true)
+        return false
+      }
+      let target = await redis.get(fromKey)
+      await redis.set(toKey, target)
       await this.reply(`加入${atUser}的对话成功`)
     }
   }

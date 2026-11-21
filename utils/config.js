@@ -180,7 +180,10 @@ const defaultConfig = {
   emojiBaseURL: 'https://www.gstatic.com/android/keyboard/emojikitchen',
   emojiBaseSwitch: true,
   enableGroupContext: false,
-  groupContextTip: '你看看我们群里的聊天记录吧，回答问题的时候要主动参考我们的聊天记录进行回答或提问。但要看清楚哦，不要把我和其他人弄混啦，也不要把自己看晕啦。',
+  // 措辞是「可参考」而不是「必须按记录回答」：群记录是一份可能滞后的旁证（B2 允许滞后
+  // ≤4 条 / ≤180 秒），把它当权威会让人误以为「记录里没写就等于没发生」。
+  // 真正要守住的是「别把别人的话当成对你说的」，所以落点在发言人识别上。
+  groupContextTip: '下面是群里的聊天记录，可以拿来参考上下文。注意看清发言人是谁，不要把别人说的话当成对你说的，也不要把自己当成对话的另一方。',
   groupContextLength: 20,
   enableRobotAt: false,
   maxNumUserMessagesInConversation: 20,

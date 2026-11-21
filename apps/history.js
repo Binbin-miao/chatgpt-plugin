@@ -1,4 +1,4 @@
-import { resolveProvider, providerConversationKey } from '../utils/providers.js'
+import { conversationKeyFor } from '../utils/conversationKey.js'
 import plugin from '../../../lib/plugins/plugin.js'
 import { render, getUin } from '../utils/common.js'
 import { Config } from '../utils/config.js'
@@ -40,7 +40,8 @@ export class history extends plugin {
       queryUser = filtered[0].qq
       user = (await e.group.getMemberMap()).get(queryUser)
     }
-    const key = providerConversationKey(resolveProvider(), e.isGroup && Config.groupMerge ? e.group_id : queryUser)
+    const key = conversationKeyFor(e, Config.groupMerge, filtered.length > 0 ? queryUser : undefined)
+    if (!key) { await e.reply('取不到该账号的会话身份', e.isGroup); return true }
     const raw = await redis.get(key)
     const messages = raw ? JSON.parse(raw).messages || [] : []
     for (let i = 0; i + 1 < messages.length; i += 2) chat.push({ prompt: messages[i].content, response: messages[i + 1].content })

@@ -29,6 +29,9 @@
  *    `.scratch/` 开头）必须真实存在——文档改名/删除后残留的旧路径会误导按指针找材料的窗口；
  *    `docs/adr/<编号>` 编号简称按数字前缀匹配对应文件（如 `docs/adr/0016`）。「路径存在但
  *    内容是否支撑断言」是章节级判断，机械查不了，留在评审（AGENTS.md「逐个打开核对」规则）。
+ * 9. 会话键的字符串字面量只允许出现在 `utils/conversationKey.js`：键格式一改，别处的手工拼接
+ *    会**静默失效**（拼出另一个键，不抛异常、不告警，只是从此读写不同位置）。测试目录豁免——
+ *    用例就该把格式钉成独立的事实。
  */
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
@@ -51,6 +54,10 @@ const CONSOLE_LOG_RE = /\bconsole\.log\(/
 const PATH_REF_RE = /(?<![/\w])((?:docs|\.scratch)\/[\w\u4e00-\u9fff./-]+)/g
 const PATH_REF_MD_DIRS = ['docs', '.scratch']
 const PATH_REF_ROOT_MDS = ['AGENTS.md', 'README.md', 'CLAUDE.md', 'GLOSSARY.md']
+
+/** 规则 9：会话键字面量的唯一归属（迁移脚本要认旧键时把它加进这个集合） */
+const CONVERSATION_KEY_LITERAL_OWNERS = new Set(['utils/conversationKey.js', 'utils/conversationMigration.js'])
+const CONVERSATION_KEY_LITERAL_RE = /CHATGPT:CONVERSATIONS?_V[23]\b/
 
 const violations = []
 
@@ -97,8 +104,12 @@ function scanFile(file) {
   if (text.length > 512 * 1024) return
   const relative = path.relative(ROOT, file).split(path.sep).join('/')
   const forbidConsoleLog = NO_CONSOLE_LOG_DIRS.some(dir => relative.startsWith(dir))
+  const allowConversationKeyLiteral = CONVERSATION_KEY_LITERAL_OWNERS.has(relative) || relative.startsWith('test/')
   text.split('\n').forEach((line, index) => {
     if (line.includes('lint-ignore')) return
+    if (!allowConversationKeyLiteral && CONVERSATION_KEY_LITERAL_RE.test(line)) {
+      violations.push(`${relative}:${index + 1} 会话键字面量只允许出现在 utils/conversationKey.js；改用 conversationKeyFor / conversationKeyOf`)
+    }
     if (JSDOC_SAME_LINE_RE.test(line)) {
       violations.push(`${relative}:${index + 1} JSDoc 结束与声明须换行`)
     }
@@ -282,4 +293,4 @@ if (violations.length) {
   for (const item of violations) console.error('  - ' + item)
   process.exit(1)
 }
-console.log('[ChatGPT] 风格检查通过：JSDoc 换行、日志前缀、console.log 边界、路径引用存在性、测试挂载、脚本路径、套件接线、调试残留、工具注册条件')
+console.log('[ChatGPT] 风格检查通过：JSDoc 换行、日志前缀、console.log 边界、路径引用存在性、测试挂载、脚本路径、套件接线、调试残留、工具注册条件、会话键单一来源')

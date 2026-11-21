@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { runProviderFallback, createAttemptHistory, trimConversation } from '../utils/providerFallback.js'
+import { runProviderFallback, createAttemptHistory, trimConversation, trimForOverflow, isContextOverflowError } from '../utils/providerFallback.js'
 
 const main = { id: 'main' }, backup = { id: 'backup' }
 test('主失败重试一次再备用，下一轮重新优先主；独立任务只调用一次', async () => {
@@ -139,4 +139,65 @@ test('迁移遗留的奇数条 / assistant 起头历史会被收敛成 user 起�
   assert.deepEqual(trimConversation(clean, cfg, { type: 'gemini' }), clean)
   // 其他通道不做这层约束，正常数据同样不应被改动
   assert.deepEqual(trimConversation(clean, cfg), clean)
+})
+
+test('超限识别：各家措辞都认得，正常错误不许误判', () => {
+  const overflow = [
+    'Error: context_length_exceeded',
+    '请求失败：This model\'s maximum context length is 128000 tokens',
+    'context length exceeded: 210000 > 200000',
+    'prompt is too long: 210000 tokens > 200000 maximum',
+    'The input token count (300000) exceeds the maximum number of tokens allowed',
+    'input length and `max_tokens` exceed context limit: 200000 + 8192 > 200000'
+  ]
+  for (const message of overflow) assert.equal(isContextOverflowError(new Error(message)), true, message)
+  const normal = ['额度不足', 'Rate limit reached', '模型未返回有效回复', '', undefined]
+  for (const message of normal) {
+    const err = message === undefined ? undefined : new Error(message)
+    assert.equal(isContextOverflowError(err), false, String(message))
+  }
+})
+
+test('超限不进回退链：同一个超大 payload 重试纯浪费，只许打一次', async () => {
+  const calls = []
+  await assert.rejects(runProviderFallback(main, backup, async (row, state) => {
+    calls.push(row.id)
+    state.requested = true
+    throw new Error('context_length_exceeded')
+  }), /context_length_exceeded/)
+  assert.deepEqual(calls, ['main'], '主通道一次都不许重试，更不许切备用')
+})
+
+test('trimForOverflow：首轮只有 system 种子 + 一条 user 时判「裁不动」', () => {
+  const cfg = { ...trimCfg, chatgptBlockCount: 4 }
+  // trimConversation 至少保留一轮；1 条 user 裁不出 2 条 → 没得裁
+  assert.equal(trimForOverflow([
+    { role: 'system', content: 'seed' },
+    { role: 'user', content: '超长'.repeat(5000) }
+  ], cfg), null)
+})
+
+test('trimForOverflow：只数 user/assistant，system 种子不许把「没裁」误判成「裁了」', () => {
+  // 原始数组 3 条、裁剪结果 2 条 —— 拿原始长度比会恒判「裁成功」，于是白花一次满额请求
+  const messages = [
+    { role: 'system', content: 'seed' },
+    { role: 'user', content: '问题' },
+    { role: 'assistant', content: '回答' }
+  ]
+  assert.equal(trimForOverflow(messages, { ...trimCfg, chatgptBlockCount: 0, maxModelTokens: 600000 }), null)
+})
+
+test('trimForOverflow：100 条短消息确实能裁动，且结果比原来短', () => {
+  const messages = Array.from({ length: 100 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: 'x' }))
+  const trimmed = trimForOverflow(messages, { ...trimCfg, chatgptBlockCount: 60 })
+  assert.ok(trimmed, '100 条超过 60 条上限时应当判为裁动')
+  assert.equal(trimmed.length, 42, '一次裁到 70%（60 × 0.7 = 42）')
+})
+
+test('trimForOverflow 的窗口口径按「本次实际尝试的通道行」算，不许按全局 128k', () => {
+  // 60 条 × 2500 字符 = 15 万字符：128k 窗口下要裁，200k 窗口下不该动
+  const messages = Array.from({ length: 60 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: 'x'.repeat(2500) }))
+  assert.ok(trimForOverflow(messages, { chatgptBlockCount: 0 }, { type: 'api' }), 'api 行 128k 窗口，15 万字符超预算')
+  assert.equal(trimForOverflow(messages, { chatgptBlockCount: 0 }, { type: 'claude' }), null,
+    'claude 行没有 maxModelTokens，必须按 200k 算，不许被当成 128k 裁掉一半')
 })

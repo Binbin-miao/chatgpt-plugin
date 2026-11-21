@@ -1,6 +1,6 @@
-import { resolveProvider, providerConfig, providerConversationKey } from '../utils/providers.js'
+import { resolveProvider, providerConfig } from '../utils/providers.js'
 import { PROMPT_FIELDS, KEY_FIELDS, providerLabel, connectionVersion } from '../utils/providerProfiles.js'
-import { createAttemptHistory, runProviderFallback } from '../utils/providerFallback.js'
+import { createAttemptHistory, runProviderFallback, isContextOverflowError, trimForOverflow } from '../utils/providerFallback.js'
 import {
   Config
 } from '../utils/config.js'
@@ -21,7 +21,7 @@ import { mergeTrustedToolArgs } from '../utils/tools/AbstractTool.js'
 import { ClaudeAPIClient } from '../client/ClaudeAPIClient.js'
 import { getMessageById, upsertMessage } from '../utils/history.js'
 import { withContextInjection } from '../utils/contextInjection.js'
-import { shouldRebuildSnapshot, GROUP_SNAPSHOT_MIN_INTERVAL } from '../utils/groupSnapshot.js'
+import { shouldRebuildSnapshot, GROUP_SNAPSHOT_MIN_INTERVAL, REBUILD_MAX_AGE_MS } from '../utils/groupSnapshot.js'
 import { v4 as uuid } from 'uuid'
 import fetch from 'node-fetch'
 import { CustomGoogleGeminiClient } from '../client/CustomGoogleGeminiClient.js'
@@ -225,7 +225,9 @@ function formatGroupSnapshotText({ groupName, groupId, botName, chats }) {
  * 写入快照并维持 map 上限，超限时淘汰最久未更新的那条。fetchedAt 只用于拉取频率保护。
  */
 function cacheGroupSnapshot(snapshotKey, { text, newestMessageId }) {
-  groupSnapshotCache.set(snapshotKey, { text, newestMessageId, fetchedAt: Date.now() })
+  // rebuiltAt 只在真正换文本时写：180 秒那条时间阈值必须锚在「上次重建」，
+  // 用 fetchedAt（每 30 秒拉取就刷新）算年龄会让它永远触发不了
+  groupSnapshotCache.set(snapshotKey, { text, newestMessageId, fetchedAt: Date.now(), rebuiltAt: Date.now() })
   if (groupSnapshotCache.size <= GROUP_SNAPSHOT_LIMIT) return
   let oldestKey = null
   let oldestAt = Infinity
@@ -286,13 +288,16 @@ export async function collectGroupContext(e, settings = {}) {
     // fetchedAt 是「上次实际拉取时刻」：频率保护看它，内容新旧看 newestMessageId。
     // dueFetch 区分「没到时间没拉」和「拉了但失败」：成功失败都续期，
     // 否则 adapter 一抛错就变成每轮都卡在一次超时上。
-    const dueFetch = !cachedSnapshot || Date.now() - cachedSnapshot.fetchedAt >= GROUP_SNAPSHOT_MIN_INTERVAL
+    // 到了 180 秒重建线就绕过 30 秒拉取保护：否则冷群每 30 秒刷新一次 fetchedAt、
+    // rebuiltAt 却不动，时间阈值那一路会被频率保护永久挡住
+    const snapshotStale = Boolean(cachedSnapshot) && Date.now() - Number(cachedSnapshot.rebuiltAt || 0) >= REBUILD_MAX_AGE_MS
+    const dueFetch = !cachedSnapshot || snapshotStale || Date.now() - cachedSnapshot.fetchedAt >= GROUP_SNAPSHOT_MIN_INTERVAL
     const chats = dueFetch ? await fetchGroupHistory(e, groupContextLength) : null
     if (dueFetch && cachedSnapshot) {
       cachedSnapshot.fetchedAt = Date.now()
     }
     // 拉取失败或返回空时 newer 恒为 0，直接落到「沿用旧快照」：缓存既不清空也不缩短。
-    const shouldRebuild = shouldRebuildSnapshot(cachedSnapshot, chats, chats?.length || 0)
+    const shouldRebuild = shouldRebuildSnapshot(cachedSnapshot, chats)
     let publicText
     if (shouldRebuild) {
       // 拉取失败或返回空也照样写一份「只有群名群号」的快照：这三样本机就有，丢了只会让
@@ -433,6 +438,37 @@ function applyQuotedMedias(option, medias) {
   if (medias.length) option.medias = medias
 }
 
+/**
+ * 溢出兜底：清空本会话的历史键。
+ *
+ * 键**只认** `opt.conversationKey`（`apps/chat.js` 按 scope 算一次传下来）——在这个位置
+ * 自己推导键，进到备用通道那次尝试时就会删到另一个命名空间：主会话原封不动，下一轮继续撞墙。
+ * 拿不到键时**什么都不删**：猜一个键删掉别人的历史，比不删坏得多。
+ *
+ * @param {{e: object, opt: object, conversation: object}} ctx
+ * @returns {Promise<boolean>} 是否真的删了
+ */
+async function clearOverflowConversation({ e, opt, conversation }) {
+  const key = String(opt?.conversationKey ?? '').trim()
+  if (!key) {
+    logger.warn('[ChatGPT] 上下文超限但调用方没传 conversationKey，跳过清空（绝不猜键）')
+    return false
+  }
+  try {
+    await redis.del(key)
+    await redis.del(`CHATGPT:WRONG_EMOTION:${e.sender.user_id}`)
+  } catch (err) {
+    // 删不掉也要把提示照发出去，但问题必须留痕
+    logger.error('[ChatGPT] 清空超限会话失败', err)
+  }
+  // 服务端那条链还指着裁剪前的上下文：不清掉，下一轮会拿着旧 id 接着聊，等于没清
+  if (conversation) {
+    delete conversation.previousResponseId
+    delete conversation.parentMessageId
+  }
+  return true
+}
+
 class Core {
   async sendMessage(prompt, conversation = {}, use, e, opt = {}) {
     opt.__s0 = Date.now()
@@ -442,31 +478,80 @@ class Core {
     if (backup && (backup.type !== main.type || backup.id === main.id)) throw new Error('失败回退配置与主模型不匹配，请在锅巴重新选择')
     const prepared = {}
     const owner = this
+    // 裁剪后的历史要对后续尝试（含备用通道）同样生效，否则回退链会拿回原始超大 payload 再撞一次
+    let attemptConversation = conversation
     return runProviderFallback(main, backup, async (row, state) => {
       opt.__t0 = Date.now()
       if (!String(row[KEY_FIELDS[row.type]] || '').split(/[,，;]/).some(key => key.trim())) throw new Error(`${providerLabel(row)} 尚未配置密钥`)
       const cfg = providerConfig(row, source)
       cfg[PROMPT_FIELDS[row.type]] = main[PROMPT_FIELDS[main.type]]
-      const history = createAttemptHistory(row.type, conversation.messages)
-      const nextConversation = { ...conversation, parentMessageId: history.parentMessageId,
-        previousResponseId: conversation.actualProviderId === row.id && conversation.actualProviderVersion === connectionVersion(row) ? conversation.previousResponseId : undefined }
-      const context = Object.create(owner)
-      context.reply = async (...args) => { state.irreversible = true; return owner.reply(...args) }
-      const event = Object.create(e)
-      event.modelProviderId = row.id
-      event.reply = async (...args) => { state.irreversible = true; return e.reply(...args) }
-      const request = async (...args) => {
-        const url = new URL(args[0])
-        if (!['http:', 'https:'].includes(url.protocol)) throw new Error('模型提供商地址需要使用 http 或 https')
-        state.requested = true
-        if (opt.__req0 === undefined) {
-          opt.__req0 = Date.now()
-          if (Config.debug) logger.mark(`[PERF-REQ] use=${use} 准备=${opt.__t0 - opt.__s0}ms 分支前置=${opt.__req0 - opt.__t0}ms`)
+      const attempt = async conv => {
+        const history = createAttemptHistory(row.type, conv.messages)
+        const nextConversation = { ...conv, parentMessageId: history.parentMessageId,
+          previousResponseId: conv.actualProviderId === row.id && conv.actualProviderVersion === connectionVersion(row) ? conv.previousResponseId : undefined }
+        const context = Object.create(owner)
+        context.reply = async (...args) => { state.irreversible = true; return owner.reply(...args) }
+        const event = Object.create(e)
+        event.modelProviderId = row.id
+        event.reply = async (...args) => { state.irreversible = true; return e.reply(...args) }
+        const request = async (...args) => {
+          const url = new URL(args[0])
+          if (!['http:', 'https:'].includes(url.protocol)) throw new Error('模型提供商地址需要使用 http 或 https')
+          state.requested = true
+          if (opt.__req0 === undefined) {
+            opt.__req0 = Date.now()
+            if (Config.debug) logger.mark(`[PERF-REQ] use=${use} 准备=${opt.__t0 - opt.__s0}ms 分支前置=${opt.__req0 - opt.__t0}ms`)
+          }
+          return newFetch(...args)
         }
-        return newFetch(...args)
+        return Core.prototype.sendWithProvider.call(context, prompt, nextConversation, row.type, event,
+          { ...opt, prepared, history, request, providerName: row.name, onToolStart: () => { state.irreversible = true } }, cfg)
       }
-      const result = await Core.prototype.sendWithProvider.call(context, prompt, nextConversation, row.type, event,
-        { ...opt, prepared, history, request, providerName: row.name, onToolStart: () => { state.irreversible = true } }, cfg)
+      /**
+       * 溢出恢复的最后一手：清空本会话 + **恰一句**提示 + 本轮无回复。
+       *
+       * 先回再 return null 不是风格问题：`runProviderFallback` 拿到 null 会判「模型未返回有效回复」
+       * 再打一轮，唯一的豁免是 `state.irreversible`——所以必须先置位、先回复。
+       */
+      const clearConversationAfterOverflow = async () => {
+        state.irreversible = true
+        await clearOverflowConversation({ e, opt, conversation })
+        // 非插件上下文（例如被复用的 Core 单例）可能没有 reply：提示发不出去也不能把恢复流程炸掉
+        await owner.reply?.('字数超限啦，将为您自动结束本次对话。')
+      }
+      /**
+       * 溢出恢复：**先裁剪重试，裁不动才清空**。
+       *
+       * 用户口径是「尽量不要清空会话，会导致 AI 失去记忆」，所以清空是最后手段。裁剪只做一次，
+       * 且不做进回退链：一次超限最多多打一次请求，不会主→主→备 × 裁剪变成请求数爆炸。
+       */
+      const runAttempt = async () => {
+        try {
+          return await attempt(attemptConversation)
+        } catch (err) {
+          if (!isContextOverflowError(err)) throw err
+          const trimmed = opt.__overflowRetried ? null : trimForOverflow(attemptConversation.messages, cfg, row)
+          if (!trimmed) {
+            await clearConversationAfterOverflow()
+            return null
+          }
+          opt.__overflowRetried = true
+          logger.warn(`[ChatGPT] 上下文超限，裁到 ${trimmed.length} 条后重试一次`)
+          attemptConversation = { ...attemptConversation, messages: trimmed, previousResponseId: undefined, parentMessageId: undefined }
+          try {
+            const retried = await attempt(attemptConversation)
+            // 裁剪重试已经多打过一次：就算拿回空结果，也不许回退链再接手——
+            // 否则「原始 1 + 裁剪 1」会立刻变成 4 次，验收的「请求次数 = 2」就不成立了
+            if (!retried?.text?.trim() && !retried?.noMsg && !retried?.refused) state.irreversible = true
+            return retried
+          } catch (retryErr) {
+            if (!isContextOverflowError(retryErr)) throw retryErr
+            await clearConversationAfterOverflow()
+            return null
+          }
+        }
+      }
+      const result = await runAttempt()
       if (result?.refused && !result.text) result.text = '模型拒绝回答'
       if (result) { result.actualProviderId = row.id; result.actualProviderVersion = connectionVersion(row); result.actualStore = cfg.responsesStore === true }
       return result
@@ -475,17 +560,6 @@ class Core {
 
   async sendWithProvider(prompt, conversation, use, e, opt, Config) {
     const { getMessageById, upsertMessage } = opt.history
-
-    /**
-     * 上下文超限后清空当前会话。key 必须与 apps/chat.js 落盘时同一套算法
-     * （V2 + 通道 id + 连接版本 + scope）：旧格式 `CHATGPT:CONVERSATIONS:<uin>`
-     * 早已无人写入，删它等于没删，会让下一轮继续撞同一堵墙。
-     */
-    const clearOverflowConversation = async () => {
-      const scope = e.isGroup && Config.groupMerge ? String(e.group_id) : e.sender.user_id
-      await redis.del(providerConversationKey(Config, scope))
-      await redis.del(`CHATGPT:WRONG_EMOTION:${e.sender.user_id}`)
-    }
 
     opt = {
       enableSmart: Config.smartMode,
@@ -857,12 +931,7 @@ class Core {
         }
         return msg
       } catch (err) {
-        if (!opt.allowFallback && err.message?.includes('context_length_exceeded')) {
-          logger.warn(err)
-          await clearOverflowConversation()
-          await this.reply('字数超限啦，将为您自动结束本次对话。')
-          return null
-        }
+        // 溢出不再在这里收拾：`sendMessage` 统一做「先裁后清」，三个分支共用一份恢复逻辑
         logger.error(err)
         throw err
       }
@@ -1171,15 +1240,9 @@ class Core {
             upsertMessage(msg).catch(err => logger.warn('[chatgpt] 清理存储中的工具调用记录失败', err))
           }
         } catch (err) {
-          if (!opt.allowFallback && err.message?.includes('context_length_exceeded')) {
-            logger.warn(err)
-            await clearOverflowConversation()
-            await this.reply('字数超限啦，将为您自动结束本次对话。')
-            return null
-          } else {
-            logger.error(err)
-            throw err
-          }
+          // 溢出统一由 sendMessage 做「先裁后清」，这里只留非溢出的日志与上抛
+          logger.error(err)
+          throw err
         }
         if (toolRoundThinking) {
           msg.thinking_text = toolRoundThinking + (msg.thinking_text || '')
@@ -1193,15 +1256,9 @@ class Core {
             : prompt;
           msg = await sendOpenAI(messageContent, option)
         } catch (err) {
-          if (!opt.allowFallback && err.message?.includes('context_length_exceeded')) {
-            logger.warn(err)
-            await clearOverflowConversation()
-            await this.reply('字数超限啦，将为您自动结束本次对话。')
-            return null
-          } else {
-            logger.error(err)
-            throw err
-          }
+          // 溢出统一由 sendMessage 做「先裁后清」，这里只留非溢出的日志与上抛
+          logger.error(err)
+          throw err
         }
         return msg
       }

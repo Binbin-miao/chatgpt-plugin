@@ -211,6 +211,40 @@ export function validateCandidateShape(candidate) {
   }
 }
 
+/**
+ * 已告警过的坏记录位置（每个进程一份）。
+ *
+ * 坏记录必须计数留痕，否则表现为「记忆莫名其妙变少」；但同一处每次召回都 warn 一次
+ * 会把日志刷爆，所以按位置去重，只提示首次。
+ */
+const corruptWarnedScopes = new Set()
+
+/** 坏记录告警：首次出现时带上计数，同一位置每个进程只提示一次 */
+function warnCorruptOnce(scope, message) {
+  if (corruptWarnedScopes.has(scope)) return
+  corruptWarnedScopes.add(scope)
+  logger?.warn?.(`[MemoryV2] ${message}（同一位置每个进程只提示一次）`)
+}
+
+/** 双后端并集：按 messageId 去重（同一条以文件侧为准），保持时间升序 */
+function mergeRawRows(fileRows, redisRows) {
+  const merged = [...fileRows]
+  const seen = new Set()
+  for (const row of fileRows) {
+    if (row?.messageId !== undefined && row?.messageId !== null) seen.add(String(row.messageId))
+  }
+  for (const row of redisRows) {
+    const id = row?.messageId
+    if (id !== undefined && id !== null) {
+      if (seen.has(String(id))) continue
+      seen.add(String(id))
+    }
+    merged.push(row)
+  }
+  merged.sort((a, b) => (Number(a?.time) || 0) - (Number(b?.time) || 0))
+  return merged
+}
+
 export class MemoryStore {
   /**
    * @param {Object} [redisClient] redis 客户端，缺省取 `global.redis`（记忆与提炼任务仍需要它）
@@ -1212,11 +1246,14 @@ export class MemoryStore {
     const gid = String(groupId)
     const ids = await redis.zRangeByScore(RAWIDX(gid), startTime, endTime)
     const out = []
+    let corrupt = 0
     for (const mid of ids) {
       const raw = await redis.get(RAW(gid, mid))
       if (!raw) continue
-      try { out.push(JSON.parse(raw)) } catch { /* 坏记录跳过，与 getRawMessages 一致 */ }
+      try { out.push(JSON.parse(raw)) } catch { corrupt++ }
     }
+    // 静默跳过会让用户看到「记忆少了但不知道为什么」：计数必须留痕
+    if (corrupt > 0) warnCorruptOnce(`raw-redis:${gid}`, `群 ${gid} 有 ${corrupt} 条原文 JSON 损坏，已跳过`)
     out.sort((a, b) => a.time - b.time)
     return out
   }
@@ -1233,11 +1270,20 @@ export class MemoryStore {
     return [...groupIds]
   }
 
-  /** 取某群指定时间范围（秒）内的原文，按时间升序 */
+  /**
+   * 取某群指定时间范围（秒）内的原文，按时间升序。
+   *
+   * **补尾窗期间必须两侧都读**：切到 file 之后、尾窗那批新原文补完之前，新消息只在 Redis，
+   * 文件侧只有旧数据。只读文件会让「刚聊过的内容」当场读不到，而 Redis 里明明有。
+   * 标记清掉（尾遍成功）后恢复单后端，不再多读一次 Redis。
+   */
   async getRawMessages(groupId, startTime, endTime) {
     const gid = String(groupId)
-    if (this.memoryStorage() === 'file') return await this.rawStore.readRange(gid, startTime, endTime)
-    return await this.getRawMessagesFromRedis(gid, startTime, endTime)
+    if (this.memoryStorage() !== 'file') return await this.getRawMessagesFromRedis(gid, startTime, endTime)
+    const fileRows = await this.rawStore.readRange(gid, startTime, endTime)
+    if (!Config?.memoryStorageTailPendingAt) return fileRows
+    const redisRows = await this.getRawMessagesFromRedis(gid, startTime, endTime)
+    return mergeRawRows(fileRows, redisRows)
   }
 
   /**

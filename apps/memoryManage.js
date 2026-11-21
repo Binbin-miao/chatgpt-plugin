@@ -310,7 +310,7 @@ export class memoryManage extends plugin {
    *
    * - `#清理无效记忆 预览`：只列群号与记忆条数，不写任何数据
    * - `#清理无效记忆`：列清单 → 二次确认 → 只清非授权群的记忆
-   * - 不删原文（raw:* 归 rawRetentionDays 自动过期），不动 CONVERSATIONS_V2 / MESSAGE
+   * - 不删原文（raw:* 归 rawRetentionDays 自动过期），不动会话键 / MESSAGE
    * - 单轮最多 PURGE_MAX_GROUPS 个群，超出提示再执行一次
    */
   async purgeInvalidMemories(e) {

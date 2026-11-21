@@ -269,6 +269,11 @@ export function getMentionedUserId(e) {
 
 /**
  * 主入口：为一次对话构建记忆注入
+ *
+ * **返回契约**：返回 `''` = 确实没有记忆（正常空，调用方不必告警）；**抛错** = 后端读取失败
+ * （调用方必须 warn + 不注入任何占位文案）。两者在返回值上可区分，调用方不许把空串当失败，
+ * 也不许用「（无相关记忆）」这类句子填补——那在 prompt 里会变成事实陈述。
+ *
  * @param {Object} e 云崽消息事件（含 user_id / group_id / message）
  * @param {string} query 当前问题文本
  * @param {Object} options { store, config }

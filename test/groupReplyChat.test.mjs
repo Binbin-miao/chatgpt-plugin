@@ -34,18 +34,23 @@ const Config = { defaultProviderId: 'responses', modelProviders: { api: [], resp
 Config.getConfig = () => Object.fromEntries(Object.entries(Config).filter(([, value]) => typeof value !== 'function'))
 mock.module('../utils/config.js', { namedExports: { Config } })
 globalThis.Bot = { uin: [] }
-globalThis.redis = { get: async () => null }
-globalThis.logger = { info() {}, error(error) { throw error } }
+globalThis.redis = { get: async () => null, set: async () => 'OK', del: async () => 1 }
+globalThis.logger = { info() {}, warn() {}, debug() {}, error(error) { throw error } }
 const { chatgpt } = await import('../apps/chat.js')
+const { conversationKeyOf } = await import('../utils/conversationKey.js')
+/** 锁的 SET 也走 redis.set：统计落盘次数/键名时要把锁键排除掉 */
+const withoutLockWrites = writes => writes.filter(write => !String(write?.key ?? write).startsWith('CHATGPT:SCOPE_LOCK'))
+const { acquireScopeLock, releaseScopeLock, scopeLockKey } = await import('../utils/scopeLock.js')
+
 const { groupReply } = await import('../utils/groupReply.js')
 const { avatarReply } = await import('../utils/avatarReply.js')
 
 test('开启角色的正式回复先发一次完整正文再附图，辅助来源使用实际备用条目', async t => {
   const previous = { ...Config }
   requests.length = 0
-  redis.set = async () => {}
+  redis.set = async () => 'OK'
   t.after(() => {
-    delete redis.set
+    redis.set = async () => 'OK'
     requests.length = 0
     scriptedResponse = undefined
     for (const key of Object.keys(Config)) delete Config[key]
@@ -231,15 +236,15 @@ test('自主回复消耗共享限额并复查，直接呼叫超限后不转自�
 })
 
 test('备用成功写入主会话，下轮携带正文仍选主模型；连接修改及失败不覆盖历史', async t => {
-  const { providerConversationKey, resolveProvider } = await import('../utils/providers.js')
+  const { resolveProvider } = await import('../utils/providers.js')
   const { connectionVersion } = await import('../utils/providerProfiles.js')
   const previous = { ...Config }
   const saved = new Map()
   const writes = []
   t.mock.method(redis, 'get', async key => saved.get(key) || null)
-  redis.set = async (key, value) => { writes.push(key); saved.set(key, value) }
+  redis.set = async (key, value) => { writes.push(key); saved.set(key, value); return 'OK' }
   t.after(() => {
-    delete redis.set
+    redis.set = async () => 'OK'
     scriptedResponse = undefined
     for (const key of Object.keys(Config)) delete Config[key]
     Object.assign(Config, previous)
@@ -256,7 +261,7 @@ test('备用成功写入主会话，下轮携带正文仍选主模型；连接�
   const replies = []
   chat.e = e
   chat.reply = async value => replies.push(value)
-  const key = providerConversationKey(resolveProvider(), '123')
+  const key = conversationKeyOf('123')
   scriptedResponse = async () => ({ text: '备用回答', id: 'remote-backup', actualProviderId: 'backup', actualProviderVersion: connectionVersion(resolveProvider('backup')), actualStore: true })
   await chat.abstractChat(e, e.msg, undefined, false, { automatic: true })
   let history = JSON.parse(saved.get(key))
@@ -283,29 +288,31 @@ test('备用成功写入主会话，下轮携带正文仍选主模型；连接�
   }
   await chat.abstractChat(e, '第三问', undefined, false, { automatic: true })
   assert.equal(saved.get(key), completed)
-  assert.equal(saved.has(providerConversationKey(resolveProvider(), '123')), false)
-  assert.equal(writes.length, 2)
+  // 键在 B1 之后与通道无关，只可能有一个桶：迟到的请求既不许改写它，也不许另建新桶
+  assert.deepEqual([...saved.keys()].filter(name => !name.startsWith('CHATGPT:SCOPE_LOCK')), [key],
+    '迟到的请求不许在任何会话键下留下记录')
+  assert.equal(withoutLockWrites(writes).length, 2)
 
   scriptedResponse = async () => { throw new Error('全部尝试失败') }
   // 允许入口正常处理模型错误，其他断言仍执行真实持久化路径。
   t.mock.method(logger, 'error', () => {})
   await chat.abstractChat(e, '失败问题', undefined, false, { automatic: true })
-  assert.equal(writes.length, 2)
+  assert.equal(withoutLockWrites(writes).length, 2)
   assert.match(replies.at(-1), /全部尝试失败/)
 })
 
 for (const type of ['api', 'responses', 'claude', 'gemini']) {
 test(`${type} 不续接升级前历史，成功问答按 3600 秒和 50 条写入新会话，超界一次裁到 70%`, async t => {
-  const { resolveProvider, providerConversationKey } = await import('../utils/providers.js')
+  const { resolveProvider } = await import('../utils/providers.js')
   const { connectionVersion, MODEL_FIELDS, KEY_FIELDS } = await import('../utils/providerProfiles.js')
   const previous = { ...Config }
   const oldKey = type === 'api' ? 'CHATGPT:CONVERSATIONS:123' : `CHATGPT:CONVERSATIONS_${type.toUpperCase()}:123`
   const saved = new Map([[oldKey, JSON.stringify({ parentMessageId: 'old-message', messages: [{ role: 'user', content: '升级前的问题' }] })]])
   const reads = [], writes = []
   t.mock.method(redis, 'get', async key => { reads.push(key); return saved.get(key) || null })
-  redis.set = async (key, value, options) => { writes.push({ key, options }); saved.set(key, value) }
+  redis.set = async (key, value, options) => { writes.push({ key, options }); saved.set(key, value); return 'OK' }
   t.after(() => {
-    delete redis.set
+    redis.set = async () => 'OK'
     scriptedResponse = undefined
     for (const key of Object.keys(Config)) delete Config[key]
     Object.assign(Config, previous)
@@ -320,7 +327,7 @@ test(`${type} 不续接升级前历史，成功问答按 3600 秒和 50 条写�
   chat.e = e
   chat.reply = async () => {}
   const row = resolveProvider()
-  const key = providerConversationKey(row, '123')
+  const key = conversationKeyOf('123')
   let turn = 0
   let expected = 0 // 已落库的历史条数：涨满 50 后一次裁到 34（50×0.7 向下取偶）
   scriptedResponse = async (prompt, conversation, id) => {
@@ -336,8 +343,8 @@ test(`${type} 不续接升级前历史，成功问答按 3600 秒和 50 条写�
     expected = expected + 2 > 50 ? 34 : expected + 2
   }
   assert.equal(reads.includes(oldKey), false)
-  assert.equal(writes.length, 27)
-  assert.ok(writes.every(write => write.key === key && write.options.EX === 3600))
+  assert.equal(withoutLockWrites(writes).length, 27)
+  assert.ok(withoutLockWrites(writes).every(write => write.key === key && write.options.EX === 3600))
   const messages = JSON.parse(saved.get(key)).messages
   assert.equal(messages.length, expected)
   assert.equal(messages.length, 36)
@@ -352,9 +359,9 @@ test(`${type} 不续接升级前历史，成功问答按 3600 秒和 50 条写�
 // 这里按「没得到回答」统一：群聊延时撤回、私聊保留、受 is_recallMsg 控制，正常回答不受影响。
 test('模型拒绝回答的文案按失败提示撤回：群聊 60 秒、私聊不撤、受开关控制', async t => {
   const previous = { ...Config }
-  redis.set = async () => {}
+  redis.set = async () => 'OK'
   t.after(() => {
-    delete redis.set
+    redis.set = async () => 'OK'
     scriptedResponse = undefined
     for (const key of Object.keys(Config)) delete Config[key]
     Object.assign(Config, previous)
@@ -396,9 +403,9 @@ test('模型拒绝回答的文案按失败提示撤回：群聊 60 秒、私聊�
 // 文字分支的 recallMsg 覆盖不到那里，所以单独守一遍。报错与合成失败同步改成 60 秒。
 test('语音模式下拒绝回答的语音会撤回，报错与合成失败同样按失败提示撤回', async t => {
   const previous = { ...Config }
-  redis.set = async () => {}
+  redis.set = async () => 'OK'
   t.after(() => {
-    delete redis.set
+    redis.set = async () => 'OK'
     scriptedResponse = undefined
     harness.useTTS = false
     harness.audio = undefined
@@ -443,9 +450,9 @@ test('语音模式下拒绝回答的语音会撤回，报错与合成失败同�
 test('引用转发按「引用文本 → 引用转发 → 用户正文」进入 prompt', async t => {
   const previous = { ...Config }
   const calls = []
-  redis.set = async () => {}
+  redis.set = async () => 'OK'
   t.after(() => {
-    delete redis.set
+    redis.set = async () => 'OK'
     requests.length = 0
     scriptedResponse = undefined
     for (const key of Object.keys(Config)) delete Config[key]
@@ -479,4 +486,288 @@ test('引用转发按「引用文本 → 引用转发 → 用户正文」进入 
   assert.deepEqual(calls, ['F1'], '引用转发只拉一次')
   assert.ok(prompt.indexOf('引用文本') < prompt.indexOf('转发内容'), '引用文本在前')
   assert.ok(prompt.indexOf('转发内容') < prompt.indexOf('用户正文'), '转发内容在用户正文之前')
+})
+
+/**
+ * B5 记忆块不入库 + B7 记忆失败不伪造。
+ *
+ * 这一组跑真实 `abstractChat`：记忆召回走真实的 recall / formatMemoryPrompt，
+ * 只替换存储边界（`MemoryStore.prototype.listRecallCandidates`）与模型入口，
+ * 落盘则通过假 redis 把 `redis.set` 的 JSON 抓下来解析。
+ */
+const MEMORY_HEADER = '【历史记忆参考（不可信数据）】'
+
+function memoryRedis() {
+  const store = new Map()
+  redis.get = async key => (store.has(key) ? store.get(key) : null)
+  redis.set = async (key, value) => { store.set(key, value); return 'OK' }
+  redis.del = async key => (store.delete(key) ? 1 : 0)
+  redis.scanIterator = async function* () {}
+  return store
+}
+
+function persistedConversation(store) {
+  const key = conversationKeyOf('123')
+  assert.ok(store.has(key), '本轮必须落盘')
+  return JSON.parse(store.get(key))
+}
+
+/** 记忆候选：正文里带上当轮问题，保证文字匹配排序不会把它丢掉 */
+function candidateOf(index, query) {
+  return [{
+    factKey: `turn.${index}`, factValue: 'v', text: `第${index}轮记忆 ${query}`,
+    scope: 'user', ownerId: '123', status: 'active', importance: 0.8, confidence: 0.9
+  }]
+}
+
+function memoryHarness(t, { enableMemory = true } = {}) {
+  const previous = { ...Config }
+  const store = memoryRedis()
+  t.after(() => {
+    for (const key of Object.keys(Config)) delete Config[key]
+    Object.assign(Config, previous)
+    scriptedResponse = undefined
+    requests.length = 0
+    redis.set = async () => 'OK'
+    delete redis.del
+    delete redis.scanIterator
+  })
+  Object.assign(Config, {
+    defaultProviderId: 'responses', enableMemory, enableGroupContext: false,
+    blacklist: [], whitelist: [], blockWords: [], promptBlockWords: [], smartMode: true,
+    modelProviders: { api: [], gemini: [], claude: [], responses: [{ id: 'responses', name: '默认' }] }
+  })
+  scriptedResponse = async () => ({ text: '答复', actualProviderId: 'responses' })
+  const e = {
+    isGroup: true, group_id: '100', self_id: '999', user_id: '123',
+    sender: { user_id: '123', role: 'member' }, message: [], reply: async () => {}
+  }
+  const chat = Object.create(chatgpt.prototype)
+  chat.e = e
+  chat.reply = async () => {}
+  chat.cacheContent = async () => {}
+  return { store, e, chat }
+}
+
+test('B5 连续三轮：请求里有当轮记忆，落盘的 user 消息一条都没有，第二轮不重放第一轮', async t => {
+  const { MemoryStore } = await import('../utils/memory/store.js')
+  const { store, e, chat } = memoryHarness(t)
+  let candidates = []
+  t.mock.method(MemoryStore.prototype, 'listRecallCandidates', async () => candidates)
+
+  const inputs = ['第一问', '第二问', '第三问']
+  const prompts = []
+  for (const [index, input] of inputs.entries()) {
+    candidates = candidateOf(index + 1, input)
+    await chat.abstractChat(e, input, 'responses', false, { automatic: true })
+    prompts.push(requests.at(-1)[0])
+  }
+
+  // 本轮模型确实看到了记忆（不能为了干净把注入也去掉）
+  for (const [index, prompt] of prompts.entries()) {
+    assert.ok(prompt.includes(MEMORY_HEADER), `第 ${index + 1} 轮请求必须带记忆块`)
+    assert.ok(prompt.includes(`第${index + 1}轮记忆`), `第 ${index + 1} 轮要带当轮召回的条目`)
+  }
+  assert.doesNotMatch(prompts[1], /第1轮记忆/, '第二轮请求不许重放第一轮的记忆块')
+  assert.doesNotMatch(prompts[2], /第1轮记忆|第2轮记忆/, '第三轮同理')
+
+  // 落盘：只有用户原文
+  const persisted = persistedConversation(store)
+  const users = persisted.messages.filter(m => m.role === 'user')
+  assert.deepEqual(users.map(m => m.content), inputs, '入库的 user 消息必须逐字等于用户原始输入')
+  assert.doesNotMatch(JSON.stringify(persisted.messages), /历史记忆参考/, '历史里一个记忆块都不许留')
+})
+
+test('B5 入库条目长度 = 用户原始输入长度（多一个字符都算错）', async t => {
+  const { MemoryStore } = await import('../utils/memory/store.js')
+  const { store, e, chat } = memoryHarness(t)
+  t.mock.method(MemoryStore.prototype, 'listRecallCandidates', async () => candidateOf(1, '咖啡怎么冲'))
+
+  const input = '咖啡怎么冲'
+  await chat.abstractChat(e, input, 'responses', false, { automatic: true })
+  assert.match(requests.at(-1)[0], /历史记忆参考/, '请求里必须有记忆')
+
+  const users = persistedConversation(store).messages.filter(m => m.role === 'user')
+  assert.equal(users.length, 1)
+  assert.equal(users[0].content, input)
+  assert.equal(users[0].content.length, input.length, '入库长度必须等于原文长度')
+})
+
+test('B7 记忆召回抛错：不注入任何占位文案，入库仍是原文，warn 恰一条且带 scope 与原因', async t => {
+  const { MemoryStore } = await import('../utils/memory/store.js')
+  const { store, e, chat } = memoryHarness(t)
+  t.mock.method(MemoryStore.prototype, 'listRecallCandidates', async () => { throw new Error('后端读取超时') })
+  const warns = []
+  t.mock.method(globalThis.logger, 'warn', message => warns.push(String(message)))
+
+  const input = '今天心情不错'
+  await chat.abstractChat(e, input, 'responses', false, { automatic: true })
+
+  const prompt = requests.at(-1)[0]
+  assert.equal(prompt, input, '失败时请求内容必须等于原文，不许夹带任何补充')
+  for (const forbidden of ['无相关记忆', '记忆获取失败', '（无记忆）', '历史记忆参考']) {
+    assert.doesNotMatch(prompt, new RegExp(forbidden), `不许注入占位文案：${forbidden}`)
+  }
+  const users = persistedConversation(store).messages.filter(m => m.role === 'user')
+  assert.deepEqual(users.map(m => m.content), [input], '失败时入库内容与原始输入一致')
+  const memoryWarns = warns.filter(message => message.startsWith('[Memory]'))
+  assert.equal(memoryWarns.length, 1, `只许 warn 一条，实际：${memoryWarns.join(' | ')}`)
+  assert.match(memoryWarns[0], /召回失败/)
+  assert.match(memoryWarns[0], /user:123|group:100/, 'warn 必须带 scope')
+  assert.match(memoryWarns[0], /后端读取超时/, 'warn 必须带失败原因')
+})
+
+test('B7 召回返回空（确实没有记忆）：不注入、不 warn，入库仍是原文', async t => {
+  const { MemoryStore } = await import('../utils/memory/store.js')
+  const { store, e, chat } = memoryHarness(t)
+  t.mock.method(MemoryStore.prototype, 'listRecallCandidates', async () => [])
+  const warns = []
+  t.mock.method(globalThis.logger, 'warn', message => warns.push(String(message)))
+
+  const input = '第一次说话'
+  await chat.abstractChat(e, input, 'responses', false, { automatic: true })
+
+  assert.equal(requests.at(-1)[0], input, '空召回不注入任何东西')
+  assert.deepEqual(warns.filter(message => String(message).startsWith('[Memory]')), [],
+    '「确实没有记忆」是正常空，不是失败，不许 warn')
+  const users = persistedConversation(store).messages.filter(m => m.role === 'user')
+  assert.deepEqual(users.map(m => m.content), [input])
+})
+
+/**
+ * B6 自主回复与正常回复共用一把 scope 锁。
+ *
+ * 这一组跑真实 `abstractChat`：锁走 `utils/scopeLock.js`（真实 SET NX EX 语义，
+ * 用 Map 模拟），只替换模型入口与消息出口。
+ */
+function lockAwareHarness(t) {
+  const previous = { ...Config }
+  const store = new Map()
+  redis.get = async key => (store.has(key) ? store.get(key) : null)
+  redis.set = async (key, value, options = {}) => {
+    // 真实 Redis 的 SET NX：键已存在时不写、返回 null
+    if (options?.NX && store.has(key)) return null
+    store.set(key, value)
+    return 'OK'
+  }
+  redis.del = async key => (store.delete(key) ? 1 : 0)
+  redis.scanIterator = async function* () {}
+  const debugLogs = []
+  const sent = []
+  t.mock.method(globalThis.logger, 'debug', message => debugLogs.push(String(message)))
+  t.after(() => {
+    for (const key of Object.keys(Config)) delete Config[key]
+    Object.assign(Config, previous)
+    requests.length = 0
+    scriptedResponse = undefined
+    redis.set = async () => 'OK'
+    delete redis.del
+    delete redis.scanIterator
+  })
+  Object.assign(Config, {
+    defaultProviderId: 'responses', enableMemory: false, enableGroupContext: false,
+    blacklist: [], whitelist: [], blockWords: [], promptBlockWords: [], smartMode: true,
+    modelProviders: { api: [], gemini: [], claude: [], responses: [{ id: 'responses', name: '默认' }] }
+  })
+  const e = {
+    isGroup: true, group_id: '100', self_id: '999', user_id: '123', message_id: 'msg-1',
+    sender: { user_id: '123', role: 'member' }, message: [], reply: async () => {}
+  }
+  const chat = Object.create(chatgpt.prototype)
+  chat.e = e
+  chat.reply = async value => { sent.push(String(value)) }
+  chat.cacheContent = async () => {}
+  return { store, e, chat, debugLogs, sent }
+}
+
+const waitFor = async predicate => {
+  for (let i = 0; i < 200; i++) {
+    if (predicate()) return true
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  return false
+}
+
+test('B6 同 scope 并发两条（自主 + 正常）串行执行，后一条的历史包含前一条', async t => {
+  const { store, e, chat } = lockAwareHarness(t)
+  let releaseFirst
+  const seen = []
+  scriptedResponse = async prompt => {
+    seen.push(prompt)
+    // 自主那条卡在模型请求里 —— 此时锁必须还握着
+    if (prompt === '自主那条') await new Promise(resolve => { releaseFirst = resolve })
+    return { text: `答:${prompt}`, actualProviderId: 'responses' }
+  }
+
+  const autoRun = chat.abstractChat(e, '自主那条', 'responses', false, { automatic: true })
+  assert.ok(await waitFor(() => typeof releaseFirst === 'function'), '自主回复必须先进入请求')
+
+  const normalRun = chat.abstractChat(e, '用户那条', 'responses', false)
+  await new Promise(resolve => setTimeout(resolve, 30))
+  releaseFirst()
+  const [autoResult, normalResult] = await Promise.all([autoRun, normalRun])
+
+  assert.notEqual(autoResult, false, '自主回复正常完成')
+  assert.notEqual(normalResult, false, '正常回复等到了锁（不是被锁挡掉的那种 false）')
+  assert.deepEqual(seen, ['自主那条', '用户那条'], '两条必须串行，不许交错')
+
+  const persisted = JSON.parse(store.get(conversationKeyOf('123')))
+  assert.deepEqual(persisted.messages.filter(m => m.role === 'user').map(m => m.content),
+    ['自主那条', '用户那条'], '后一条写盘时必须包含前一条写进去的内容，不许覆盖')
+})
+
+test('B6 自主回复抢不到锁：直接跳过，不发消息、不调模型、记 debug', async t => {
+  const { e, chat, debugLogs, sent } = lockAwareHarness(t)
+  await acquireScopeLock('123')
+  requests.length = 0
+
+  const result = await chat.abstractChat(e, '自主那条', 'responses', false, { automatic: true })
+
+  assert.equal(result, false, '抢不到锁就当本轮没发生')
+  assert.equal(requests.length, 0, '不许调模型')
+  assert.deepEqual(sent, [], '不许发任何消息（排队的延迟回复比不回复更怪）')
+  assert.match(debugLogs.join('\n'), /自主回复抢不到锁/, '必须留一行 debug 说明为什么没回')
+  // 释放放在断言之后：harness 的 after 会先清掉 redis.del，注册成 hook 会拿到空实现
+  await releaseScopeLock('123')
+})
+
+test('B6 抛异常时锁被释放：紧接着的下一次调用能拿到', async t => {
+  const { store, e, chat } = lockAwareHarness(t)
+  let fail = true
+  scriptedResponse = async () => {
+    if (fail) { fail = false; throw new Error('模型炸了') }
+    return { text: '好', actualProviderId: 'responses' }
+  }
+
+  // 这个 harness 的 logger.error 会把错误原样再抛一次（有意的），本轮只关心锁有没有放掉
+  await chat.abstractChat(e, '第一轮', 'responses', false, { automatic: true }).catch(() => {})
+  assert.equal(store.has(scopeLockKey('123')), false, '异常路径必须在 finally 里把锁放掉')
+
+  requests.length = 0
+  await chat.abstractChat(e, '第二轮', 'responses', false, { automatic: true })
+  assert.equal(requests.length, 1, '锁没泄漏，下一次调用能正常拿到')
+})
+
+test('B6 锁粒度是 scope 不是全局：键按 scope 出现，不同账号互不阻塞', async t => {
+  const { store, e, chat } = lockAwareHarness(t)
+  let releaseA
+  scriptedResponse = async prompt => {
+    if (prompt === '甲的问题') await new Promise(resolve => { releaseA = resolve })
+    return { text: '好', actualProviderId: 'responses' }
+  }
+
+  const runA = chat.abstractChat(e, '甲的问题', 'responses', false, { automatic: true })
+  assert.ok(await waitFor(() => typeof releaseA === 'function'), '甲要先进入请求，锁才看得见')
+
+  // 锁键只按 scope 出现：不存在任何「全局锁」键
+  assert.equal(store.has(scopeLockKey('123')), true, '甲的 scope 锁必须存在')
+  assert.equal(store.has(scopeLockKey('global')), false, '不许退化成一把全局锁')
+
+  const other = { ...e, user_id: '456', sender: { ...e.sender, user_id: '456' }, message_id: 'msg-2' }
+  requests.length = 0
+  await chat.abstractChat(other, '乙的问题', 'responses', false, { automatic: true })
+  assert.equal(requests.length, 1, '乙的 scope 不同，不该被甲的锁挡住')
+
+  releaseA()
+  await runA
 })

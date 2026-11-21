@@ -61,7 +61,7 @@ const Config = {
 Config.getConfig = () => Object.fromEntries(Object.entries(Config).filter(([, value]) => typeof value !== 'function'))
 mock.module('../utils/config.js', { namedExports: { Config, providerDefaults: {} } })
 globalThis.Bot = { uin: [] }
-globalThis.redis = { get: async () => null }
+globalThis.redis = { get: async () => null, set: async () => 'OK', del: async () => 1 }
 
 const { chatgpt, isFirstPersonCall } = await import('../apps/chat.js')
 

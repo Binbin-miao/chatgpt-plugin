@@ -254,3 +254,82 @@ test('file 模式：分页读取（群成员技能）走文件且按时间倒序
   assert.deepEqual(tail.rows.map(r => r.messageId), ['m0'], '最后一页只剩 1 条')
   assert.equal(tail.count, 1)
 })
+
+test('文件坏行：按文件计数告警，同一文件每进程只 warn 一次', async () => {
+  await rawStore.append('888', { groupId: '888', messageId: 'a', time: T1, text: '正常一条' })
+  fs.appendFileSync(dayFile('888', '2026-03-01'), '{坏行一\n这不是 JSON\n')
+  await rawStore.append('888', { groupId: '888', messageId: 'c', time: T1 + 60, text: '正常两条' })
+
+  const warns = []
+  const originalWarn = globalThis.logger.warn
+  globalThis.logger.warn = message => warns.push(String(message))
+  try {
+    const first = await rawStore.readRange('888', 0, MAX_SEC)
+    assert.deepEqual(first.map(r => r.messageId), ['a', 'c'], '坏行只丢自己')
+    const corrupt = warns.filter(message => message.includes('无法解析'))
+    assert.equal(corrupt.length, 1, '必须留痕，且只一条')
+    assert.match(corrupt[0], /2 行无法解析/, '计数要如实：两行坏数据')
+    assert.match(corrupt[0], /2026-03-01\.ndjson/, '要能定位到哪个文件')
+
+    await rawStore.readRange('888', 0, MAX_SEC)
+    await rawStore.readRange('888', 0, MAX_SEC)
+    assert.equal(warns.filter(message => message.includes('无法解析')).length, 1,
+      '同一个文件再读多少次都不许重复 warn（否则日志被刷爆）')
+  } finally {
+    globalThis.logger.warn = originalWarn
+  }
+})
+
+test('Redis 坏原文：计数进日志，同一群每进程只 warn 一次', async () => {
+  const client = {
+    zRangeByScore: async () => ['m1', 'm2', 'm3'],
+    get: async key => (String(key).endsWith('m2') ? '{坏掉的 JSON' : JSON.stringify({ messageId: String(key).split(':').pop(), time: T1, text: '好的' }))
+  }
+  const store = new MemoryStore(client, { rawStore })
+  const warns = []
+  const originalWarn = globalThis.logger.warn
+  globalThis.logger.warn = message => warns.push(String(message))
+  try {
+    const rows = await store.getRawMessagesFromRedis('777', 0, MAX_SEC)
+    assert.deepEqual(rows.map(r => r.messageId).sort(), ['m1', 'm3'], '坏记录只丢自己')
+    const corrupt = warns.filter(message => message.includes('JSON 损坏'))
+    assert.equal(corrupt.length, 1)
+    assert.match(corrupt[0], /1 条/, '计数要如实：一条坏原文')
+
+    await store.getRawMessagesFromRedis('777', 0, MAX_SEC)
+    assert.equal(warns.filter(message => message.includes('JSON 损坏')).length, 1, '同一群重复读不许刷屏')
+  } finally {
+    globalThis.logger.warn = originalWarn
+  }
+})
+
+test('补尾窗未完成：同时读文件与 Redis 取并集，标记清掉后只读文件', async () => {
+  // 文件侧只有迁移过去的旧原文；Redis 侧是切到 file 之后新采集的那几条
+  await rawStore.append('666', { groupId: '666', messageId: 'old', time: T1, text: '迁移过去的' })
+  const client = {
+    zRangeByScore: async () => ['new1', 'old'],
+    get: async key => {
+      const id = String(key).split(':').pop()
+      if (id === 'old') return JSON.stringify({ groupId: '666', messageId: 'old', time: T1, text: '迁移过去的' })
+      return JSON.stringify({ groupId: '666', messageId: id, time: T1 + 120, text: '切过去之后新说的' })
+    }
+  }
+  const config = Config.getConfig()
+  const previousStorage = config.memoryStorage
+  const previousPending = config.memoryStorageTailPendingAt
+  config.memoryStorage = 'file'
+  const store = new MemoryStore(client, { rawStore })
+  try {
+    config.memoryStorageTailPendingAt = Date.now()
+    const merged = await store.getRawMessages('666', 0, MAX_SEC)
+    assert.deepEqual(merged.map(r => r.messageId), ['old', 'new1'], '只读文件会当场漏掉刚聊的那几条')
+    assert.equal(merged.filter(r => r.messageId === 'old').length, 1, '两侧都有的同一条只算一次')
+
+    config.memoryStorageTailPendingAt = 0
+    const fileOnly = await store.getRawMessages('666', 0, MAX_SEC)
+    assert.deepEqual(fileOnly.map(r => r.messageId), ['old'], '尾窗补完就恢复单后端，不再多读 Redis')
+  } finally {
+    config.memoryStorage = previousStorage
+    config.memoryStorageTailPendingAt = previousPending
+  }
+})

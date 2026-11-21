@@ -23,7 +23,7 @@ mock.module('../apps/chat.js', { namedExports: { chatgpt: class {
   async chatgpt_for_firstperson_call(e, options) { await respond(e, options) }
 } } })
 globalThis.logger = { error: message => errors.push(message), info: message => infos.push(message), debug: () => {} }
-globalThis.redis = { get: async key => key.startsWith('CHATGPT:SHUT_UP:') ? (muted ? '1' : null) : 'api' }
+globalThis.redis = { get: async key => key.startsWith('CHATGPT:SHUT_UP:') ? (muted ? '1' : null) : 'api', set: async () => 'OK', del: async () => 1 }
 const { groupReply } = await import('../utils/groupReply.js')
 const { groupReplyObserver } = await import('../apps/groupReply.js')
 // 提前加载两个被隔离的边界模块，计时断言不包含模块加载的 IO。

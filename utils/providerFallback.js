@@ -20,6 +20,27 @@ export function createAttemptHistory(type, messages = []) {
   }
 }
 
+/**
+ * 「疑似上下文超限」的关键字表。
+ *
+ * 各家措辞互不相同，还会在句式里塞自己的上限数字，只能做小写子串匹配。
+ * 新增一家只改这张表——业务代码里不许再另写 `includes('context_length_exceeded')`。
+ */
+export const CONTEXT_OVERFLOW_KEYWORDS = [
+  'context_length_exceeded',
+  'context length exceeded',
+  'maximum context length',
+  'exceeds the maximum number of tokens',
+  'prompt is too long',
+  'exceed context limit'
+]
+
+/** 是否疑似上下文超限（决定「不参与回退重试」与「先裁后清」两条策略） */
+export function isContextOverflowError(error) {
+  const message = String(error?.message ?? '').toLowerCase()
+  return Boolean(message) && CONTEXT_OVERFLOW_KEYWORDS.some(keyword => message.includes(keyword))
+}
+
 export async function runProviderFallback(main, backup, execute, { enabled = true, onRetry = () => {} } = {}) {
   const state = { irreversible: false, requested: false }
   const attempts = enabled ? [main, main, ...(backup ? [backup] : [])] : [main]
@@ -33,6 +54,8 @@ export async function runProviderFallback(main, backup, execute, { enabled = tru
       }
       return result
     } catch (err) {
+      // 超限不可回退：换一条同协议通道不会让 payload 变小，重试一次就是再烧一次满额请求
+      if (isContextOverflowError(err)) throw err
       if (state.irreversible || !state.requested || err.noRetry || err.name === 'AbortError' && err.userCancelled || i === attempts.length - 1) throw err
       onRetry(attempts[i + 1], i + 1)
     }
@@ -102,4 +125,26 @@ export function trimConversation(messages, config, provider = null) {
     if (end - start >= 2) result = result.slice(start, end)
   }
   return result
+}
+
+/**
+ * 超限后要重试的那份历史；**裁不动就返回 null**。
+ *
+ * 「裁动了」的判据必须只看 `user` / `assistant`：新会话的 `messages` 都带一条 system 种子
+ * （`apps/chat.js` 首轮写入），拿原始数组长度比会恒判「裁成功」，于是白花一次满额请求、
+ * 最后还是得清空。条数或字符数任一变小才算裁动；裁完不足一轮（< 2 条）同样算没得裁。
+ *
+ * @param {Array<object>} messages 当前会话历史（可含 system 种子）
+ * @param {object} config `providerConfig(row)` 的产物
+ * @param {object|null} provider 本次实际尝试的通道行（窗口口径按它算）
+ * @returns {Array<object>|null}
+ */
+export function trimForOverflow(messages, config, provider = null) {
+  const list = Array.isArray(messages) ? messages : []
+  const chattable = list.filter(m => ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
+  const trimmed = trimConversation(list, config, provider)
+  if (trimmed.length < 2) return null
+  const charsOf = items => items.reduce((total, m) => total + m.content.length, 0)
+  const shrank = trimmed.length < chattable.length || charsOf(trimmed) < charsOf(chattable)
+  return shrank ? trimmed : null
 }
